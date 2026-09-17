@@ -78,9 +78,13 @@ fn held_initialization_has_queue_bypass_cancel_close_and_no_replay() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("plan");
     let (release, held) = mpsc::channel();
-    let mut w = Workbench::spawn_inner(config(&root, OpenMode::Create), move || {
-        held.recv().unwrap();
-    })
+    let mut w = Workbench::spawn_inner(
+        config(&root, OpenMode::Create),
+        move || {
+            held.recv().unwrap();
+        },
+        None,
+    )
     .unwrap();
     let initial = w.status();
     assert_eq!(initial.phase, Phase::Opening);
@@ -155,7 +159,7 @@ fn exact_result_tokens_decimal_cursors_and_bounded_cache_replace() {
     ))
     .unwrap();
     let opening = value(&reopened);
-    assert_eq!(opening["schema"], 3);
+    assert_eq!(opening["schema"], core::plan::PLAN_SCHEMA_VERSION);
     assert!(opening.get("rows").is_none());
     close(&mut reopened);
 }

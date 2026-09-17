@@ -1,34 +1,39 @@
 # sc-22842 organization query experiment — protocol and retained design
 
-Current source compatibility revision: driver **5**, native receipt protocol **2**,
-catalog schema **6**. This revision is source preparation, not a new performance
+Current source compatibility revision: driver **6**, native receipt protocol **2**,
+catalog schema **13**. This revision is source preparation, not a new performance
 qualification. The qualified driver-4/native-1/schema-5 binaries, source archives,
 private fixtures and receipts remain unchanged.
 
 The synthetic `organization_fixture.protocol=1`, row formulas and provenance,
 17 workloads, sample counts and performance budgets stay unchanged. Current
 native query/transition entrypoints refuse older catalogs before `Catalog::open`;
-no schema migration belongs to a timed query. `prepare` creates schema 6 directly.
+no schema migration belongs to a timed query. `prepare` creates schema 13 directly.
 For reused owned copies, run `migrate-fixture` explicitly during preparation.
 Migration receipts identify `identity_scope=pre_existing_tables`: the before/after
 typed hash and table counts cover exactly that old table set, including FTS and
-row identities. `added_tables` separately names the nine initially empty
-edit/export tables and four derived alias tables. Alias directories/paths start
-empty; alias state has one row, and dirty membership contains every existing
-storage binding. `alias_initial_state` reports the exact unbound-asset and dirty
-counts, checked against existing assets/bindings and exact dirty membership.
-This is not a claim that the entire schema-6 hash equals the old schema-5 hash.
-A pristine 6-to-6 verification reports no additions and validates that same
-initial state. Projection reconciliation is not timed query work.
+row identities. `added_tables` exactly enumerates every table introduced after
+the donor schema through schema 13, with version-specific initial row counts.
+A schema-4 or schema-5 donor adds 57 tables, a schema-6 donor adds 44, and a
+schema-13 verification adds none.
+Alias state, image/shared state, mapping epoch, collection-zero backfill, repair,
+review, and write-receipt rows are checked against the frozen pristine-fixture
+contract. `alias_initial_state`, `image_initial_state`, and
+`original_columns_preserved` remain explicit receipt fields. A pristine 13-to-13
+verification reports no additions and must leave the physical main unchanged.
+Projection reconciliation is not timed query work.
 
-The driver preserves the original native-protocol-1 4-to-5 proof bytes, then records
-a distinct 5-to-6 migration and changed physical main hash. A copied schema-6
-fixture instead requires current producer evidence or a bound predecessor
-migration receipt, retains predecessor proof bytes/manifest identity, and records
-a separate 6-to-6 verification with unchanged physical bytes. Old-schema test
-fixtures remove all schema-6 tables, indexes and attached alias triggers rather
-than merely relabeling a current database. Existing frozen 4-to-5 proof bytes
-and their native-protocol-1 interpretation remain unchanged.
+The driver preserves the original native-protocol-1 4-to-5 proof bytes. It may
+then record a truthful direct 5-to-13 migration. When a genuine retained 5-to-6
+proof exists, it preserves those exact proof/native bytes and physical boundary,
+then records a separate 6-to-13 migration. It never inserts a synthetic 5-to-6
+hop. Reuse admits evidenced schema 4, 5, 6, and 13 fixtures; intermediate schema
+7–12 manifests are not claimed by this campaign contract. Existing frozen
+4-to-5 and 5-to-6 proof bytes keep their original interpretation. Direct
+5-to-13 logical identity must equal the retained schema-5 identity. A genuine
+5-to-6 receipt keeps that schema-5 pre-existing identity, while its later
+6-to-13 receipt must use a different logical digest because the exact 13-table
+schema-6 roster is then part of the pre-existing table-name hash.
 
 This experiment is separate from S2 backend selection. SQLite remains the selected
 backend; no alternative backend/profile or threshold search is performed here.

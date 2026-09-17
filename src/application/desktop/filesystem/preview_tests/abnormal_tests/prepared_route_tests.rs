@@ -13,6 +13,7 @@ fn ready_interactive(
     token: &str,
     key: &VariantKey,
     generation: u64,
+    diagnostics: bool,
 ) -> Result<PreviewStatus> {
     let Response::Preview(mut status) = command(
         &running.bridge,
@@ -24,6 +25,7 @@ fn ready_interactive(
             viewport: "prepared-route".into(),
             generation: U64(generation),
             foreground: true,
+            diagnostics,
         },
     )?
     else {
@@ -147,8 +149,16 @@ fn actual_prepared_reuse_and_source_or_cache_change_fall_back_to_original() -> R
         Ok(())
     }));
 
-    ready_interactive(running, &token, &variants[0], 1)?;
+    let first_status = ready_interactive(running, &token, &variants[0], 1, true)?;
     let first = observation(&rows, &variants[0])?;
+    ensure!(
+        first_status
+            .diagnostic
+            .as_ref()
+            .and_then(|diagnostic| diagnostic.expected_key_digest.as_ref())
+            == Some(&first.key.digest()?),
+        "interactive diagnostic expected key differs from admitted render key"
+    );
     ensure!(
         first.prepared.is_none(),
         "first render unexpectedly had a prepared candidate"
@@ -161,7 +171,7 @@ fn actual_prepared_reuse_and_source_or_cache_change_fall_back_to_original() -> R
         "first render did not decode original"
     );
 
-    ready_interactive(running, &token, &variants[1], 2)?;
+    ready_interactive(running, &token, &variants[1], 2, false)?;
     let second = observation(&rows, &variants[1])?;
     let candidate = second
         .prepared
@@ -203,7 +213,7 @@ fn actual_prepared_reuse_and_source_or_cache_change_fall_back_to_original() -> R
             == checksum,
         "fixture replacement changed original bytes"
     );
-    ready_interactive(running, &token, &variants[2], 3)?;
+    ready_interactive(running, &token, &variants[2], 3, false)?;
     let third = observation(&rows, &variants[2])?;
     let stale = third
         .prepared
@@ -233,7 +243,7 @@ fn actual_prepared_reuse_and_source_or_cache_change_fall_back_to_original() -> R
     let last = prepared_bytes.len() - 1;
     prepared_bytes[last] ^= 1;
     std::fs::write(&prepared_path, &prepared_bytes)?;
-    ready_interactive(running, &token, &variants[3], 4)?;
+    ready_interactive(running, &token, &variants[3], 4, false)?;
     let fourth = observation(&rows, &variants[3])?;
     let corrupt = fourth
         .prepared
@@ -303,7 +313,7 @@ fn actual_prepared_reuse_and_source_or_cache_change_fall_back_to_original() -> R
     let running = cold.running.as_ref().unwrap();
     let begin = Instant::now();
     for (index, variant) in variants.iter().enumerate() {
-        ready_interactive(running, &token, variant, 10 + index as u64)?;
+        ready_interactive(running, &token, variant, 10 + index as u64, false)?;
     }
     let elapsed = begin.elapsed();
     {

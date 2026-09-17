@@ -10,6 +10,7 @@ pub(crate) mod manifest_json;
 mod reader;
 pub(crate) mod record_json;
 pub(crate) mod seal_json;
+mod supplement_json;
 pub(crate) use access::MigrationRead;
 pub(crate) use reader::IMAGE_LINK_LIMITATIONS;
 pub use reader::MigrationSource;
@@ -49,6 +50,18 @@ pub struct SupplementPin {
     pub historical_status: crate::xmp_packets::Status,
     pub proof_blake3: String,
 }
+pub(crate) fn validate_supplement_pin(
+    evidence: &[u8],
+    pin: &SupplementPin,
+    stop: &dyn Fn() -> bool,
+) -> Result<()> {
+    let (source, status) = supplement_json::select(evidence, &pin.origin, stop)?;
+    ensure!(
+        source == pin.source_revision && status == pin.historical_status,
+        "supplement differs from retained original identity/status"
+    );
+    Ok(())
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StableSource {
@@ -83,7 +96,8 @@ pub struct SelectedCapture {
 }
 
 /// These are per-operation bounds, not a claim about total import work.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReadLimits {
     pub page_bytes: usize,
     pub inline_bytes: usize,

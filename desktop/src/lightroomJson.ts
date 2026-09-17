@@ -30,6 +30,16 @@ export function parseLosslessJson(raw:string,limits:{bytes:number;nodes:number;d
   };
   const value=read(0);white();if(at!==raw.length)throw new Error('Trailing JSON bytes');return value;
 }
+export function stringifyLosslessJson(node:JsonNode):string {
+  switch(node.kind){
+    case 'null':return 'null';
+    case 'boolean':return node.value?'true':'false';
+    case 'string':return JSON.stringify(node.value);
+    case 'number':return node.lexeme;
+    case 'array':return `[${node.items.map(stringifyLosslessJson).join(',')}]`;
+    case 'object':return `{${node.entries.map(([key,value])=>`${JSON.stringify(key)}:${stringifyLosslessJson(value)}`).join(',')}}`;
+  }
+}
 function unsigned(text:string):bigint {if(!/^(0|[1-9][0-9]*)$/.test(text))throw new Error('Invalid decimal cursor');return BigInt(text);}
 export class ResultAssembly {
   private fragments:string[]=[];private offset=0n;private total:bigint|null=null;private done=false;

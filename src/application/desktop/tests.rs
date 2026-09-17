@@ -22,19 +22,65 @@ pub(super) fn shared(cap: usize) -> Arc<Shared> {
             shutdown_attempt: 0,
             shutdown_sent: 0,
             drain_error: None,
+            control_reader_failed: false,
             reaped: false,
             child_finished: false,
             local_verified: false,
             filesystem_verified: true,
             child_exit: None,
+            catalog_retiring: false,
+            catalog_epoch: 0,
+            backup_admitting: false,
+            close_admitting: false,
         }),
         wake: Condvar::new(),
         binary: Arc::new(AtomicUsize::new(0)),
         filesystem: None,
+        backup: None,
         metadata: Default::default(),
         migration_stop: Mutex::new(None),
         fixture: Mutex::new(None),
     })
+}
+
+#[test]
+fn managed_backup_routes_share_pre_effect_public_byte_boundary() {
+    let path = || NativePath::from_path(std::path::Path::new("/fixture/backup"));
+    let requests = [
+        Request::BackupCreate {
+            catalog: "catalog".into(),
+            bundle: path(),
+        },
+        Request::BackupInspect { bundle: path() },
+        Request::BackupRestore {
+            bundle: path(),
+            destination: NativePath::from_path(std::path::Path::new("/fixture/restore")),
+        },
+        Request::BackupStatus,
+        Request::BackupCancel {
+            operation: "operation".into(),
+        },
+        Request::Close {
+            catalog: "catalog".into(),
+        },
+        Request::Close {
+            catalog: "雪\"".into(),
+        },
+    ];
+    for request in requests {
+        let encoded_bytes = serde_json::to_vec(&request).unwrap().len();
+        assert!(validate_public_request(&request, encoded_bytes).is_ok());
+        assert!(matches!(
+            validate_public_request(&request, encoded_bytes - 1)
+                .unwrap_err()
+                .code,
+            ErrorCode::ResourceLimit
+        ));
+        assert!(matches!(
+            validate_public_request(&request, 0).unwrap_err().code,
+            ErrorCode::ResourceLimit
+        ));
+    }
 }
 
 #[test]
@@ -369,13 +415,25 @@ fn managed_catalog_retirement_requires_identity_reap_join_and_g_drain() {
             for reaped in [false, true] {
                 for joined in [false, true] {
                     for migration in [false, true] {
-                        state.ready = ready;
-                        state.reaped = reaped;
-                        state.child_finished = joined;
-                        assert_eq!(
-                            managed_catalog_retired(&state, paired, migration),
-                            paired && ready && reaped && joined && migration
-                        );
+                        for backup in [false, true] {
+                            for control in [false, true] {
+                                state.ready = ready;
+                                state.reaped = reaped;
+                                state.child_finished = joined;
+                                assert_eq!(
+                                    managed_catalog_retired(
+                                        &state, paired, migration, backup, control,
+                                    ),
+                                    paired
+                                        && ready
+                                        && reaped
+                                        && joined
+                                        && migration
+                                        && backup
+                                        && control
+                                );
+                            }
+                        }
                     }
                 }
             }

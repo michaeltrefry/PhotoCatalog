@@ -18,6 +18,8 @@ uuid = { version = "1", features = ["v4"] }
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+# Explicit measurement packages only; ordinary release builds remain uninspectable.
+measurement-devtools = ["tauri/devtools"]
 
 [patch.crates-io]
 libsqlite3-sys = { path = "../../vendor/libsqlite3-sys" }

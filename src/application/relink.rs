@@ -731,12 +731,14 @@ impl Coordinator {
                 Response::Operation(control.lock().unwrap().status.clone())
             }
             Request::Mounts => {
+                let observer = crate::catalog_session::storage::Observer(catalog.session.clone());
                 let cancel = self.start(control, Action::Mounts, Phase::Observing, None, false)?;
                 if let Err(e) = self.spawn(move || {
                     if cancel.is_canceled() {
                         return Err("mount observation canceled".into());
                     }
-                    storage_volume::mounted_volumes()
+                    observer
+                        .mounts(&cancel.0)
                         .map(Output::Mounts)
                         .map_err(|e| e.to_string())
                 }) {
@@ -759,10 +761,11 @@ impl Coordinator {
                         catalog.image(&key)?;
                         let identity = catalog.edit_render_identity(&key)?;
                         #[cfg(test)] if let Some(c) = checkpoint { c("relink_original", &cancel.0); }
-                        let mounts = storage_volume::mounted_volumes()?;
+                        let observer = crate::catalog_session::storage::Observer(catalog.session.clone());
+                        let mounts = observer.mounts(&cancel.0)?;
                         let mut status = catalog.storage_status(&key.asset_id, &mounts)?;
                         if status.state == "unregistered" && let core::PathReference::Native(path) = &status.current {
-                            let observation = storage_volume::locate(&path.to_path()?);
+                            let observation = observer.locate(&path.to_path()?, &cancel.0)?;
                             status.state = match observation.state {
                                 storage_volume::LocationState::Available => "available_unverified",
                                 storage_volume::LocationState::MissingPath => "missing",

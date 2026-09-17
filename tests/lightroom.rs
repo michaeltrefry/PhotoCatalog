@@ -76,6 +76,25 @@ fn request(source: &Path, output: &Path) -> Request {
 fn capture_file(source: &Path, output: &Path) -> capture::Manifest {
     capture::spawn(&worker(), &request(source, output)).unwrap()
 }
+
+#[test]
+fn photocatalog_executable_dispatches_capture_worker() {
+    let temp = tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+    let originals = temp.path().join("originals");
+    fs::create_dir(&originals).unwrap();
+    let source = originals.join("source.lrcat");
+    drop(fixture(&source, "1300000", 100.0));
+    let output = temp.path().join("capture");
+
+    let manifest = capture::spawn(
+        Path::new(env!("CARGO_BIN_EXE_photocatalog")),
+        &request(&source, &output),
+    )
+    .unwrap();
+
+    assert_eq!(manifest.state, "captured");
+    assert!(output.join("manifest.json").is_file());
+}
 fn finish(plan: &mut Plan, revision: &str) {
     for _ in 0..1000 {
         let result = plan.resume(revision, 7).unwrap();
@@ -1140,7 +1159,7 @@ fn emitted_packet_page_includes_newline_in_exact_byte_limit() {
 }
 
 #[test]
-fn create_cli_reports_inspection_schema_three() {
+fn create_cli_reports_current_inspection_schema() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("plan");
     let output = std::process::Command::new(worker())
@@ -1154,7 +1173,10 @@ fn create_cli_reports_inspection_schema_three() {
         String::from_utf8_lossy(&output.stderr)
     );
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(value["schema"], 3);
+    assert_eq!(
+        value["schema"],
+        photocatalog::lightroom::plan::PLAN_SCHEMA_VERSION
+    );
     let db = Connection::open_with_flags(
         root.join("inspection.sqlite3"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -1163,7 +1185,7 @@ fn create_cli_reports_inspection_schema_three() {
     assert_eq!(
         db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        3
+        photocatalog::lightroom::plan::PLAN_SCHEMA_VERSION
     );
 }
 

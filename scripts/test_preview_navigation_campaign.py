@@ -1,7 +1,7 @@
 """Tiny receipt-contract tests; no timing, image work, database or child process."""
 import copy
 import unittest
-from preview_navigation_campaign import distribution, expected_trials, plan, validate_binding, validate_trial
+from preview_navigation_campaign import CURRENT_SCHEMA, PROTOCOL, distribution, expected_trials, plan, validate_binding, validate_child_identity, validate_trial
 
 
 def page():
@@ -50,13 +50,23 @@ class NavigationContractTests(unittest.TestCase):
             with self.assertRaises(ValueError): validate_trial(bad,"navigation",0)
 
     def test_review_binding_requires_exact_whole_archive_binary_and_protocol(self):
-        files={k:"a"*64 for k in ("archive","binary","worker","protocol","fixture","dataset","layout_receipt","storage","coordinator")}
-        binding={"version":2,"catalog_schema":6,"clean":True,"source_revision":"b"*40,"planned_measured_children":44,"planned_verifiers":44,
+        files={k:"a"*64 for k in ("archive","binary","worker","protocol","fixture","dataset","layout_receipt","storage","coordinator","schema_contract")}
+        binding={"version":PROTOCOL,"catalog_schema":CURRENT_SCHEMA,"clean":True,"source_revision":"b"*40,"planned_measured_children":44,"planned_verifiers":44,
                  **{name+"_sha256":value for name,value in files.items()}}
         validate_binding(binding,files)
         for field in ("catalog_schema","version","clean","archive_sha256","binary_sha256","protocol_sha256","planned_measured_children"):
             bad=copy.deepcopy(binding);bad[field]=None
             with self.assertRaises(ValueError): validate_binding(bad,files)
+
+    def test_child_keeps_native_protocol_two_at_current_schema(self):
+        child={"version":2,"catalog_schema":CURRENT_SCHEMA,"complete":True,
+               "profile":"standard","workload":"warm","dataset_blake3":"a"*64}
+        validate_child_identity(child,"standard","warm","a"*64)
+        for field,value in (("version",PROTOCOL),("catalog_schema",6),("complete",False),
+                            ("profile","constrained"),("workload","fresh"),("dataset_blake3","b"*64)):
+            bad={**child,field:value}
+            with self.subTest(field=field),self.assertRaises(ValueError):
+                validate_child_identity(bad,"standard","warm","a"*64)
 
 
 if __name__=="__main__": unittest.main()

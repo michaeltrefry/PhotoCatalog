@@ -1,7 +1,7 @@
 //! Decoded pixels retain their memory reservation until the final consumer drops
 //! them. Evicting an LRU entry alone cannot make externally held pixels free.
 use super::{Codec, PreparedRgb, decode, encoded_dimensions};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -80,6 +80,42 @@ impl ByteBudget {
 impl ByteReservation {
     pub(crate) fn bytes(&self) -> u64 {
         self.bytes
+    }
+    /// Transfer part of an already-held allowance without charging the shared
+    /// pool a second time. Process supervisors use this after one aggregate
+    /// admission succeeds to give an independently retained owner its subgrant.
+    pub(crate) fn split_exact(
+        &mut self,
+        bytes: u64,
+    ) -> std::result::Result<ByteReservation, ByteLimit> {
+        if bytes > self.bytes {
+            return Err(ByteLimit {
+                required: bytes,
+                available: self.bytes,
+            });
+        }
+        self.bytes -= bytes;
+        Ok(ByteReservation {
+            budget: self.budget.clone(),
+            bytes,
+        })
+    }
+    pub(crate) fn same_pool(&self, budget: &ByteBudget) -> bool {
+        self.budget.same_pool(budget)
+    }
+    pub(crate) fn merge_transferred(&mut self, mut other: ByteReservation) -> Result<()> {
+        ensure!(
+            Arc::ptr_eq(&self.budget.0, &other.budget.0),
+            "transferred reservations belong to different pools"
+        );
+        self.bytes = self
+            .bytes
+            .checked_add(other.bytes)
+            .context("transferred reservation overflow")?;
+        // The aggregate charge never changed, so consuming the transferred
+        // token must not adjust the shared pool's used count.
+        other.bytes = 0;
+        Ok(())
     }
     pub(crate) fn grow_exact(&mut self, bytes: u64) -> std::result::Result<(), ByteLimit> {
         let mut state = self.budget.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -335,6 +371,24 @@ mod tests {
         let equal = ByteBudget::new(100).unwrap();
         assert!(pool.same_pool(&same));
         assert!(!pool.same_pool(&equal));
+    }
+    #[test]
+    fn split_transfers_an_existing_charge_without_double_reservation() -> Result<()> {
+        let pool = ByteBudget::new(100)?;
+        let mut parent = pool.reserve_exact(100)?;
+        let child = parent.split_exact(37)?;
+        assert_eq!(pool.used(), 100);
+        assert_eq!(parent.bytes(), 63);
+        assert_eq!(child.bytes(), 37);
+        assert!(child.same_pool(&pool));
+        assert!(parent.split_exact(64).is_err());
+        assert_eq!(parent.bytes(), 63);
+        parent.merge_transferred(child)?;
+        assert_eq!(parent.bytes(), 100);
+        assert_eq!(pool.used(), 100);
+        drop(parent);
+        assert_eq!(pool.used(), 0);
+        Ok(())
     }
     #[test]
     fn lm_supervisor_batch2_typed_reservation_denies_atomically_and_retries_same_pool() {

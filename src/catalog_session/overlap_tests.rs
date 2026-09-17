@@ -255,6 +255,21 @@ pub(crate) fn run(
         ready_rx.recv_timeout(std::time::Duration::from_secs(15))?;
         let root = session.bootstrap.root_capability();
         if alias {
+            let observer = storage::Observer(session.authority.clone());
+            let shm = request.root.to_path()?.join("catalog.sqlite3-shm");
+            let evidence = observer.evidence(&shm, &AtomicBool::new(false))?;
+            ensure!(
+                evidence.length > 0,
+                "storage F reader did not consume the lock-bearing alias"
+            );
+            ensure!(
+                observer.quick(&shm, &evidence, &AtomicBool::new(false))?,
+                "storage quick identity differs"
+            );
+            ensure!(
+                observer.object(&shm, &AtomicBool::new(false))? == evidence.object,
+                "storage object identity differs"
+            );
             let error = filesystem
                 .restore_status(&root)
                 .err()

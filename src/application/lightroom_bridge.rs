@@ -3,6 +3,7 @@
 use super::{I64, U64, lightroom as lw};
 use crate::storage_volume::NativePath;
 use anyhow::{Context, Result, ensure};
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 mod wire;
 pub use wire::*;
@@ -16,6 +17,7 @@ impl Drop for OwnerLease {
 const ENVELOPE: usize = 128 * 1024;
 // JSON may escape a single source byte to six bytes. Leave envelope headroom.
 const CHUNK: usize = (ENVELOPE - 16 * 1024) / 6;
+pub(super) const INPUT_OWNED_OVERHEAD: usize = 256;
 fn identity(s: &str) -> Result<()> {
     ensure!(
         !s.is_empty() && s.len() <= 128,
@@ -59,6 +61,11 @@ struct Upload {
     hash: blake3::Hasher,
     sealed: Option<Arc<Vec<String>>>,
 }
+pub(super) struct MetadataLayouts {
+    pub upload: usize,
+    pub control: usize,
+    pub coordinator: usize,
+}
 impl Upload {
     fn status(&self, attempt: &str) -> InputStatus {
         InputStatus {
@@ -73,6 +80,77 @@ impl Upload {
             complete: self.sealed.is_some(),
         }
     }
+    fn bytes(&self) -> Result<Vec<u8>> {
+        let chunks = self.sealed.as_ref().context("input is incomplete")?;
+        let mut bytes = Vec::with_capacity(self.total);
+        for chunk in chunks.iter() {
+            bytes.extend_from_slice(chunk.as_bytes());
+        }
+        ensure!(bytes.len() == self.total, "sealed input length differs");
+        ensure!(
+            self.digest.as_deref() == Some(blake3::hash(&bytes).to_hex().as_str()),
+            "sealed input digest differs"
+        );
+        Ok(bytes)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArtifactReceipt {
+    receipt: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovalReceiptDraft {
+    protocol: u32,
+    review_token: String,
+    destination: NativePath,
+    import_source: String,
+    overlap: crate::catalog_migration::importer::OverlapPolicy,
+    keyword_overlap: crate::catalog_migration::importer::KeywordOverlap,
+    artifacts: Vec<ArtifactReceipt>,
+    supplements: Vec<crate::lightroom::selection::ExactDocument>,
+    authorization: String,
+}
+
+fn resolve_approval_receipts(
+    bytes: &[u8],
+    review_token: &str,
+    cancel: &std::sync::atomic::AtomicBool,
+    mut resolve: impl FnMut(&str) -> Result<crate::lightroom::selection::ExactDocument>,
+) -> Result<crate::lightroom::selection::ApprovalDraft> {
+    let public: ApprovalReceiptDraft = serde_json::from_slice(bytes)?;
+    ensure!(
+        public.protocol == 1 && public.review_token == review_token,
+        "approval receipt draft protocol or review token differs"
+    );
+    ensure!(
+        public.artifacts.len() <= crate::lightroom::selection::APPROVAL_ROSTER_LIMIT
+            && public.supplements.len() <= crate::lightroom::selection::APPROVAL_ROSTER_LIMIT,
+        "approval roster bound"
+    );
+    let mut artifacts = Vec::with_capacity(public.artifacts.len());
+    for reference in public.artifacts {
+        ensure!(
+            !cancel.load(std::sync::atomic::Ordering::Acquire),
+            "approval receipt resolution canceled"
+        );
+        uuid::Uuid::parse_str(&reference.receipt)?;
+        artifacts.push(resolve(&reference.receipt)?);
+    }
+    Ok(crate::lightroom::selection::ApprovalDraft {
+        protocol: public.protocol,
+        review_token: public.review_token,
+        destination: public.destination,
+        import_source: public.import_source,
+        overlap: public.overlap,
+        keyword_overlap: public.keyword_overlap,
+        artifacts,
+        supplements: public.supplements,
+        authorization: public.authorization,
+    })
 }
 #[derive(Default)]
 pub(crate) struct Control {
@@ -116,7 +194,57 @@ impl Control {
         );
         Ok(u)
     }
-    pub(crate) fn direct(&mut self, request: Request, envelope: usize) -> Result<Response> {
+    pub(crate) fn approval_documents(
+        &mut self,
+        g: &Guard,
+        input: &str,
+        review_token: &str,
+        cancel: &std::sync::atomic::AtomicBool,
+        mut resolve: impl FnMut(&str) -> Result<crate::lightroom::selection::ExactDocument>,
+    ) -> Result<Response> {
+        let w = self.checked(g)?;
+        idle(&w.status())?;
+        let upload = self.input(g, input)?;
+        ensure!(
+            upload.purpose == InputPurpose::ApprovalDraft,
+            "input purpose differs"
+        );
+        ensure!(
+            self.status()
+                .as_ref()
+                .and_then(|s| s.review_token.as_deref())
+                == Some(review_token),
+            "approval factory review token differs"
+        );
+        ensure!(
+            !cancel.load(std::sync::atomic::Ordering::Acquire),
+            "approval receipt resolution canceled"
+        );
+        let trusted =
+            resolve_approval_receipts(&upload.bytes()?, review_token, cancel, &mut resolve)?;
+        ensure!(
+            !cancel.load(std::sync::atomic::Ordering::Acquire),
+            "approval receipt resolution canceled"
+        );
+        let bytes = crate::lightroom::bounded_json(&trusted, w.status().limits.request_bytes)?;
+        let json = lw::Payload {
+            bytes: bytes.len(),
+            chunks: Arc::new(vec![String::from_utf8(bytes)?]),
+        };
+        w.bridge_deferred(
+            &g.generation,
+            &g.operation,
+            lw::DeferredAction::ApprovalDocuments { json },
+        )?;
+        self.upload = None;
+        Ok(Response::Status(self.status()))
+    }
+    pub(crate) fn direct(
+        &mut self,
+        request: Request,
+        envelope: usize,
+        managed: Option<&Arc<dyn lw::ManagedIo>>,
+    ) -> Result<Response> {
         match request {
             Request::Options {} => Ok(Response::Options(options(envelope))),
             Request::Status { workbench, attempt } => {
@@ -193,6 +321,20 @@ impl Control {
                 };
                 Ok(Response::Input(value))
             }
+            Request::SealedDocument { request } => {
+                request.validate()?;
+                let value = managed
+                    .context("sealed document reads require the managed filesystem owner")?
+                    .sealed_document(request, &std::sync::atomic::AtomicBool::new(false))?;
+                Ok(Response::SealedDocument(value))
+            }
+            Request::ArtifactPreparation { request } => {
+                request.validate()?;
+                let value = managed
+                    .context("artifact preparation requires the managed filesystem owner")?
+                    .artifact_preparation(request, &std::sync::atomic::AtomicBool::new(false))?;
+                Ok(Response::ArtifactPreparation(value))
+            }
             _ => anyhow::bail!("inspection request requires actor admission"),
         }
     }
@@ -219,18 +361,44 @@ pub(crate) struct Coordinator {
     owner: Option<lw::Workbench>,
     lease: Option<OwnerLease>,
     control: Arc<Mutex<Control>>,
+    managed: Option<Arc<dyn lw::ManagedIo>>,
+}
+pub(super) fn metadata_layouts() -> MetadataLayouts {
+    MetadataLayouts {
+        upload: std::mem::size_of::<Upload>(),
+        control: std::mem::size_of::<Control>(),
+        coordinator: std::mem::size_of::<Coordinator>(),
+    }
 }
 impl Coordinator {
+    pub(crate) fn fatal(&self) -> bool {
+        self.owner
+            .as_ref()
+            .is_some_and(|owner| owner.control().fatal())
+    }
+
     pub(crate) fn new(control: Arc<Mutex<Control>>) -> Self {
         Self {
             owner: None,
             lease: None,
             control,
+            managed: None,
         }
     }
-    pub(crate) fn maintain(&mut self) {
+    pub(crate) fn new_managed(
+        control: Arc<Mutex<Control>>,
+        managed: Arc<dyn lw::ManagedIo>,
+    ) -> Self {
+        Self {
+            owner: None,
+            lease: None,
+            control,
+            managed: Some(managed),
+        }
+    }
+    pub(crate) fn maintain(&mut self) -> Result<()> {
         if let Some(w) = &mut self.owner {
-            let joined = w.poll_closed().unwrap_or(true);
+            let joined = w.poll_closed()?;
             if joined {
                 self.owner = None;
                 self.lease = None;
@@ -240,18 +408,41 @@ impl Coordinator {
                     .drained = true;
             }
         }
+        Ok(())
     }
-    pub(crate) fn shutdown(&mut self) {
+    pub(crate) fn shutdown(&mut self) -> Result<()> {
         self.control
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .signal_shutdown();
-        drop(self.owner.take());
+        if let Some(owner) = &mut self.owner {
+            owner.request_close();
+            while !owner.poll_closed()? {
+                let status = owner.control().status();
+                ensure!(
+                    !owner.control().fatal(),
+                    "managed Workbench close failed: {}",
+                    status.error.as_deref().unwrap_or("retained close failure")
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+        self.owner = None;
         self.lease = None;
         self.control
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .drained = true;
+        Ok(())
+    }
+
+    /// A terminal application actor has no caller left that can retry checked
+    /// shutdown. Keep every remaining child and dependency owner alive rather
+    /// than allowing field destruction to counterfeit a successful reap.
+    pub(crate) fn retain_failed_shutdown(&mut self) {
+        std::mem::forget(self.owner.take());
+        std::mem::forget(self.lease.take());
+        std::mem::forget(self.managed.take());
     }
     pub(crate) fn request(
         &mut self,
@@ -264,7 +455,7 @@ impl Coordinator {
                 .control
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .direct(request, envelope);
+                .direct(request, envelope, self.managed.as_ref());
         }
         if let Request::Open {
             attempt,
@@ -279,7 +470,7 @@ impl Coordinator {
                 "inspection transport requires at least 48KiB envelopes"
             );
             identity(&attempt)?;
-            self.maintain();
+            self.maintain()?;
             ensure!(
                 self.owner.is_none(),
                 "close and drain the current inspection workbench before opening another"
@@ -301,13 +492,18 @@ impl Coordinator {
                 "another desktop inspection owner is active in this process"
             );
             let lease = OwnerLease;
-            let w = lw::Workbench::spawn(lw::Config {
+            let config = lw::Config {
                 root,
                 mode,
                 capture_executable: NativePath::from_path(executable),
                 capture_staging,
                 limits: limits.try_into()?,
-            })?;
+            };
+            let w = if let Some(managed) = &self.managed {
+                lw::Workbench::spawn_managed(config, managed)?
+            } else {
+                lw::Workbench::spawn(config)?
+            };
             c.attempt = Some(attempt);
             c.workbench = Some(w.control());
             c.upload = None;
@@ -383,6 +579,37 @@ impl Coordinator {
                                 output,
                             },
                         )?;
+                    }
+                    Action::ApprovalDocuments {
+                        input,
+                        review_token,
+                    } => {
+                        let managed = self.managed.as_ref().context(
+                            "approval documents require filesystem receipts resolved by the managed desktop owner",
+                        )?;
+                        let cancel = std::sync::atomic::AtomicBool::new(false);
+                        return c.approval_documents(
+                            &g,
+                            &input,
+                            &review_token,
+                            &cancel,
+                            |receipt| {
+                                let request = crate::filesystem_worker::wire::LightroomArtifactPreparation::Resolve {
+                                    receipt: receipt.into(),
+                                };
+                                match managed.artifact_preparation(request, &cancel)? {
+                                    Some(crate::filesystem_worker::wire::LightroomArtifactPreparationReply::Resolved {
+                                        input_json,
+                                        input_blake3,
+                                        ..
+                                    }) => Ok(crate::lightroom::selection::ExactDocument {
+                                        json: input_json,
+                                        blake3: input_blake3,
+                                    }),
+                                    _ => anyhow::bail!("prepared artifact receipt resolution is absent"),
+                                }
+                            },
+                        );
                     }
                     value => {
                         w.bridge_start(&g.generation, &g.operation, typed_action(value)?)?;
@@ -467,9 +694,12 @@ impl Coordinator {
                     .checked_add(std::mem::size_of::<String>() * 2)
                     .context("input allocation overflow")?;
                 ensure!(
-                    u.owned
-                        .checked_add(charge)
-                        .is_some_and(|n| n <= u.total.saturating_mul(3).saturating_add(256)),
+                    u.owned.checked_add(charge).is_some_and(|n| {
+                        n <= u
+                            .total
+                            .saturating_mul(3)
+                            .saturating_add(INPUT_OWNED_OVERHEAD)
+                    }),
                     "input owned allocation budget"
                 );
                 let u = c.upload.as_mut().unwrap();
@@ -569,7 +799,7 @@ fn typed_action(a: Action) -> Result<lw::Action> {
 
 impl Drop for Coordinator {
     fn drop(&mut self) {
-        self.shutdown();
+        let _ = self.shutdown();
     }
 }
 

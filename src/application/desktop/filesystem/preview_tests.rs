@@ -2,10 +2,11 @@
 use super::super::DesktopBridge;
 use super::{Call, Parent};
 use crate::application::{
-    Config, Limits, PreviewState, PreviewStatus, PreviewTier, Reply, Request, Response, U64,
+    Config, Limits, PreviewRoute, PreviewState, PreviewStatus, PreviewTier, Reply, Request,
+    Response, U64,
 };
 use crate::catalog_edits::VariantKey;
-use crate::catalog_session::{RootCapability, native as n};
+use crate::catalog_session::{CatalogFilesystem, RootCapability, native as n};
 use crate::filesystem_worker::client::Client;
 use crate::storage_volume::NativePath;
 use anyhow::{Context, Result, ensure};
@@ -53,6 +54,7 @@ struct Running {
     parent: Arc<Parent>,
     client: Arc<Client>,
     observed: Arc<Mutex<Vec<Observation>>>,
+    restored_roots: Arc<Mutex<Vec<RootCapability>>>,
     metadata: crate::preview::ByteBudget,
     native: crate::preview::ByteBudget,
     temporary: Arc<tempfile::TempDir>,
@@ -69,6 +71,7 @@ struct ExportFixtureOptions<'a> {
     workers: usize,
     export_executable: &'a Path,
     worker_bytes: u64,
+    configured_originals: bool,
 }
 type ManagedExportMetadataJob = (String, PathBuf, &'static str, Vec<u8>);
 type ExportObserverRecord = (String, [u8; 32]);
@@ -130,6 +133,7 @@ impl Running {
             workers,
             export_executable: executable,
             worker_bytes: 64 * 1024 * 1024,
+            configured_originals: true,
         })
     }
     fn start_export_options(options: ExportFixtureOptions<'_>) -> Result<(Self, String)> {
@@ -143,11 +147,15 @@ impl Running {
             workers,
             export_executable,
             worker_bytes,
+            configured_originals,
         } = options;
         ensure!((1..=2).contains(&workers), "fixture worker count");
         let client = Arc::new(Client::spawn(
             executable,
-            vec![NativePath::from_path(originals)],
+            configured_originals
+                .then(|| NativePath::from_path(originals))
+                .into_iter()
+                .collect(),
         )?);
         let parent = Parent::new(client.clone());
         let mut before_catalog = BeforeCatalog {
@@ -176,7 +184,10 @@ impl Running {
         let config = Config {
             worker_executable: executable.to_owned(),
             cache_root: None,
-            original_roots: vec![originals.to_owned()],
+            original_roots: configured_originals
+                .then(|| originals.to_owned())
+                .into_iter()
+                .collect(),
             preview_policy: policy,
             preview_limits: limits.clone(),
             limits: Limits::default(),
@@ -186,9 +197,14 @@ impl Running {
         parent.configure_native(executable.to_owned(), limits, &native)?;
         parent.configure_export_native(export_executable.to_owned(), workers, &native)?;
         let observed: Arc<Mutex<Vec<Observation>>> = Default::default();
+        let restored_roots: Arc<Mutex<Vec<RootCapability>>> = Default::default();
         let weak = Arc::downgrade(&parent);
         let observations = observed.clone();
+        let restored = restored_roots.clone();
         *parent.observer.lock().unwrap() = Some(Arc::new(move |call, after| {
+            if after && let Call::RestoreOriginalRoot(request) = call {
+                restored.lock().unwrap().push(request.root.clone());
+            }
             if after
                 && let Call::Native(request) = call
                 && let n::Action::Spawn { work, .. } = &request.action
@@ -217,11 +233,18 @@ impl Running {
         }));
         config.validate()?;
         let metadata = crate::preview::ByteBudget::new(config.requested_preview_metadata_bytes()?)?;
+        let migration_source = crate::preview::ByteBudget::new(1)?;
+        let migration_result = crate::preview::ByteBudget::new(1)?;
         // All pre-C fallibility passed while guarded. Once called, spawn_inner
         // owns C creation and its Unstarted error retains F when required.
         before_catalog.parent.take();
-        let bridge = match DesktopBridge::spawn_inner(config, Some(parent.clone()), Some(&metadata))
-        {
+        let bridge = match DesktopBridge::spawn_inner(
+            config,
+            Some(parent.clone()),
+            Some(&metadata),
+            Some(&migration_source),
+            Some(&migration_result),
+        ) {
             Ok(bridge) => bridge,
             Err(error) => {
                 if let Some(unstarted) = error.downcast_ref::<super::Unstarted>()
@@ -249,6 +272,7 @@ impl Running {
             parent,
             client,
             observed,
+            restored_roots,
             metadata,
             native,
             temporary,
@@ -269,6 +293,15 @@ impl Running {
         Ok((running, token))
     }
     fn ready(&self, token: &str, key: &VariantKey, generation: u64) -> Result<PreviewStatus> {
+        self.ready_with_diagnostics(token, key, generation, false)
+    }
+    fn ready_with_diagnostics(
+        &self,
+        token: &str,
+        key: &VariantKey,
+        generation: u64,
+        diagnostics: bool,
+    ) -> Result<PreviewStatus> {
         let Response::Preview(mut status) = command(
             &self.bridge,
             Request::Preview {
@@ -279,6 +312,7 @@ impl Running {
                 viewport: "fixture".into(),
                 generation: U64(generation),
                 foreground: true,
+                diagnostics,
             },
         )?
         else {
@@ -365,8 +399,24 @@ impl Running {
                 eprintln!("{error:#}");
             }
         }
-        let mut filesystem_retired = false;
-        if c_reaped {
+        // DesktopBridge may already have checked native dependents, reaped F,
+        // and joined the relay. In particular, forced retirement preserves an
+        // Unknown operation diagnostic; invoking normal F work again is invalid.
+        let mut filesystem_retired = self
+            .bridge
+            .0
+            .shared
+            .state
+            .lock()
+            .unwrap()
+            .filesystem_verified;
+        if filesystem_retired {
+            ensure!(
+                self.parent.threads.lock().unwrap().is_empty(),
+                "F retirement proof retained relay threads"
+            );
+        }
+        if c_reaped && !filesystem_retired {
             // This fixture admits only the preview helper allowlist. Once C is
             // reaped, forced F cleanup cannot race an untracked descendant.
             match self.parent.finish_after_dependents(false) {
@@ -483,6 +533,460 @@ fn fixture() -> Result<(Arc<tempfile::TempDir>, PathBuf, PathBuf, VariantKey, St
     drop(catalog);
     Ok((temp, root, originals, key, checksum))
 }
+
+#[cfg(unix)]
+#[derive(Default)]
+struct BackupProcessProbe {
+    state: Mutex<(Vec<crate::catalog_backup::managed::ProcessEvent>, bool)>,
+    wake: std::sync::Condvar,
+}
+#[cfg(unix)]
+struct BackupProbePause(Arc<BackupProcessProbe>);
+#[cfg(unix)]
+impl Drop for BackupProbePause {
+    fn drop(&mut self) {
+        // Release the injected pause before Running's checked cleanup, even
+        // when an assertion or fallible setup returns early.
+        self.0.release();
+    }
+}
+#[cfg(unix)]
+impl BackupProcessProbe {
+    fn observe(&self, event: crate::catalog_backup::managed::ProcessEvent) {
+        let mut state = self.state.lock().unwrap();
+        state.0.push(event);
+        self.wake.notify_all();
+        if matches!(
+            event,
+            crate::catalog_backup::managed::ProcessEvent::Spawned { .. }
+        ) {
+            while state.1 {
+                state = self.wake.wait(state).unwrap();
+            }
+        }
+    }
+    fn pause(self: &Arc<Self>) -> BackupProbePause {
+        self.state.lock().unwrap().1 = true;
+        BackupProbePause(self.clone())
+    }
+    fn spawned(&self) -> Result<(u32, u32)> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if let Some(pids) = state.0.iter().find_map(|event| match event {
+                crate::catalog_backup::managed::ProcessEvent::Spawned { backup, filesystem } => {
+                    Some((*backup, *filesystem))
+                }
+                _ => None,
+            }) {
+                return Ok(pids);
+            }
+            let now = Instant::now();
+            ensure!(now < deadline, "managed backup process spawn timeout");
+            state = self.wake.wait_timeout(state, deadline - now).unwrap().0;
+        }
+    }
+    fn release(&self) {
+        self.state.lock().unwrap().1 = false;
+        self.wake.notify_all();
+    }
+    fn reaped(&self, backup: u32, filesystem: u32) -> bool {
+        let state = self.state.lock().unwrap();
+        state
+            .0
+            .contains(&crate::catalog_backup::managed::ProcessEvent::BackupReaped { backup })
+            && state.0.contains(
+                &crate::catalog_backup::managed::ProcessEvent::FilesystemReaped { filesystem },
+            )
+    }
+}
+
+#[cfg(unix)]
+fn process_parent(pid: u32) -> Result<u32> {
+    let pid_text = pid.to_string();
+    let output = std::process::Command::new("ps")
+        .args(["-o", "ppid=", "-p", pid_text.as_str()])
+        .output()?;
+    ensure!(output.status.success(), "ps failed for process {pid}");
+    Ok(std::str::from_utf8(&output.stdout)?.trim().parse()?)
+}
+
+#[cfg(unix)]
+fn backup_snapshot(bridge: &DesktopBridge) -> Result<Option<crate::application::backup::Snapshot>> {
+    let Response::Backup(snapshot) = command(bridge, Request::BackupStatus)? else {
+        anyhow::bail!("wrong backup status reply")
+    };
+    Ok(snapshot)
+}
+
+#[cfg(unix)]
+fn wait_backup_terminal(bridge: &DesktopBridge) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if backup_snapshot(bridge)?.is_some_and(|snapshot| {
+            matches!(
+                snapshot.state,
+                crate::application::backup::State::Complete
+                    | crate::application::backup::State::Failed
+            )
+        }) {
+            return Ok(());
+        }
+        ensure!(Instant::now() < deadline, "managed backup terminal timeout");
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires explicitly configured built CLI; actual G/C/B/F fixture"]
+fn actual_g_owns_backup_siblings_and_close_waits_for_checked_drain() -> Result<()> {
+    let executable = PathBuf::from(
+        std::env::var_os("PHOTOCATALOG_TEST_EXECUTABLE").context("configured CLI required")?,
+    );
+    ensure!(executable.is_absolute(), "configured CLI must be absolute");
+    let (temporary, root, originals, _, _) = fixture()?;
+    let (mut running, token) =
+        Running::start(temporary.clone(), &executable, &root, &originals, false)?;
+    let probe = Arc::new(BackupProcessProbe::default());
+    let _pause = probe.pause();
+    let observer = probe.clone();
+    running
+        .bridge
+        .set_backup_process_probe(Arc::new(move |event| observer.observe(event)))?;
+    let bundle = temporary.path().join("close-backup");
+    let Response::Backup(Some(started)) = command(
+        &running.bridge,
+        Request::BackupCreate {
+            catalog: token.clone(),
+            bundle: NativePath::from_path(&bundle),
+        },
+    )?
+    else {
+        anyhow::bail!("wrong backup start reply")
+    };
+    let (backup_pid, filesystem_pid) = probe.spawned()?;
+    ensure!(
+        process_parent(backup_pid)? == std::process::id(),
+        "B is not a direct G child"
+    );
+    ensure!(
+        process_parent(filesystem_pid)? == std::process::id(),
+        "backup F is not a direct G child"
+    );
+    ensure!(
+        command(
+            &running.bridge,
+            Request::Export {
+                catalog: token.clone(),
+                request: Box::new(crate::application::exports::Request::Begin),
+            },
+        )
+        .is_err(),
+        "G admitted a new export job while backup custody was live"
+    );
+    ensure!(
+        command(
+            &running.bridge,
+            Request::Close {
+                catalog: "stale-close-token".into(),
+            },
+        )
+        .is_err(),
+        "stale Close unexpectedly reached G retirement"
+    );
+    ensure!(
+        backup_snapshot(&running.bridge)?.is_some_and(|snapshot| {
+            snapshot.operation == started.operation
+                && snapshot.state == crate::application::backup::State::Running
+                && !snapshot.cancellation_requested
+        }),
+        "stale Close changed the active backup"
+    );
+    ensure!(
+        unsafe { libc::kill(backup_pid as libc::pid_t, 0) } == 0
+            && unsafe { libc::kill(filesystem_pid as libc::pid_t, 0) } == 0,
+        "stale Close retired a G backup child"
+    );
+    let oversized = "x".repeat(running.bridge.0.shared.limits.request_bytes + 1);
+    ensure!(
+        running
+            .bridge
+            .submit(Request::Close { catalog: oversized })
+            .is_err(),
+        "oversized Close passed the shared public request boundary"
+    );
+    ensure!(
+        backup_snapshot(&running.bridge)?.is_some_and(|snapshot| {
+            snapshot.operation == started.operation
+                && snapshot.state == crate::application::backup::State::Running
+                && !snapshot.cancellation_requested
+        }),
+        "oversized Close changed the active backup"
+    );
+    let close = running.bridge.submit(Request::Close {
+        catalog: token.clone(),
+    })?;
+    ensure!(
+        close
+            .receiver
+            .recv_timeout(Duration::from_millis(50))
+            .is_err(),
+        "Close acknowledged before the paused B/F drain"
+    );
+    probe.release();
+    match close.receiver.recv_timeout(Duration::from_secs(30))? {
+        Reply::Ok {
+            value: Response::Status(status),
+        } => ensure!(status.catalog.is_none(), "Close retained catalog token"),
+        Reply::Error { error } => return Err(error.into()),
+        _ => anyhow::bail!("wrong Close reply"),
+    }
+    wait_backup_terminal(&running.bridge)?;
+    ensure!(
+        probe.reaped(backup_pid, filesystem_pid),
+        "Close returned before checked B/F reap"
+    );
+    ensure!(
+        backup_snapshot(&running.bridge)?.is_some_and(|snapshot| {
+            snapshot.operation == started.operation && snapshot.cancellation_requested
+        }),
+        "Close did not preserve the canceled operation identity"
+    );
+    running.token = None;
+    running.cleanup()?;
+    ensure!(
+        running.bridge.status().phase == super::super::TransportPhase::Closed,
+        "desktop reported Closed before complete control-task drain"
+    );
+    let tasks = running.bridge.0.control_tasks.lock().unwrap();
+    ensure!(
+        tasks.backup_admission.is_none() && tasks.close.is_none(),
+        "Closed retained a backup control task"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires explicitly configured built CLI; actual G/C/B/F fixture"]
+fn actual_c_death_cancels_and_reaps_g_owned_backup_siblings() -> Result<()> {
+    let executable = PathBuf::from(
+        std::env::var_os("PHOTOCATALOG_TEST_EXECUTABLE").context("configured CLI required")?,
+    );
+    ensure!(executable.is_absolute(), "configured CLI must be absolute");
+    let (temporary, root, originals, _, _) = fixture()?;
+    let (mut running, token) =
+        Running::start(temporary.clone(), &executable, &root, &originals, false)?;
+    let probe = Arc::new(BackupProcessProbe::default());
+    let _pause = probe.pause();
+    let observer = probe.clone();
+    running
+        .bridge
+        .set_backup_process_probe(Arc::new(move |event| observer.observe(event)))?;
+    let Response::Backup(Some(_)) = command(
+        &running.bridge,
+        Request::BackupCreate {
+            catalog: token,
+            bundle: NativePath::from_path(&temporary.path().join("c-death-backup")),
+        },
+    )?
+    else {
+        anyhow::bail!("wrong backup start reply")
+    };
+    let (backup_pid, filesystem_pid) = probe.spawned()?;
+    let c_pid = running.bridge.status().pid;
+    ensure!(
+        unsafe { libc::kill(c_pid as libc::pid_t, libc::SIGKILL) } == 0,
+        "kill C"
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !matches!(
+        running.bridge.status().phase,
+        super::super::TransportPhase::Failed | super::super::TransportPhase::Draining
+    ) {
+        ensure!(Instant::now() < deadline, "C death was not observed by G");
+        thread::sleep(Duration::from_millis(5));
+    }
+    probe.release();
+    wait_backup_terminal(&running.bridge)?;
+    running.token = None;
+    running.cleanup()?;
+    ensure!(
+        probe.reaped(backup_pid, filesystem_pid),
+        "C death cleanup returned before checked B/F reap"
+    );
+    let tasks = running.bridge.0.control_tasks.lock().unwrap();
+    ensure!(
+        tasks.backup_admission.is_none() && tasks.close.is_none(),
+        "C death cleanup retained a backup control task"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires explicitly configured built CLI; actual G/C/B/F fixture"]
+fn actual_public_backup_cancel_reaps_both_g_children_before_terminal_status() -> Result<()> {
+    let executable = PathBuf::from(
+        std::env::var_os("PHOTOCATALOG_TEST_EXECUTABLE").context("configured CLI required")?,
+    );
+    ensure!(executable.is_absolute(), "configured CLI must be absolute");
+    let (temporary, root, originals, _, _) = fixture()?;
+    let (running, token) =
+        Running::start(temporary.clone(), &executable, &root, &originals, false)?;
+    let probe = Arc::new(BackupProcessProbe::default());
+    let _pause = probe.pause();
+    let observer = probe.clone();
+    running
+        .bridge
+        .set_backup_process_probe(Arc::new(move |event| observer.observe(event)))?;
+    let Response::Backup(Some(started)) = command(
+        &running.bridge,
+        Request::BackupCreate {
+            catalog: token.clone(),
+            bundle: NativePath::from_path(&temporary.path().join("cancel-backup")),
+        },
+    )?
+    else {
+        anyhow::bail!("wrong backup start reply")
+    };
+    let (backup_pid, filesystem_pid) = probe.spawned()?;
+    let Response::Backup(Some(canceling)) = command(
+        &running.bridge,
+        Request::BackupCancel {
+            operation: started.operation.clone(),
+        },
+    )?
+    else {
+        anyhow::bail!("wrong backup cancel reply")
+    };
+    ensure!(
+        canceling.cancellation_requested
+            && canceling.state == crate::application::backup::State::CancelRequested,
+        "public cancel did not retain the running operation"
+    );
+    probe.release();
+    wait_backup_terminal(&running.bridge)?;
+    ensure!(
+        probe.reaped(backup_pid, filesystem_pid),
+        "terminal cancel status preceded checked B/F reap"
+    );
+    running.finish(token)
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires explicitly configured built CLI; actual G/C/B/F fixture"]
+fn actual_global_inspect_and_restore_remain_legal_after_catalog_close() -> Result<()> {
+    let executable = PathBuf::from(
+        std::env::var_os("PHOTOCATALOG_TEST_EXECUTABLE").context("configured CLI required")?,
+    );
+    ensure!(executable.is_absolute(), "configured CLI must be absolute");
+    let (temporary, root, originals, _, _) = fixture()?;
+    let (mut running, token) =
+        Running::start(temporary.clone(), &executable, &root, &originals, false)?;
+    let bundle = temporary.path().join("closed-inspection");
+    let rejected = temporary.path().join("stale-token");
+    ensure!(
+        command(
+            &running.bridge,
+            Request::BackupCreate {
+                catalog: "stale-catalog-token".into(),
+                bundle: NativePath::from_path(&rejected),
+            },
+        )
+        .is_err(),
+        "C admitted a stale catalog token for backup"
+    );
+    ensure!(
+        !rejected.exists(),
+        "stale token reached G backup process creation"
+    );
+    let Response::Backup(Some(_)) = command(
+        &running.bridge,
+        Request::BackupCreate {
+            catalog: token.clone(),
+            bundle: NativePath::from_path(&bundle),
+        },
+    )?
+    else {
+        anyhow::bail!("wrong backup start reply")
+    };
+    wait_backup_terminal(&running.bridge)?;
+    ensure!(
+        backup_snapshot(&running.bridge)?.is_some_and(|snapshot| {
+            snapshot.state == crate::application::backup::State::Complete
+                && matches!(
+                    snapshot.receipt,
+                    Some(crate::application::backup::Receipt::Backup(_))
+                )
+        }),
+        "managed create did not publish a backup receipt"
+    );
+    let Response::Status(closed) = command(
+        &running.bridge,
+        Request::Close {
+            catalog: token.clone(),
+        },
+    )?
+    else {
+        anyhow::bail!("wrong Close reply")
+    };
+    ensure!(closed.catalog.is_none(), "catalog remained open");
+    running.token = None;
+    let Response::Backup(Some(_)) = command(
+        &running.bridge,
+        Request::BackupInspect {
+            bundle: NativePath::from_path(&bundle),
+        },
+    )?
+    else {
+        anyhow::bail!("wrong inspect start reply")
+    };
+    wait_backup_terminal(&running.bridge)?;
+    ensure!(
+        backup_snapshot(&running.bridge)?.is_some_and(|snapshot| {
+            snapshot.state == crate::application::backup::State::Complete
+                && matches!(
+                    snapshot.receipt,
+                    Some(crate::application::backup::Receipt::Backup(_))
+                )
+        }),
+        "managed inspect did not retain its receipt"
+    );
+    let destination = temporary.path().join("restored");
+    let Response::Backup(Some(_)) = command(
+        &running.bridge,
+        Request::BackupRestore {
+            bundle: NativePath::from_path(&bundle),
+            destination: NativePath::from_path(&destination),
+        },
+    )?
+    else {
+        anyhow::bail!("wrong restore start reply")
+    };
+    wait_backup_terminal(&running.bridge)?;
+    ensure!(
+        backup_snapshot(&running.bridge)?.is_some_and(|snapshot| {
+            snapshot.state == crate::application::backup::State::Complete
+                && matches!(
+                    snapshot.receipt,
+                    Some(crate::application::backup::Receipt::Restore(_))
+                )
+        }),
+        "managed restore did not retain its receipt"
+    );
+    let restored = crate::Catalog::open(&destination)?;
+    ensure!(
+        restored
+            .restore_status()?
+            .is_some_and(|status| status.jobs_held),
+        "restored catalog lost its external-job hold"
+    );
+    drop(restored);
+    running.cleanup()
+}
 #[test]
 #[ignore = "requires explicitly configured built CLI; actual C/G/F/N fixture"]
 fn actual_managed_render_cold_cache_decode_and_warm_delivery() -> Result<()> {
@@ -508,13 +1012,56 @@ fn actual_managed_render_cold_cache_decode_and_warm_delivery() -> Result<()> {
     running.finish(token)?;
     let (running, token) = Running::start(temporary.clone(), &executable, &root, &originals, true)?;
     let cold = Instant::now();
-    let status = running.ready(&token, &key, 1)?;
+    let status = running.ready_with_diagnostics(&token, &key, 1, true)?;
+    let diagnostic = status
+        .diagnostic
+        .as_ref()
+        .context("missing retained-read diagnostic")?;
+    ensure!(
+        matches!(diagnostic.route, PreviewRoute::Retained)
+            && diagnostic.current_key_matches_selected == Some(true)
+            && diagnostic.expected_key_digest == diagnostic.selected_key_digest,
+        "cold retained route did not select the current key"
+    );
+    let retained_read = diagnostic
+        .retained_read
+        .as_ref()
+        .context("missing retained read phases")?;
+    ensure!(
+        retained_read.outcome == "ready"
+            && retained_read.decoded_hits + retained_read.decoded_misses == 1
+            && retained_read.total_ms >= retained_read.catalog_identity_ms
+            && retained_read.total_ms >= retained_read.store_read_checksum_ms
+            && retained_read.total_ms >= retained_read.header_decode_ms,
+        "cold retained read phases are inconsistent"
+    );
     let bytes = running.bytes(&token, &status.ticket)?;
     ensure!(
         blake3::hash(bytes.bytes()) == digest,
         "cached encoded bytes changed"
     );
     drop(bytes);
+    let Response::Preview(delivered) = command(
+        &running.bridge,
+        Request::PreviewStatus {
+            catalog: token.clone(),
+            ticket: status.ticket,
+        },
+    )?
+    else {
+        anyhow::bail!("wrong delivered status reply")
+    };
+    let delivery = delivered
+        .diagnostic
+        .and_then(|diagnostic| diagnostic.delivery)
+        .context("missing retained delivery phases")?;
+    ensure!(
+        delivery.retained_read.outcome == "ready"
+            && delivery.retained_read.decoded_hits + delivery.retained_read.decoded_misses == 1
+            && delivery.ready_for_transfer_ms >= delivery.retained_read.queue_ms
+            && delivery.total_ms >= delivery.ready_for_transfer_ms,
+        "cold retained delivery phases are inconsistent"
+    );
     let cold_elapsed = cold.elapsed();
     let initial = running.observed.lock().unwrap().len();
     ensure!(
@@ -681,6 +1228,7 @@ fn request(
             viewport: "fixture".into(),
             generation: U64(generation),
             foreground: true,
+            diagnostics: false,
         },
     )? {
         Response::Preview(status) => Ok(status),
@@ -1547,6 +2095,103 @@ fn managed_export_max_metadata_fixture_matches_derivative_limits() -> Result<()>
 }
 
 #[test]
+#[ignore = "requires explicitly configured built CLI; actual paired C/G/F import and reopen fixture"]
+fn actual_empty_config_actor_import_close_reopen_restores_export_authority() -> Result<()> {
+    use crate::application::ImportPhase;
+    use crate::catalog_session::InspectExportOriginal;
+
+    let executable = PathBuf::from(
+        std::env::var_os("PHOTOCATALOG_TEST_EXECUTABLE").context("configured CLI required")?,
+    );
+    ensure!(executable.is_absolute(), "configured CLI must be absolute");
+    let temporary = Arc::new(tempfile::tempdir()?);
+    let base = temporary.path().canonicalize()?;
+    let root = base.join("catalog");
+    let originals = base.join("selected-originals");
+    std::fs::create_dir(&originals)?;
+    let original = originals.join("selected.png");
+    image::RgbImage::from_pixel(16, 12, image::Rgb([30u8, 60, 90])).save(&original)?;
+    drop(crate::Catalog::open(&root)?);
+
+    let options = |temporary: Arc<tempfile::TempDir>| ExportFixtureOptions {
+        temporary,
+        executable: &executable,
+        root: &root,
+        originals: &originals,
+        small: false,
+        codec: crate::preview::Codec::Jpeg,
+        workers: 1,
+        export_executable: &executable,
+        worker_bytes: 64 * 1024 * 1024,
+        configured_originals: false,
+    };
+    let (first, token) = Running::start_export_options(options(temporary.clone()))?;
+    let Response::Import(Some(started)) = command(
+        &first.bridge,
+        Request::ImportStart {
+            catalog: token.clone(),
+            source: NativePath::from_path(&originals),
+        },
+    )?
+    else {
+        anyhow::bail!("managed import did not start")
+    };
+    ensure!(
+        started.source == NativePath::from_path(&originals),
+        "F did not return the selected canonical root"
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let completed = loop {
+        let Response::Import(Some(status)) = command(
+            &first.bridge,
+            Request::ImportStatus {
+                catalog: token.clone(),
+            },
+        )?
+        else {
+            anyhow::bail!("managed import status disappeared")
+        };
+        if status.phase == ImportPhase::Complete {
+            break status;
+        }
+        ensure!(
+            !matches!(status.phase, ImportPhase::Failed | ImportPhase::Canceled),
+            "managed import ended {:?}: {:?}",
+            status.phase,
+            status.error
+        );
+        ensure!(Instant::now() < deadline, "managed import timed out");
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    ensure!(completed.imported.0 == 1, "managed import count changed");
+    first.finish(token)?;
+    ensure!(
+        crate::Catalog::open(&root)?.browse(0, 10)?.len() == 1,
+        "managed actor did not commit the selected image"
+    );
+
+    let parked = base.join("selected-originals-offline");
+    std::fs::rename(&originals, &parked)?;
+    let (second, token) = Running::start_export_options(options(temporary.clone()))?;
+    let restored = second.restored_roots.lock().unwrap().clone();
+    ensure!(
+        restored.len() == 1,
+        "managed reopen did not restore exactly one persisted original root"
+    );
+    std::fs::rename(&parked, &originals)?;
+    second.client.inspect_export_original(
+        &InspectExportOriginal {
+            root: restored[0].clone(),
+            requested: NativePath::from_path(&original),
+            allowance: U64(std::fs::metadata(&original)?.len()),
+        },
+        &std::sync::atomic::AtomicBool::new(false),
+    )?;
+    second.finish(token)?;
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires explicitly configured built CLI; actual paired C/G/F/N export fixture"]
 fn actual_managed_export_replays_stage_and_native_acknowledgements_and_reuses_preview_pool()
 -> Result<()> {
@@ -1568,6 +2213,7 @@ fn actual_managed_export_replays_stage_and_native_acknowledgements_and_reuses_pr
         workers: 1,
         export_executable: &executable,
         worker_bytes: 512 * 1024 * 1024,
+        configured_originals: true,
     })?;
     let preview = running.ready(&token, &key, 1)?;
     let preview_bytes = running.bytes(&token, &preview.ticket)?;
@@ -1871,6 +2517,7 @@ fn actual_managed_export_failed_launch_drains_releases_and_restores_preview_capa
         workers: 1,
         export_executable: &export_executable,
         worker_bytes: 64 * 1024 * 1024,
+        configured_originals: true,
     })?;
     running.ready(&token, &key, 1)?;
     let calls = Arc::new(Mutex::new(Vec::new()));

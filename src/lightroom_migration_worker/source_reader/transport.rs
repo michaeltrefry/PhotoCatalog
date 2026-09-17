@@ -106,6 +106,9 @@ pub(super) enum Authority {
         limits: RawLimits,
         protected: Vec<FileKey>,
     },
+    CaptureSql {
+        value: super::capture_wire::Authority,
+    },
 }
 impl Authority {
     pub fn binding(&self) -> Result<String> {
@@ -114,6 +117,7 @@ impl Authority {
             Self::Artifact { descriptor, .. } => {
                 crate::lightroom::digest(&crate::lightroom::bounded_json(descriptor, 64 * 1024)?)
             }
+            Self::CaptureSql { value } => value.binding_blake3.clone(),
         })
     }
 }
@@ -123,6 +127,7 @@ pub(super) enum Read {
     Sql(Query),
     ArtifactVerify,
     ArtifactChunk { offset: U64 },
+    CaptureSql(super::capture_wire::Query),
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
@@ -265,6 +270,12 @@ impl Read {
             Self::Sql(Q::Resolve { .. }) => K::Resolution,
             Self::Sql(Q::ImageLinks { .. }) => K::ImageLinks,
             Self::ArtifactVerify => K::Verified,
+            Self::CaptureSql(query) => match query {
+                super::capture_wire::Query::SchemaObjects => K::CaptureSchemaObjects,
+                super::capture_wire::Query::Variables => K::CaptureVariables,
+                super::capture_wire::Query::TableRows { .. } => K::CaptureTable,
+                super::capture_wire::Query::Current => K::CaptureCurrent,
+            },
         }
     }
 }

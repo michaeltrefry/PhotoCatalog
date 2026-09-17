@@ -2,7 +2,7 @@
 //! byte evidence; typed row retention and projections are derivative and versioned.
 use super::{
     Issue, Limits, PROTOCOL,
-    capture::{Manifest, read_manifest},
+    capture::{Manifest, read_manifest_exact},
     digest, json_digest, path_value,
     source::Source,
 };
@@ -18,7 +18,7 @@ use std::{
 };
 
 /// Inspection-plan storage version; independent of the application catalog.
-pub const PLAN_SCHEMA_VERSION: i64 = 3;
+pub const PLAN_SCHEMA_VERSION: i64 = 4;
 pub(crate) mod desktop;
 pub mod selection;
 const PAGING_INDEXES: &str = "CREATE INDEX rows_revision_sequence ON rows(revision,sequence);
@@ -28,6 +28,7 @@ CREATE INDEX paths_revision_sequence ON paths(revision,sequence);
 CREATE INDEX facts_revision ON metadata_facts(revision);
 CREATE INDEX paths_pending_queue ON paths(revision,sequence) WHERE state='pending';
 CREATE INDEX paths_packet_queue ON paths(revision,sequence) WHERE state='pending' OR json_extract(evidence,'$.embedded_sidecar_xmp') IS NOT NULL;";
+const CAPTURE_NOT_REGISTERED: &str = "capture revision is not registered; choose its capture evidence folder and add captured evidence before resuming or inspecting it";
 const ROWS_PAGE: &str = "SELECT r.sequence,r.source_id,r.table_name,r.key_json,t.columns_json,r.cells_json,t.category FROM rows r JOIN tables t ON t.revision=r.revision AND t.name=r.table_name WHERE r.revision=?1 AND r.sequence>?2 ORDER BY r.sequence LIMIT ?3";
 const TABLE_ROWS_PAGE: &str = "SELECT r.sequence,r.source_id,r.table_name,r.key_json,t.columns_json,r.cells_json,t.category FROM rows r JOIN tables t ON t.revision=r.revision AND t.name=r.table_name WHERE r.revision=?1 AND r.sequence>?2 AND r.table_name=?3 ORDER BY r.sequence LIMIT ?4";
 const ISSUES_PAGE: &str = "SELECT sequence,source_id,code,detail FROM issues WHERE revision=? AND sequence>? ORDER BY sequence LIMIT ?";
@@ -203,15 +204,62 @@ pub struct Progress {
     pub retained_this_call: usize,
     pub stage: String,
 }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OriginalCandidate {
+    pub revision: String,
+    pub sequence: i64,
+    pub source_id: String,
+    pub path: NativePath,
+    pub packets: bool,
+    pub limits: Limits,
+    pub token: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OriginalFileObservation {
+    pub origin: String,
+    pub path: NativePath,
+    pub state: String,
+    pub error: Option<String>,
+    pub inspection: Option<xmp_packets::Inspection>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OriginalObservation {
+    pub token: String,
+    pub base_state: String,
+    pub metadata: serde_json::Value,
+    pub files: Vec<OriginalFileObservation>,
+    pub packet_gaps: bool,
+}
+#[derive(Clone, Debug)]
+pub(crate) struct ManagedTable {
+    pub name: String,
+    pub descriptor: crate::lightroom_migration_worker::source_reader::capture_wire::TableDescriptor,
+    pub cursor: Option<Vec<Cell>>,
+}
 pub struct Plan {
     db: Connection,
     root: PathBuf,
     execution: Option<Box<super::control::Control>>,
 }
-fn identifier(value: &str) -> String {
+pub(crate) struct ManagedPlanOpenError {
+    pub(crate) plan: Option<Box<Plan>>,
+    pub(crate) error: anyhow::Error,
+}
+impl ManagedPlanOpenError {
+    fn before_open(error: impl Into<anyhow::Error>) -> Self {
+        Self {
+            plan: None,
+            error: error.into(),
+        }
+    }
+}
+pub(crate) fn identifier(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
-pub(super) fn uri(path: &Path) -> Result<String> {
+pub(crate) fn uri(path: &Path) -> Result<String> {
     let path = fs::canonicalize(path)?;
     #[cfg(unix)]
     let bytes = {
@@ -239,7 +287,7 @@ pub(super) fn uri(path: &Path) -> Result<String> {
         .collect();
     Ok(format!("file:{escaped}?mode=ro&immutable=1"))
 }
-fn restrict(db: &Connection, limits: &Limits) -> Result<()> {
+pub(crate) fn restrict(db: &Connection, limits: &Limits) -> Result<()> {
     db.busy_timeout(Duration::from_millis(0))?;
     db.pragma_update(None, "trusted_schema", false)?;
     db.pragma_update(None, "mmap_size", 0)?;
@@ -354,38 +402,68 @@ pub(super) fn recover_private(source: &Path, destination: &Path, limits: &Limits
         .sync_all()?;
     Ok(())
 }
+fn initialize_plan(db: &Connection) -> Result<()> {
+    let transaction = db.unchecked_transaction()?;
+    transaction.execute_batch("PRAGMA application_id=0x50434c49;
+    CREATE TABLE captures(revision TEXT PRIMARY KEY,lineage TEXT NOT NULL,path TEXT NOT NULL,manifest TEXT NOT NULL,stage TEXT NOT NULL,schema_version TEXT,provider TEXT,evidence_revision INTEGER NOT NULL DEFAULT 0,schema_roster TEXT);
+    CREATE TABLE schema_objects(revision TEXT NOT NULL,kind TEXT NOT NULL,name TEXT NOT NULL,table_name TEXT NOT NULL,sql_text TEXT NOT NULL,PRIMARY KEY(revision,kind,name));
+    CREATE TABLE tables(revision TEXT NOT NULL,name TEXT NOT NULL,columns_json TEXT NOT NULL,key_json TEXT NOT NULL,schema_json TEXT NOT NULL,category TEXT NOT NULL,expected INTEGER,retained INTEGER NOT NULL DEFAULT 0,cursor TEXT,state TEXT NOT NULL,issue TEXT,PRIMARY KEY(revision,name));
+    CREATE TABLE rows(sequence INTEGER PRIMARY KEY,revision TEXT NOT NULL,source_id TEXT NOT NULL,table_name TEXT NOT NULL,key_json TEXT NOT NULL,cells_json TEXT NOT NULL,UNIQUE(revision,table_name,key_json));
+    CREATE INDEX source_rows ON rows(revision,table_name,sequence);
+    CREATE INDEX source_ids ON rows(revision,source_id);
+    CREATE TABLE entities(revision TEXT NOT NULL,source_id TEXT NOT NULL,table_name TEXT NOT NULL,local_key TEXT,global_key TEXT,fields_json TEXT NOT NULL,PRIMARY KEY(revision,source_id));
+    CREATE INDEX entity_local ON entities(revision,table_name,local_key);
+    CREATE INDEX entity_global ON entities(revision,table_name,global_key);
+    CREATE TABLE issues(sequence INTEGER PRIMARY KEY,revision TEXT NOT NULL,source_id TEXT,code TEXT NOT NULL,detail TEXT NOT NULL,UNIQUE(revision,source_id,code,detail));
+    CREATE TABLE packets(sequence INTEGER PRIMARY KEY,revision TEXT NOT NULL,source_id TEXT NOT NULL,origin TEXT NOT NULL,raw_digest TEXT NOT NULL,raw BLOB NOT NULL,decoded BLOB,detail TEXT NOT NULL,UNIQUE(revision,source_id,origin,raw_digest));
+    CREATE TABLE metadata_facts(revision TEXT NOT NULL,source_id TEXT NOT NULL,file_source_id TEXT,origin TEXT NOT NULL,packet_digest TEXT NOT NULL,field TEXT NOT NULL,value_json TEXT NOT NULL,PRIMARY KEY(revision,source_id,origin,packet_digest,field));
+    CREATE INDEX facts_by_file ON metadata_facts(revision,file_source_id,field);
+    CREATE TABLE references_out(sequence INTEGER PRIMARY KEY,revision TEXT NOT NULL,source_id TEXT NOT NULL,field TEXT NOT NULL,target_table TEXT NOT NULL,target_key TEXT NOT NULL,UNIQUE(revision,source_id,field,target_table,target_key));
+    CREATE TABLE paths(sequence INTEGER PRIMARY KEY,revision TEXT NOT NULL,source_id TEXT NOT NULL,original TEXT NOT NULL,inspection_path TEXT,state TEXT NOT NULL,evidence TEXT,UNIQUE(revision,source_id));
+    CREATE INDEX path_locator ON paths(revision,inspection_path,sequence);
+    CREATE TABLE inventories(digest TEXT PRIMARY KEY,json TEXT NOT NULL);
+    CREATE TABLE family_assignments(revision TEXT PRIMARY KEY,family TEXT NOT NULL,reason TEXT NOT NULL);
+    CREATE TABLE family_choices(family TEXT PRIMARY KEY,revision TEXT NOT NULL,evidence_digest TEXT NOT NULL,reason TEXT NOT NULL);
+    ")?;
+    transaction.execute_batch(PAGING_INDEXES)?;
+    transaction.pragma_update(None, "user_version", PLAN_SCHEMA_VERSION)?;
+    transaction.commit()?;
+    db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    Ok(())
+}
+pub(crate) fn physical(
+    key: &crate::lightroom_migration_worker::identity::FileKey,
+) -> crate::catalog_session::PhysicalObjectId {
+    #[cfg(unix)]
+    {
+        crate::catalog_session::PhysicalObjectId::Unix {
+            device: key.volume,
+            inode: key.index,
+        }
+    }
+    #[cfg(windows)]
+    {
+        crate::catalog_session::PhysicalObjectId::Windows {
+            volume_serial: key.volume,
+            file_index: key.index,
+        }
+    }
+}
+fn hex(value: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(value.len() * 2);
+    for byte in value {
+        write!(out, "{byte:02x}").unwrap();
+    }
+    out
+}
 impl Plan {
     pub fn create(root: &Path) -> Result<Self> {
         ensure!(!root.exists(), "inspection output must be a new directory");
         fs::create_dir(root)?;
         let db = Connection::open(root.join("inspection.sqlite3"))?;
         crate::configure_catalog_connection(&db)?;
-        let transaction = db.unchecked_transaction()?;
-        transaction.execute_batch("PRAGMA application_id=0x50434c49;
-CREATE TABLE captures(revision TEXT PRIMARY KEY,lineage TEXT NOT NULL,path TEXT NOT NULL,manifest TEXT NOT NULL,stage TEXT NOT NULL,schema_version TEXT,provider TEXT,evidence_revision INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE schema_objects(revision TEXT NOT NULL,kind TEXT NOT NULL,name TEXT NOT NULL,table_name TEXT NOT NULL,sql_text TEXT NOT NULL,PRIMARY KEY(revision,kind,name));
-CREATE TABLE tables(revision TEXT NOT NULL,name TEXT NOT NULL,columns_json TEXT NOT NULL,key_json TEXT NOT NULL,schema_json TEXT NOT NULL,category TEXT NOT NULL,expected INTEGER,retained INTEGER NOT NULL DEFAULT 0,cursor TEXT,state TEXT NOT NULL,issue TEXT,PRIMARY KEY(revision,name));
-CREATE TABLE rows(sequence INTEGER PRIMARY KEY,revision TEXT NOT NULL,source_id TEXT NOT NULL,table_name TEXT NOT NULL,key_json TEXT NOT NULL,cells_json TEXT NOT NULL,UNIQUE(revision,table_name,key_json));
-CREATE INDEX source_rows ON rows(revision,table_name,sequence);
-CREATE INDEX source_ids ON rows(revision,source_id);
-CREATE TABLE entities(revision TEXT NOT NULL,source_id TEXT NOT NULL,table_name TEXT NOT NULL,local_key TEXT,global_key TEXT,fields_json TEXT NOT NULL,PRIMARY KEY(revision,source_id));
-CREATE INDEX entity_local ON entities(revision,table_name,local_key);
-CREATE INDEX entity_global ON entities(revision,table_name,global_key);
-CREATE TABLE issues(sequence INTEGER PRIMARY KEY,revision TEXT NOT NULL,source_id TEXT,code TEXT NOT NULL,detail TEXT NOT NULL,UNIQUE(revision,source_id,code,detail));
-CREATE TABLE packets(sequence INTEGER PRIMARY KEY,revision TEXT NOT NULL,source_id TEXT NOT NULL,origin TEXT NOT NULL,raw_digest TEXT NOT NULL,raw BLOB NOT NULL,decoded BLOB,detail TEXT NOT NULL,UNIQUE(revision,source_id,origin,raw_digest));
-CREATE TABLE metadata_facts(revision TEXT NOT NULL,source_id TEXT NOT NULL,file_source_id TEXT,origin TEXT NOT NULL,packet_digest TEXT NOT NULL,field TEXT NOT NULL,value_json TEXT NOT NULL,PRIMARY KEY(revision,source_id,origin,packet_digest,field));
-CREATE INDEX facts_by_file ON metadata_facts(revision,file_source_id,field);
-CREATE TABLE references_out(sequence INTEGER PRIMARY KEY,revision TEXT NOT NULL,source_id TEXT NOT NULL,field TEXT NOT NULL,target_table TEXT NOT NULL,target_key TEXT NOT NULL,UNIQUE(revision,source_id,field,target_table,target_key));
-CREATE TABLE paths(sequence INTEGER PRIMARY KEY,revision TEXT NOT NULL,source_id TEXT NOT NULL,original TEXT NOT NULL,inspection_path TEXT,state TEXT NOT NULL,evidence TEXT,UNIQUE(revision,source_id));
-CREATE INDEX path_locator ON paths(revision,inspection_path,sequence);
-CREATE TABLE inventories(digest TEXT PRIMARY KEY,json TEXT NOT NULL);
-CREATE TABLE family_assignments(revision TEXT PRIMARY KEY,family TEXT NOT NULL,reason TEXT NOT NULL);
-CREATE TABLE family_choices(family TEXT PRIMARY KEY,revision TEXT NOT NULL,evidence_digest TEXT NOT NULL,reason TEXT NOT NULL);
-")?;
-        transaction.execute_batch(PAGING_INDEXES)?;
-        transaction.pragma_update(None, "user_version", PLAN_SCHEMA_VERSION)?;
-        transaction.commit()?;
-        db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        initialize_plan(&db)?;
         Ok(Self {
             db,
             root: fs::canonicalize(root)?,
@@ -448,6 +526,112 @@ CREATE TABLE family_choices(family TEXT PRIMARY KEY,revision TEXT NOT NULL,evide
             execution: None,
         })
     }
+    pub(crate) fn create_managed(
+        root: &Path,
+        expected: &crate::lightroom_migration_worker::identity::FileKey,
+    ) -> std::result::Result<Self, ManagedPlanOpenError> {
+        let root = fs::canonicalize(root).map_err(ManagedPlanOpenError::before_open)?;
+        let path = root.join("inspection.sqlite3");
+        let metadata = fs::symlink_metadata(&path).map_err(ManagedPlanOpenError::before_open)?;
+        if metadata.len() != 0 {
+            return Err(ManagedPlanOpenError::before_open(anyhow::anyhow!(
+                "managed inspection database must be empty"
+            )));
+        }
+        let db = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(ManagedPlanOpenError::before_open)?;
+        let plan = Self {
+            db,
+            root,
+            execution: None,
+        };
+        let admitted = (|| -> Result<()> {
+            crate::catalog_storage::verify_database_identity(&plan.db, &physical(expected))
+                .context("managed inspection create identity")?;
+            crate::configure_catalog_connection(&plan.db)?;
+            initialize_plan(&plan.db)?;
+            crate::catalog_storage::verify_database_identity(&plan.db, &physical(expected))
+                .context("managed inspection initialized identity")?;
+            Ok(())
+        })();
+        match admitted {
+            Ok(()) => Ok(plan),
+            Err(error) => Err(ManagedPlanOpenError {
+                plan: Some(Box::new(plan)),
+                error,
+            }),
+        }
+    }
+    pub(crate) fn open_managed(
+        root: &Path,
+        expected: &crate::lightroom_migration_worker::identity::FileKey,
+    ) -> std::result::Result<Self, ManagedPlanOpenError> {
+        let root = fs::canonicalize(root).map_err(ManagedPlanOpenError::before_open)?;
+        let path = root.join("inspection.sqlite3");
+        let db = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(ManagedPlanOpenError::before_open)?;
+        let plan = Self {
+            db,
+            root,
+            execution: None,
+        };
+        let admitted = (|| -> Result<()> {
+            crate::catalog_storage::verify_database_identity(&plan.db, &physical(expected))
+                .context("managed inspection open identity")?;
+            let app: i64 = plan
+                .db
+                .query_row("PRAGMA application_id", [], |r| r.get(0))?;
+            let version: i64 = plan.db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            ensure!(
+                app == 0x50434c49,
+                "not a supported Lightroom inspection plan"
+            );
+            require_current_plan(version)?;
+            validate_paging_indexes(&plan.db)?;
+            crate::configure_catalog_connection(&plan.db)?;
+            crate::catalog_storage::verify_database_identity(&plan.db, &physical(expected))
+                .context("managed inspection configured identity")?;
+            Ok(())
+        })();
+        match admitted {
+            Ok(()) => Ok(plan),
+            Err(error) => Err(ManagedPlanOpenError {
+                plan: Some(Box::new(plan)),
+                error,
+            }),
+        }
+    }
+    pub(crate) fn close_checked(self) -> std::result::Result<(), (Box<Self>, anyhow::Error)> {
+        let Self {
+            db,
+            root,
+            execution,
+        } = self;
+        match db.close() {
+            Ok(()) => Ok(()),
+            Err((db, error)) => Err((
+                Box::new(Self {
+                    db,
+                    root,
+                    execution,
+                }),
+                error.into(),
+            )),
+        }
+    }
+    pub(crate) fn verify_managed_identity(
+        &self,
+        expected: &crate::lightroom_migration_worker::identity::FileKey,
+    ) -> Result<()> {
+        crate::catalog_storage::verify_database_identity(&self.db, &physical(expected))
+            .context("managed inspection identity")
+    }
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -460,7 +644,7 @@ CREATE TABLE family_choices(family TEXT PRIMARY KEY,revision TEXT NOT NULL,evide
             !directory.starts_with(&self.root) && !self.root.starts_with(&directory),
             "capture evidence and mutable inspection plan must be separate"
         );
-        let manifest = read_manifest(&directory)?;
+        let (manifest, manifest_json) = read_manifest_exact(&directory)?;
         ensure!(
             manifest.state == "captured"
                 && manifest.sqlite_consistency == "consistent_default_sqlite",
@@ -506,16 +690,16 @@ CREATE TABLE family_choices(family TEXT PRIMARY KEY,revision TEXT NOT NULL,evide
                 "raw artifact digest mismatch"
             );
         }
-        if self
+        if let Some(stored) = self
             .db
             .query_row(
-                "SELECT 1 FROM captures WHERE revision=?",
+                "SELECT manifest FROM captures WHERE revision=?",
                 [&revision],
-                |r| r.get::<_, i64>(0),
+                |r| r.get::<_, String>(0),
             )
             .optional()?
-            .is_some()
         {
+            ensure!(stored == manifest_json, "existing capture evidence differs");
             return Ok(revision);
         }
         let source = snapshot(&directory.join("logical.sqlite3"), &manifest.request.limits)?;
@@ -538,7 +722,7 @@ CREATE TABLE family_choices(family TEXT PRIMARY KEY,revision TEXT NOT NULL,evide
                 revision,
                 lineage,
                 path_value(&directory)?,
-                serde_json::to_string(&manifest)?,
+                manifest_json,
                 "pending",
                 version,
                 provider
@@ -748,15 +932,285 @@ CREATE TABLE family_choices(family TEXT PRIMARY KEY,revision TEXT NOT NULL,evide
         })
     }
     fn capture(&self, revision: &str) -> Result<(PathBuf, Manifest)> {
-        let (path, manifest): (String, String) = self.db.query_row(
-            "SELECT path,manifest FROM captures WHERE revision=?",
-            [revision],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
+        let (path, manifest): (String, String) = self
+            .db
+            .query_row(
+                "SELECT path,manifest FROM captures WHERE revision=?",
+                [revision],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .context(CAPTURE_NOT_REGISTERED)?;
         Ok((
             serde_json::from_str::<NativePath>(&path)?.to_path()?,
             serde_json::from_str(&manifest)?,
         ))
+    }
+    pub(crate) fn managed_capture(&self, revision: &str) -> Result<(NativePath, Manifest)> {
+        let (path, manifest): (String, String) = self
+            .db
+            .query_row(
+                "SELECT path,manifest FROM captures WHERE revision=?",
+                [revision],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .context(CAPTURE_NOT_REGISTERED)?;
+        Ok((
+            serde_json::from_str(&path)?,
+            serde_json::from_str(&manifest)?,
+        ))
+    }
+    pub(crate) fn add_capture_managed(
+        &mut self,
+        directory: &NativePath,
+        manifest: &Manifest,
+        manifest_json: &str,
+        schema: &crate::lightroom_migration_worker::source_reader::capture_wire::SchemaObjects,
+        commit_authority: impl FnOnce() -> Result<()>,
+    ) -> Result<String> {
+        use crate::lightroom_migration_worker::source_reader::capture_wire::{
+            ObjectKind, PhysicalCursor,
+        };
+        let revision = manifest
+            .revision_id
+            .clone()
+            .context("capture revision missing")?;
+        ensure!(
+            manifest.state == "captured"
+                && manifest.sqlite_consistency == "consistent_default_sqlite"
+                && json_digest(&manifest.artifacts)? == revision,
+            "capture manifest identity/state differs"
+        );
+        ensure!(
+            schema.authority_binding.len() == 64 && schema.schema_roster_blake3.len() == 64,
+            "managed schema binding"
+        );
+        ensure!(
+            !manifest_json.is_empty() && manifest_json.len() <= super::MANIFEST_BYTES,
+            "managed capture manifest byte limit"
+        );
+        if let Some((stored, roster)) = self
+            .db
+            .query_row(
+                "SELECT manifest,schema_roster FROM captures WHERE revision=?",
+                [&revision],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?
+        {
+            ensure!(
+                stored == manifest_json && roster.as_deref() == Some(&schema.schema_roster_blake3),
+                "existing capture evidence differs"
+            );
+            return Ok(revision);
+        }
+        let version = schema.variables.get("Adobe_DBVersion").cloned();
+        let provider = schema.variables.get("Adobe_storeProviderID").cloned();
+        let lineage = uuid::Uuid::new_v4().to_string();
+        let transaction = self.db.transaction()?;
+        transaction.execute("INSERT INTO captures(revision,lineage,path,manifest,stage,schema_version,provider,schema_roster) VALUES(?,?,?,?,?,?,?,?)",params![revision,lineage,serde_json::to_string(directory)?,manifest_json,"pending",version,provider,schema.schema_roster_blake3])?;
+        for object in &schema.objects {
+            let kind = match object.kind {
+                ObjectKind::Table => "table",
+                ObjectKind::Index => "index",
+                ObjectKind::View => "view",
+                ObjectKind::Trigger => "trigger",
+            };
+            let text = |v: &[u8]| {
+                String::from_utf8(v.to_vec()).unwrap_or_else(|_| format!("hex:{}", hex(v)))
+            };
+            transaction.execute(
+                "INSERT INTO schema_objects VALUES(?,?,?,?,?)",
+                params![
+                    revision,
+                    kind,
+                    text(&object.name),
+                    text(&object.table),
+                    text(&object.sql)
+                ],
+            )?;
+        }
+        let table_objects: Vec<_> = schema
+            .objects
+            .iter()
+            .filter(|v| matches!(v.kind, ObjectKind::Table))
+            .collect();
+        for table in &schema.tables {
+            let object = table_objects
+                .get(usize::try_from(table.ordinal.0)?)
+                .context("managed table schema object")?;
+            let name = String::from_utf8(object.name.clone())
+                .unwrap_or_else(|_| format!("hex:{}", hex(&object.name)));
+            let columns: Vec<String> = table
+                .columns
+                .iter()
+                .map(|v| String::from_utf8(v.name.clone()))
+                .collect::<std::result::Result<_, _>>()
+                .unwrap_or_default();
+            let keys: Vec<String> = match &table.cursor {
+                Some(PhysicalCursor::PrimaryKey(indexes)) => indexes
+                    .iter()
+                    .map(|v| {
+                        columns
+                            .get(v.0 as usize)
+                            .cloned()
+                            .context("managed key ordinal")
+                    })
+                    .collect::<Result<_>>()?,
+                Some(PhysicalCursor::RowIdAlias(v)) => vec![String::from_utf8(v.clone())?],
+                None => vec![],
+            };
+            let mut stable = table.clone();
+            stable.table_handle.clear();
+            let issue = table.retained_only.as_ref().map(|v| format!("{v:?}"));
+            transaction.execute("INSERT INTO tables(revision,name,columns_json,key_json,schema_json,category,expected,state,issue) VALUES(?,?,?,?,?,?,?,?,?)",params![revision,name,serde_json::to_string(&columns)?,serde_json::to_string(&keys)?,serde_json::to_string(&stable)?,&table.category,table.expected_count.map(|v|v.0),if issue.is_some(){"retained_snapshot_only"}else{"pending"},issue])?;
+        }
+        commit_authority()?;
+        transaction.commit()?;
+        Ok(revision)
+    }
+    pub(crate) fn managed_resume_roster(
+        &self,
+        revision: &str,
+    ) -> Result<(String, Vec<ManagedTable>)> {
+        let digest: String = self.db.query_row(
+            "SELECT schema_roster FROM captures WHERE revision=?",
+            [revision],
+            |r| r.get(0),
+        )?;
+        let mut statement=self.db.prepare("SELECT name,schema_json,cursor FROM tables WHERE revision=? AND state='pending' ORDER BY name")?;
+        let values = statement
+            .query_map([revision], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .map(|row| -> Result<ManagedTable> {
+                let (name, json, cursor) = row?;
+                Ok(ManagedTable {
+                    name,
+                    descriptor: serde_json::from_str(&json)?,
+                    cursor: cursor.map(|v| serde_json::from_str(&v)).transpose()?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((digest, values))
+    }
+    pub(crate) fn apply_managed_table(
+        &mut self,
+        revision: &str,
+        stable: &ManagedTable,
+        value: crate::lightroom_migration_worker::source_reader::capture_wire::TableValue,
+        commit_authority: impl FnOnce() -> Result<()>,
+    ) -> Result<usize> {
+        use crate::lightroom_migration_worker::source_reader::capture_wire::TableValue;
+        let (_, manifest) = self.capture(revision)?;
+        let transaction = self.db.transaction()?;
+        let retained = match value {
+            TableValue::Failure(failure) => {
+                ensure!(
+                    failure.cursor == stable.cursor,
+                    "managed failure cursor differs"
+                );
+                transaction.execute(
+                    "UPDATE tables SET state='failed',issue=? WHERE revision=? AND name=?",
+                    params![failure.detail, revision, stable.name],
+                )?;
+                0
+            }
+            TableValue::Batch(batch) => {
+                ensure!(
+                    batch.observed.0 == batch.rows.len() as u64
+                        && batch.next_cursor
+                            == batch
+                                .rows
+                                .last()
+                                .map(|v| v.key.clone())
+                                .or(stable.cursor.clone()),
+                    "managed batch cursor/count differs"
+                );
+                let columns: Vec<String> = stable
+                    .descriptor
+                    .columns
+                    .iter()
+                    .map(|v| {
+                        String::from_utf8(v.name.clone())
+                            .context("managed selected column encoding")
+                    })
+                    .collect::<Result<_>>()?;
+                if batch.rows.is_empty() {
+                    ensure!(batch.eof, "empty managed batch must prove EOF");
+                    transaction.execute("UPDATE tables SET state=CASE WHEN expected=retained THEN 'complete' ELSE 'count_mismatch' END WHERE revision=? AND name=?",params![revision,stable.name])?;
+                } else {
+                    ensure!(!batch.eof, "nonempty managed batch cannot be EOF");
+                }
+                for row in &batch.rows {
+                    let identity = source_identity(&stable.name, &columns, &row.values, &row.key)?;
+                    let lineage: String = transaction.query_row(
+                        "SELECT lineage FROM captures WHERE revision=?",
+                        [revision],
+                        |r| r.get(0),
+                    )?;
+                    let source_id = format!("{lineage}:{}", digest(identity.as_bytes()));
+                    let key = serde_json::to_string(&row.key)?;
+                    transaction.execute("INSERT INTO rows(revision,source_id,table_name,key_json,cells_json) VALUES(?,?,?,?,?)",params![revision,source_id,stable.name,key,serde_json::to_string(&row.values)?])?;
+                    retain_xmp(
+                        &transaction,
+                        revision,
+                        &source_id,
+                        &stable.name,
+                        &columns,
+                        &row.values,
+                        manifest.request.limits.max_cell_bytes,
+                    )?;
+                    retain_references(
+                        &transaction,
+                        revision,
+                        &source_id,
+                        &stable.name,
+                        &columns,
+                        &row.values,
+                    )?;
+                    retain_entity(
+                        &transaction,
+                        revision,
+                        &source_id,
+                        &stable.name,
+                        &columns,
+                        &row.values,
+                    )?;
+                    transaction.execute("UPDATE tables SET retained=retained+1,cursor=? WHERE revision=? AND name=?",params![key,revision,stable.name])?;
+                }
+                batch.rows.len()
+            }
+        };
+        transaction.execute(
+            "UPDATE captures SET evidence_revision=evidence_revision+1 WHERE revision=?",
+            [revision],
+        )?;
+        commit_authority()?;
+        transaction.commit()?;
+        Ok(retained)
+    }
+    pub(crate) fn finish_managed_resume(
+        &mut self,
+        revision: &str,
+        commit_authority: impl FnOnce() -> Result<()>,
+    ) -> Result<String> {
+        let pending: i64 = self.db.query_row(
+            "SELECT count(*) FROM tables WHERE revision=? AND state='pending'",
+            [revision],
+            |r| r.get(0),
+        )?;
+        if pending == 0 {
+            self.reconcile_with_commit(revision, commit_authority)
+        } else {
+            commit_authority()?;
+            Ok("pending".into())
+        }
     }
     pub fn rows(
         &self,
@@ -1371,6 +1825,13 @@ fn retain_entity(
 }
 impl Plan {
     fn reconcile(&mut self, revision: &str) -> Result<String> {
+        self.reconcile_with_commit(revision, || Ok(()))
+    }
+    fn reconcile_with_commit(
+        &mut self,
+        revision: &str,
+        commit_authority: impl FnOnce() -> Result<()>,
+    ) -> Result<String> {
         let transaction = self.db.transaction()?;
         transaction.execute("DELETE FROM issues WHERE revision=? AND code IN ('dangling_reference','duplicate_local_id','duplicate_global_id','hierarchy_cycle','hierarchy_depth_limit','ambiguous_hierarchy_reference','required_auxiliary_missing','unknown_schema_version')",[revision])?;
         {
@@ -1547,8 +2008,174 @@ impl Plan {
             "UPDATE captures SET stage=? WHERE revision=?",
             params![stage, revision],
         )?;
+        commit_authority()?;
         transaction.commit()?;
         Ok(stage.into())
+    }
+    pub(crate) fn managed_original_candidates(
+        &self,
+        revision: &str,
+        limit: usize,
+        packets: bool,
+    ) -> Result<Vec<OriginalCandidate>> {
+        ensure!((1..=1000).contains(&limit), "path budget must be 1..1000");
+        let (_, manifest) = self.capture(revision)?;
+        let mut statement = self.db.prepare(if packets {
+            PATH_PACKET_QUEUE
+        } else {
+            PATH_QUEUE
+        })?;
+        let mut rows = statement.query(params![revision, limit as i64])?;
+        let mut out = Vec::new();
+        let mut bytes = 0usize;
+        while let Some(row) = rows.next()? {
+            let sequence = row.get::<_, i64>(0)?;
+            let source_id = row.get::<_, String>(1)?;
+            let encoded_path = row.get::<_, String>(2)?;
+            let path: NativePath = serde_json::from_str(&encoded_path)?;
+            let token = digest(&super::bounded_json(
+                &(revision, sequence, &source_id, &path, packets),
+                super::PAGE_BYTES,
+            )?);
+            let candidate = OriginalCandidate {
+                revision: revision.into(),
+                sequence,
+                source_id,
+                path,
+                packets,
+                limits: manifest.request.limits.clone(),
+                token,
+            };
+            let size = super::bounded_json(&candidate, super::PAGE_BYTES)?.len();
+            if bytes
+                .checked_add(size)
+                .context("original candidate bytes")?
+                > super::PAGE_BYTES
+            {
+                ensure!(!out.is_empty(), "original candidate exceeds page bytes");
+                break;
+            }
+            bytes += size;
+            out.push(candidate);
+        }
+        Ok(out)
+    }
+    pub(crate) fn apply_managed_original(
+        &mut self,
+        candidate: &OriginalCandidate,
+        observation: OriginalObservation,
+        commit_authority: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        ensure!(
+            observation.token == candidate.token,
+            "original evidence token differs"
+        );
+        let (source_id, encoded_path, state, evidence): (String, String, String, Option<String>) = self.db.query_row(
+            "SELECT source_id,inspection_path,state,evidence FROM paths WHERE revision=? AND sequence=?",
+            params![candidate.revision, candidate.sequence],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        ensure!(
+            state == "pending"
+                || (candidate.packets
+                    && evidence
+                        .as_deref()
+                        .is_some_and(|value| value.contains("embedded_sidecar_xmp"))),
+            "original candidate state changed before commit"
+        );
+        let path: NativePath = serde_json::from_str(&encoded_path)?;
+        let expected = digest(&super::bounded_json(
+            &(
+                candidate.revision.as_str(),
+                candidate.sequence,
+                &source_id,
+                &path,
+                candidate.packets,
+            ),
+            super::PAGE_BYTES,
+        )?);
+        ensure!(
+            expected == candidate.token
+                && source_id == candidate.source_id
+                && path == candidate.path,
+            "original candidate changed before commit"
+        );
+        let transaction = self.db.transaction()?;
+        let mut inspections = Vec::new();
+        for file in &observation.files {
+            if let Some(value) = &file.inspection {
+                for (index, packet) in value.packets.iter().enumerate() {
+                    let detail = serde_json::json!({"container":packet.container,"ranges":packet.ranges,"group":packet.group,"attributes":packet.attributes,"source_revision":value.revision,"inspection_status":value.status,"source_path":file.path});
+                    transaction.execute("INSERT OR IGNORE INTO packets(revision,source_id,origin,raw_digest,raw,detail) VALUES(?,?,?,?,?,?)",params![candidate.revision,candidate.source_id,format!("{}:packet:{index}",file.origin),packet.blake3,packet.bytes,detail.to_string()])?;
+                }
+                for (index, input) in value.parse_inputs.iter().enumerate() {
+                    let detail = serde_json::json!({"transformation":input.transformation,"packet_indices":input.packet_indices,"group":input.group,"input_blake3":input.blake3,"source_revision":value.revision,"inspection_status":value.status});
+                    transaction.execute("INSERT OR IGNORE INTO packets(revision,source_id,origin,raw_digest,raw,decoded,detail) VALUES(?,?,?,?,?,?,?)",params![candidate.revision,candidate.source_id,format!("{}:parse_input:{index}",file.origin),input.blake3,Vec::<u8>::new(),input.bytes,detail.to_string()])?;
+                    if value.status == xmp_packets::Status::Complete {
+                        retain_facts(
+                            &transaction,
+                            &candidate.revision,
+                            &candidate.source_id,
+                            Some(&candidate.source_id),
+                            &file.origin,
+                            &input.blake3,
+                            &input.bytes,
+                        )?;
+                    }
+                }
+            }
+            inspections.push(serde_json::json!({"origin":file.origin,"path":file.path,"state":file.state,"error":file.error,"status":file.inspection.as_ref().map(|v|v.status),"revision":file.inspection.as_ref().map(|v|&v.revision),"packets":file.inspection.as_ref().map_or(0,|v|v.packets.len()),"parse_inputs":file.inspection.as_ref().map_or(0,|v|v.parse_inputs.len()),"issues":file.inspection.as_ref().map(|v|&v.issues)}));
+        }
+        let state = if candidate.packets && observation.base_state == "available" {
+            if observation.packet_gaps {
+                "available_packet_gaps"
+            } else {
+                "available_packets_retained"
+            }
+        } else if !candidate.packets && observation.base_state == "available" {
+            "available_packets_uninspected"
+        } else {
+            &observation.base_state
+        };
+        let evidence = if candidate.packets {
+            serde_json::json!({"metadata":observation.metadata,"inspections":inspections,"packet_gaps":observation.packet_gaps})
+        } else {
+            serde_json::json!({"metadata":observation.metadata,"embedded_sidecar_xmp":"not inspected by explicit metadata-only mode"})
+        };
+        transaction.execute(
+            "UPDATE paths SET state=?,evidence=? WHERE revision=? AND sequence=?",
+            params![
+                state,
+                serde_json::to_string(&evidence)?,
+                candidate.revision,
+                candidate.sequence
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE captures SET evidence_revision=evidence_revision+1 WHERE revision=?",
+            [&candidate.revision],
+        )?;
+        commit_authority()?;
+        transaction.commit()?;
+        Ok(())
+    }
+    pub(crate) fn finish_managed_originals(
+        &mut self,
+        revision: &str,
+        commit_authority: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let pending: i64 = self
+            .db
+            .query_row(PATH_PENDING, [revision], |row| row.get(0))?;
+        if pending == 0 {
+            let transaction = self.db.transaction()?;
+            transaction.execute("UPDATE captures SET stage='inspection_complete_with_reported_gaps' WHERE revision=? AND stage='rows_reconciled_paths_pending'",[revision])?;
+            commit_authority()?;
+            transaction.commit()?;
+        } else {
+            commit_authority()?;
+        }
+        Ok(())
     }
     /// Bounded direct-path inspection. No directory recursion or root guessing.
     /// `packets=false` performs metadata lookups only and leaves explicit XMP gaps.
@@ -1809,6 +2436,20 @@ impl Plan {
         &mut self,
         inventory: &super::discovery::Inventory,
     ) -> Result<String> {
+        self.register_inventory_with_commit(inventory, || Ok(()))
+    }
+    pub(crate) fn register_inventory_managed(
+        &mut self,
+        inventory: &super::discovery::Inventory,
+        commit_authority: impl FnOnce() -> Result<()>,
+    ) -> Result<String> {
+        self.register_inventory_with_commit(inventory, commit_authority)
+    }
+    fn register_inventory_with_commit(
+        &mut self,
+        inventory: &super::discovery::Inventory,
+        commit_authority: impl FnOnce() -> Result<()>,
+    ) -> Result<String> {
         ensure!(
             inventory.protocol == PROTOCOL,
             "unsupported discovery protocol"
@@ -1819,13 +2460,34 @@ impl Plan {
             "inventory exceeds manifest budget"
         );
         let hash = digest(json.as_bytes());
-        self.db.execute(
+        let transaction = self.db.transaction()?;
+        transaction.execute(
             "INSERT OR IGNORE INTO inventories VALUES(?,?)",
             params![hash, json],
         )?;
+        commit_authority()?;
+        transaction.commit()?;
         Ok(hash)
     }
     pub fn assign_family(&mut self, revision: &str, family: &str, reason: &str) -> Result<()> {
+        self.assign_family_with_commit(revision, family, reason, || Ok(()))
+    }
+    pub(crate) fn assign_family_managed(
+        &mut self,
+        revision: &str,
+        family: &str,
+        reason: &str,
+        commit_authority: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        self.assign_family_with_commit(revision, family, reason, commit_authority)
+    }
+    fn assign_family_with_commit(
+        &mut self,
+        revision: &str,
+        family: &str,
+        reason: &str,
+        commit_authority: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         self.capture(revision)?;
         ensure!(
             !family.trim().is_empty()
@@ -1834,7 +2496,10 @@ impl Plan {
                 && reason.len() <= 4096,
             "explicit bounded family and reason required"
         );
-        self.db.execute("INSERT INTO family_assignments VALUES(?,?,?) ON CONFLICT(revision) DO UPDATE SET family=excluded.family,reason=excluded.reason",params![revision,family,reason])?;
+        let transaction = self.db.transaction()?;
+        transaction.execute("INSERT INTO family_assignments VALUES(?,?,?) ON CONFLICT(revision) DO UPDATE SET family=excluded.family,reason=excluded.reason",params![revision,family,reason])?;
+        commit_authority()?;
+        transaction.commit()?;
         Ok(())
     }
     pub fn families(&self) -> Result<FamilyReport> {
@@ -2595,6 +3260,233 @@ fn bounded_values(
 #[cfg(test)]
 mod bounded_plan_tests {
     use super::*;
+    fn exact_manifest_fixture(root: &Path) -> Manifest {
+        let artifact = super::super::capture::Artifact {
+            source: NativePath::from_path(&root.join("source.lrcat")),
+            role: "main".into(),
+            relative: NativePath::from_path(Path::new("source.lrcat")),
+            stored: "raw/000000-source.lrcat".into(),
+            revision: super::super::source::Revision {
+                object: "fixture-object".into(),
+                bytes: 1,
+                modified_ns: Some(1),
+                changed: "fixture-changed".into(),
+            },
+            blake3: "a".repeat(64),
+        };
+        let artifacts = vec![artifact];
+        let revision = json_digest(&artifacts).unwrap();
+        Manifest {
+            protocol: PROTOCOL,
+            request: super::super::capture::Request {
+                source: NativePath::from_path(&root.join("source.lrcat")),
+                output: NativePath::from_path(&root.join("capture")),
+                include_auxiliary: false,
+                closed_application_evidence: Some("fixture is closed".into()),
+                limits: Limits::default(),
+            },
+            state: "captured".into(),
+            raw_byte_retention: "complete".into(),
+            sqlite_consistency: "consistent_default_sqlite".into(),
+            application_consistency: "closed".into(),
+            cooperative_lock_protocol: "fixture".into(),
+            artifacts,
+            companion_inventory: vec![],
+            absent_companions: vec![],
+            issues: vec![],
+            wal: None,
+            logical_blake3: Some("b".repeat(64)),
+            logical_revision: None,
+            revision_id: Some(revision),
+        }
+    }
+
+    #[test]
+    fn managed_capture_retains_exact_manifest_bytes_and_rejects_whitespace_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut plan = Plan::create(&temp.path().join("plan")).unwrap();
+        let manifest = exact_manifest_fixture(temp.path());
+        let exact = serde_json::to_string_pretty(&manifest).unwrap();
+        let schema =
+            crate::lightroom_migration_worker::source_reader::capture_wire::SchemaObjects {
+                authority_binding: "c".repeat(64),
+                schema_roster_blake3: "d".repeat(64),
+                objects: vec![],
+                tables: vec![],
+                variables: BTreeMap::new(),
+            };
+        let directory = NativePath::from_path(&temp.path().join("capture"));
+        let revision = plan
+            .add_capture_managed(&directory, &manifest, &exact, &schema, || Ok(()))
+            .unwrap();
+        let stored: String = plan
+            .db
+            .query_row(
+                "SELECT manifest FROM captures WHERE revision=?",
+                [&revision],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, exact);
+        assert_eq!(
+            plan.add_capture_managed(&directory, &manifest, &exact, &schema, || Ok(()))
+                .unwrap(),
+            revision
+        );
+        let drift = format!("\n{exact}\n");
+        let error = plan
+            .add_capture_managed(&directory, &manifest, &drift, &schema, || Ok(()))
+            .unwrap_err();
+        assert!(error.to_string().contains("existing capture evidence"));
+    }
+
+    #[test]
+    fn missing_capture_revision_explains_registration_step() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let plan = Plan::create(&root.join("plan")).unwrap();
+        for error in [
+            plan.capture("missing").unwrap_err(),
+            plan.managed_capture("missing").unwrap_err(),
+        ] {
+            assert!(
+                error
+                    .to_string()
+                    .contains("capture revision is not registered")
+            );
+            assert!(error.to_string().contains("add captured evidence"));
+        }
+    }
+
+    #[test]
+    fn direct_capture_repeat_requires_the_same_exact_manifest_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let capture = root.join("capture");
+        let raw_dir = capture.join("raw");
+        fs::create_dir_all(&raw_dir).unwrap();
+        let raw_path = raw_dir.join("000000-source.lrcat");
+        fs::write(&raw_path, b"captured source bytes").unwrap();
+        let mut raw = Source::open(&raw_path, 1024).unwrap();
+        let raw_revision = raw.before.clone();
+        let raw_blake3 = raw.copy_and_hash(None).unwrap();
+        drop(raw);
+
+        let logical_path = capture.join("logical.sqlite3");
+        drop(Connection::open(&logical_path).unwrap());
+        let mut logical = Source::open(&logical_path, 1024 * 1024).unwrap();
+        let logical_revision = logical.before.clone();
+        let logical_blake3 = logical.copy_and_hash(None).unwrap();
+        drop(logical);
+
+        let mut manifest = exact_manifest_fixture(&capture);
+        manifest.request.output = NativePath::from_path(&capture);
+        manifest.artifacts[0].stored = "raw/000000-source.lrcat".into();
+        manifest.artifacts[0].revision = raw_revision;
+        manifest.artifacts[0].blake3 = raw_blake3;
+        manifest.logical_revision = Some(logical_revision);
+        manifest.logical_blake3 = Some(logical_blake3);
+        manifest.revision_id = Some(json_digest(&manifest.artifacts).unwrap());
+        let exact = serde_json::to_string_pretty(&manifest).unwrap();
+        fs::write(capture.join("manifest.json"), &exact).unwrap();
+
+        let mut plan = Plan::create(&root.join("plan")).unwrap();
+        let revision = plan.add_capture(&capture).unwrap();
+        let stored: String = plan
+            .db
+            .query_row(
+                "SELECT manifest FROM captures WHERE revision=?",
+                [&revision],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, exact);
+        assert_eq!(plan.add_capture(&capture).unwrap(), revision);
+
+        fs::write(capture.join("manifest.json"), format!("\n{exact}\n")).unwrap();
+        let error = plan.add_capture(&capture).unwrap_err();
+        assert!(error.to_string().contains("existing capture evidence"));
+    }
+
+    #[test]
+    fn checked_close_returns_the_exact_busy_plan_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let plan = Plan::create(&temp.path().join("plan")).unwrap();
+        let mut statement = std::ptr::null_mut();
+        let sql = b"SELECT 1\0";
+        let prepared = unsafe {
+            rusqlite::ffi::sqlite3_prepare_v2(
+                plan.db.handle(),
+                sql.as_ptr().cast(),
+                -1,
+                &mut statement,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(prepared, rusqlite::ffi::SQLITE_OK);
+        assert!(!statement.is_null());
+
+        let (plan, _) = plan.close_checked().unwrap_err();
+        assert_eq!(
+            unsafe { rusqlite::ffi::sqlite3_finalize(statement) },
+            rusqlite::ffi::SQLITE_OK
+        );
+        assert!((*plan).close_checked().is_ok());
+    }
+
+    #[test]
+    fn managed_identity_failure_retains_the_open_plan_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("plan");
+        let plan = Plan::create(&root).unwrap();
+        assert!(plan.close_checked().is_ok());
+        let file = fs::File::open(root.join("inspection.sqlite3")).unwrap();
+        let mut wrong = crate::lightroom_migration_worker::identity::FileKey::of(&file).unwrap();
+        wrong.index.0 = wrong.index.0.checked_add(1).unwrap();
+        drop(file);
+
+        let failure = match Plan::open_managed(&root, &wrong) {
+            Ok(_) => panic!("wrong managed identity was admitted"),
+            Err(failure) => failure,
+        };
+        assert!(failure.error.to_string().contains("identity"));
+        assert!(failure.plan.is_some());
+        assert!((*failure.plan.unwrap()).close_checked().is_ok());
+    }
+
+    #[test]
+    fn managed_commit_gate_rolls_back_before_capture_stage_transition() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut plan = Plan::create(&temp.path().join("plan")).unwrap();
+        plan.db
+            .execute(
+                "INSERT INTO captures(revision,lineage,path,manifest,stage) VALUES('r','l','{}','{}','rows_reconciled_paths_pending')",
+                [],
+            )
+            .unwrap();
+
+        let failure = plan
+            .finish_managed_originals("r", || anyhow::bail!("injected F loss at commit selection"))
+            .unwrap_err();
+        assert!(failure.to_string().contains("injected F loss"));
+        let stage: String = plan
+            .db
+            .query_row("SELECT stage FROM captures WHERE revision='r'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(stage, "rows_reconciled_paths_pending");
+
+        plan.finish_managed_originals("r", || Ok(())).unwrap();
+        let stage: String = plan
+            .db
+            .query_row("SELECT stage FROM captures WHERE revision='r'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(stage, "inspection_complete_with_reported_gaps");
+    }
+
     #[test]
     fn global_id_conflict_query_uses_global_indexes_instead_of_nested_revision_scans() {
         use rusqlite::StatementStatus;

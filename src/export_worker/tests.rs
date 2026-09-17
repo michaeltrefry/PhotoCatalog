@@ -300,7 +300,7 @@ fn completed_recovery_releases_duplicate_description() {
     let path = stage(temp.path(), &request, true);
     let lease = open_lease(&path).unwrap();
     lease.try_lock_exclusive().unwrap();
-    let mut lease = AcquiredLease(lease);
+    let mut lease = AcquiredLease::new(lease);
     // dup retains the same open-file description as fork before CLOEXEC runs.
     // No process timing, sleep or unsafe fork is needed to preserve that owner.
     let inherited = lease.0.try_clone().unwrap();
@@ -330,7 +330,7 @@ fn recovery_error_and_unwind_release_inherited_description() {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
             let file = open_lease(&path)?;
             file.try_lock_exclusive()?;
-            let _lease = AcquiredLease(file);
+            let _lease = AcquiredLease::new(file);
             inherited = Some(_lease.0.try_clone()?);
             if unwind {
                 panic!("injected recovery unwind");
@@ -572,6 +572,100 @@ fn parent_lease_admission_is_nofollow_nonblocking_and_rechecks_exact_object() ->
     fs::remove_file(&lease_path)?;
     fs::create_dir(&lease_path)?;
     assert!(acquire_parent_lease(&stage).is_err());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn parent_process_drop_explicitly_unlocks_duplicated_description() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let stage = temp.path().join("stage");
+    fs::create_dir(&stage)?;
+    write(&stage.join("parent.lock"), b"")?;
+    let parent = metadata_export::open_regular(&stage.join("parent.lock"))?;
+    parent.try_lock_exclusive()?;
+    let inherited = parent.try_clone()?;
+    let contender = metadata_export::open_regular(&stage.join("parent.lock"))?;
+    assert!(contender.try_lock_exclusive().is_err());
+
+    let mut child = Command::new(std::env::current_exe()?)
+        .args(["--exact", "export_worker::tests::pre_admission_child_entry"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    ensure!(child.wait()?.success(), "fixture child failed");
+    let process = ExportWorkerProcess {
+        child,
+        lease: None,
+        parent_lease: RefCell::new(Some(AcquiredLease::new(parent))),
+        staging: stage,
+        request: request(temp.path()),
+        exited: true,
+        consumed: true,
+    };
+    drop(process);
+
+    contender.try_lock_exclusive()?;
+    ensure!(inherited.metadata()?.len() == 0, "parent lease changed");
+    drop(inherited);
+    let next = metadata_export::open_regular(&temp.path().join("stage/parent.lock"))?;
+    assert!(
+        next.try_lock_exclusive().is_err(),
+        "closing the inherited description released the new owner"
+    );
+    FileExt::unlock(&contender)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn parent_process_drop_retains_lease_when_reap_is_unconfirmed() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let stage = temp.path().join("stage");
+    fs::create_dir(&stage)?;
+    write(&stage.join("parent.lock"), b"")?;
+    let parent = metadata_export::open_regular(&stage.join("parent.lock"))?;
+    parent.try_lock_exclusive()?;
+    // This duplicate shares the owner's open-file description. The production
+    // guard is intentionally leaked below; this handle only releases the test.
+    let cleanup = parent.try_clone()?;
+    let contender = metadata_export::open_regular(&stage.join("parent.lock"))?;
+
+    let child = Command::new(std::env::current_exe()?)
+        .args(["--exact", "export_worker::tests::pre_admission_child_entry"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let pid = child.id() as libc::pid_t;
+    let mut status = 0;
+    ensure!(
+        unsafe { libc::waitpid(pid, &mut status, 0) } == pid,
+        "fixture child reap failed"
+    );
+    ensure!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "fixture child failed"
+    );
+    let process = ExportWorkerProcess {
+        child,
+        lease: None,
+        parent_lease: RefCell::new(Some(AcquiredLease::new(parent))),
+        staging: stage,
+        request: request(temp.path()),
+        exited: false,
+        consumed: false,
+    };
+    drop(process);
+
+    assert!(
+        contender.try_lock_exclusive().is_err(),
+        "unconfirmed reap released parent authority"
+    );
+    FileExt::unlock(&cleanup)?;
+    contender.try_lock_exclusive()?;
+    FileExt::unlock(&contender)?;
     Ok(())
 }
 

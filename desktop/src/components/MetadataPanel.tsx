@@ -5,6 +5,7 @@ import type { ImageIdentity } from '../organization';
 import { Dialog, ErrorNotice } from './Controls';
 import { SettingsPath } from './SettingsPath';
 import { ImportedColumns } from './ImportedColumns';
+import { MetadataEditor, SidecarPanel } from './MetadataEditor';
 import './metadata.css';
 
 type ChunkRequest = Extract<MetadataRequest, { command: 'text_chunk' | 'blob_chunk' | 'import_chunk' }>;
@@ -124,11 +125,13 @@ export function MetadataPanel({ catalog, variant, filename, mutate, onClose }: {
   const key = JSON.stringify(variant);
   useEffect(() => { const abort = new AbortController(); setIdentity(null); setField(null); setBytes(null); setError(''); void metadata(catalog, { command: 'identity', args: { key: variant } }, 'identity', abort.signal).then(value => { if (!abort.signal.aborted) setIdentity(value); }).catch(e => { if (!abort.signal.aborted) setError(errorText(e)); }); return () => abort.abort(); }, [catalog, key, epoch]);
   const inspect: Inspect = (title, request) => setBytes({ title, request });
-  const tabs = [['fields', 'Effective values'], ['sources', 'Sources'], ['observations', 'Packets & observations'], ['decisions', 'Decisions'], ['file_instances', 'File provenance'], ['imported', 'Lightroom history']];
+  const tabs = [['fields', 'Effective values'], ['edit', 'Edit metadata'], ['sidecar', 'Write sidecar'], ['sources', 'Sources'], ['observations', 'Packets & observations'], ['decisions', 'Decisions'], ['file_instances', 'File provenance'], ['imported', 'Lightroom history']];
   return <Dialog title={`Metadata · ${filename}`} onClose={onClose}><div className="metadata-panel"><nav aria-label="Metadata sections">{tabs.map(([id, title]) => <button key={id} aria-pressed={tab === id} onClick={() => { setTab(id); setBytes(null); }}>{title}</button>)}</nav><button onClick={() => setEpoch(v => v + 1)}>Refresh current metadata</button>
     {error && <ErrorNotice message={error} />}{!identity && !error && <p role="status">Loading selected photo metadata…</p>}
     {identity && <div key={JSON.stringify(identity)}>
       {tab === 'fields' && <><Pages catalog={catalog} kind="fields" request={after => ({ command: 'fields', args: { identity, after, limit: 20 } })}>{row => <><Value label={row.name} value={row.value} identity={identity} inspect={inspect} />{row.conflicted && <p className="metadata-conflict">Conflicting source values</p>}<button onClick={() => setField(row.name)}>Review candidate values</button></>}</Pages>{field && <Candidates key={field} catalog={catalog} identity={identity} field={field} inspect={inspect} mutate={mutate} changed={() => setEpoch(v => v + 1)} />}</>}
+      {tab === 'edit' && <MetadataEditor catalog={catalog} identity={identity} changed={() => setEpoch(v => v + 1)} />}
+      {tab === 'sidecar' && <SidecarPanel catalog={catalog} identity={identity} />}
       {tab === 'sources' && <Pages catalog={catalog} kind="sources" request={after => ({ command: 'sources', args: { identity, after, limit: 20 } })}>{row => <>{(['display', 'kind', 'association', 'availability', 'locator', 'status', 'issues'] as const).map(name => <Value key={name} label={name} value={row[name]} identity={identity} inspect={inspect} />)}<details><summary>Source reference</summary><p>Source {row.id} · observation {row.observation ?? 'none'}</p></details></>}</Pages>}
       {tab === 'observations' && <Observations catalog={catalog} identity={identity} inspect={inspect} />}
       {tab === 'decisions' && <Pages catalog={catalog} kind="decisions" request={after => ({ command: 'decisions', args: { identity, after, limit: 20 } })}>{row => <><p>Metadata revision {row.revision}</p>{(['action', 'detail', 'created_at'] as const).map(name => <Value key={name} label={name.replaceAll('_', ' ')} value={row[name]} identity={identity} inspect={inspect} />)}</>}</Pages>}

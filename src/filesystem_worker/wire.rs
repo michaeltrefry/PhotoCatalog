@@ -7,12 +7,13 @@ use crate::{
         ExportDestinationSnapshotReply, ExportDestinationSnapshotRequest, ExportOriginalReply,
         ExportOriginalRequest, ExportProfileReply, ExportProfileRequest, ExportPublicationReply,
         ExportPublicationRequest, InspectExportOriginal, InspectedExportOriginal, LeaseId,
-        MigrationIdentityReply, MigrationIdentityRequest, PrepareCatalog, PrepareExportDirectory,
-        PreparedExportDirectory, RootCapability, SqlAdmissionConfirmed, validate_path,
+        MigrationIdentityReply, MigrationIdentityRequest, PhysicalObjectId, PrepareCatalog,
+        PrepareExportDirectory, PreparedExportDirectory, RestoreOriginalRootReply,
+        RestoreOriginalRootRequest, RootCapability, SqlAdmissionConfirmed, validate_path,
     },
     storage_volume::NativePath,
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io::{self, Read, Write};
 
@@ -20,6 +21,7 @@ pub const CONFIG_BYTES: usize = 4 * 1024 * 1024;
 pub const MESSAGE_BYTES: usize = 1024 * 1024;
 pub const ERROR_BYTES: usize = 4096;
 pub const CHUNK_BYTES: usize = 16 * 1024;
+pub(crate) const LIGHTROOM_ORIGINAL_BYTES: u64 = 64 * 1024 * 1024;
 const HEADER_BYTES: usize = 48;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +47,7 @@ impl Startup {
             "filesystem helper build mismatch"
         );
         encode(self, CONFIG_BYTES)?;
+        crate::catalog_session::import::validate_original_root_registry(&self.original_roots)?;
         for path in &self.original_roots {
             validate_path(path)?;
         }
@@ -72,18 +75,29 @@ pub fn build_identity() -> String {
             include_str!("client.rs"),
             include_str!("process.rs"),
             include_str!("../catalog_session.rs"),
+            include_str!("../catalog_session/import.rs"),
+            include_str!("../catalog_session/storage.rs"),
             include_str!("../catalog_session/store.rs"),
             include_str!("../catalog_session/preview_io.rs"),
             include_str!("../catalog_session/export_managed.rs"),
             include_str!("../preview/store.rs"),
             include_str!("../filesystem_worker.rs"),
+            include_str!("import.rs"),
+            include_str!("../import_storage.rs"),
             include_str!("bootstrap.rs"),
             include_str!("store.rs"),
             include_str!("preview_io.rs"),
             include_str!("preview_stage.rs"),
+            include_str!("lightroom_sealed.rs"),
+            include_str!("lightroom_artifacts.rs"),
+            include_str!("lightroom_workbench.rs"),
+            include_str!("../lightroom/plan.rs"),
+            include_str!("../lightroom_migration_worker/source_reader/capture_wire.rs"),
             include_str!("../catalog_session/preview_stage.rs"),
             include_str!("export_stage.rs"),
             include_str!("../catalog_session/export_stage.rs"),
+            include_str!("metadata_files.rs"),
+            include_str!("../catalog_session/metadata_files.rs"),
             include_str!("export_executor.rs"),
             include_str!("../catalog_session/export_executor.rs"),
             include_str!("../export_worker.rs"),
@@ -100,6 +114,7 @@ pub fn build_identity() -> String {
             include_str!("../preview/worker/read_transport.rs"),
             include_str!("../preview/transport_task.rs"),
             include_str!("../catalog_backup.rs"),
+            include_str!("../catalog_backup/managed_filesystem.rs"),
             include_str!("../lib.rs"),
             include_str!("../catalog_storage.rs"),
             include_str!("../metadata_export.rs"),
@@ -126,19 +141,27 @@ pub fn build_identity() -> String {
 // confirmation inline instead of adding a separate allocation to every decode.
 #[allow(clippy::large_enum_variant)]
 pub enum Operation {
+    Backup(Box<crate::catalog_backup::managed_filesystem::Request>),
     ExportExecutor(crate::catalog_session::export_executor::Request),
+    Import(crate::catalog_session::import::Request),
+    RestoreOriginalRoot(RestoreOriginalRootRequest),
     PreviewStore(crate::catalog_session::store::Request),
     PreviewIo(crate::catalog_session::preview_io::Request),
     PreviewStage(crate::catalog_session::preview_stage::Request),
     ExportStage(crate::catalog_session::export_stage::Request),
     ReadPreviewConfiguration(NativePath),
+    LightroomSealedRead(LightroomSealedRead),
+    LightroomArtifactPreparation(LightroomArtifactPreparation),
+    LightroomWorkbenchIo(LightroomWorkbenchIo),
     PrepareExportDirectory(Box<PrepareExportDirectory>),
     ExportDestinationSnapshot(Box<ExportDestinationSnapshotRequest>),
     MigrationIdentity(Box<MigrationIdentityRequest>),
     ExportAliasFact(Box<ExportAliasFactRequest>),
+    Storage(Box<crate::catalog_session::storage::Request>),
     InspectExportOriginal(Box<InspectExportOriginal>),
     ExportOriginal(Box<ExportOriginalRequest>),
     ExportPublication(Box<ExportPublicationRequest>),
+    MetadataFiles(Box<crate::catalog_session::metadata_files::Request>),
     ExportProfile(Box<ExportProfileRequest>),
     PrepareCatalog(PrepareCatalog),
     ConfirmSqlAdmission(ConfirmSqlAdmission),
@@ -172,30 +195,53 @@ pub enum Operation {
 impl Operation {
     pub(crate) fn is_cleanup(&self) -> bool {
         matches!(self, Self::AbandonPrepare { .. } | Self::ReleaseRoot { .. })
+            || matches!(
+                self,
+                Self::LightroomSealedRead(LightroomSealedRead::Discard { .. })
+            )
+            || matches!(
+                self,
+                Self::LightroomArtifactPreparation(
+                    LightroomArtifactPreparation::Discard { .. }
+                        | LightroomArtifactPreparation::DiscardReceipt { .. }
+                )
+            )
+            || matches!(self, Self::Backup(r) if r.cleanup())
+            || matches!(self, Self::LightroomWorkbenchIo(value) if value.cleanup())
             || matches!(self, Self::ExportExecutor(r) if r.cleanup())
             || matches!(self, Self::ExportProfile(r) if r.cleanup())
             || matches!(self, Self::ExportOriginal(r) if r.cleanup())
             || matches!(self, Self::ExportPublication(r) if r.cleanup())
+            || matches!(self, Self::MetadataFiles(r) if r.cleanup())
             || matches!(self, Self::PreviewStore(r) if r.is_cleanup())
             || matches!(self, Self::PreviewIo(r) if r.cleanup())
             || matches!(self, Self::PreviewStage(r) if r.cleanup())
             || matches!(self, Self::ExportStage(r) if r.cleanup())
+            || matches!(self, Self::Import(r) if r.cleanup())
     }
     pub fn validate(&self) -> Result<()> {
         match self {
+            Self::Backup(value) => value.validate()?,
             Self::ExportExecutor(value) => value.validate()?,
+            Self::Import(value) => value.validate()?,
+            Self::RestoreOriginalRoot(value) => value.validate()?,
             Self::PreviewStore(value) => value.validate()?,
             Self::PreviewIo(value) => value.validate()?,
             Self::PreviewStage(value) => value.validate()?,
             Self::ExportStage(value) => value.validate()?,
             Self::ReadPreviewConfiguration(value) => crate::catalog_session::store::path(value)?,
+            Self::LightroomSealedRead(value) => value.validate()?,
+            Self::LightroomArtifactPreparation(value) => value.validate()?,
+            Self::LightroomWorkbenchIo(value) => value.validate()?,
             Self::PrepareExportDirectory(value) => value.validate()?,
             Self::ExportDestinationSnapshot(value) => value.validate()?,
             Self::MigrationIdentity(value) => value.validate()?,
             Self::ExportAliasFact(value) => value.validate()?,
+            Self::Storage(value) => value.validate()?,
             Self::InspectExportOriginal(value) => value.validate()?,
             Self::ExportOriginal(value) => value.validate()?,
             Self::ExportPublication(value) => value.validate()?,
+            Self::MetadataFiles(value) => value.validate()?,
             Self::ExportProfile(value) => value.validate()?,
             Self::PrepareCatalog(value) => value.validate()?,
             Self::ConfirmSqlAdmission(value) => {
@@ -223,6 +269,1441 @@ impl Operation {
             } => {
                 validate_path(root)?;
                 uuid::Uuid::parse_str(restore_id)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LightroomSealedDocument {
+    Seal,
+    Approval,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LightroomSealedRead {
+    Begin {
+        session: String,
+        directory: NativePath,
+        document: LightroomSealedDocument,
+    },
+    Page {
+        session: String,
+        offset: U64,
+        limit: U64,
+    },
+    Discard {
+        session: String,
+    },
+}
+impl LightroomSealedRead {
+    pub fn validate(&self) -> Result<()> {
+        let session = match self {
+            Self::Begin {
+                session, directory, ..
+            } => {
+                validate_path(directory)?;
+                session
+            }
+            Self::Page {
+                session,
+                offset,
+                limit,
+            } => {
+                ensure!(
+                    offset.0 <= crate::lightroom::MANIFEST_BYTES as u64,
+                    "sealed document offset limit"
+                );
+                ensure!(
+                    (1..=CHUNK_BYTES as u64).contains(&limit.0),
+                    "sealed document page limit"
+                );
+                session
+            }
+            Self::Discard { session } => session,
+        };
+        uuid::Uuid::parse_str(session)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LightroomSealedDocumentPage {
+    pub session: String,
+    pub directory: NativePath,
+    pub path: NativePath,
+    pub document: LightroomSealedDocument,
+    pub physical: PhysicalObjectId,
+    pub total_bytes: U64,
+    pub blake3: String,
+    pub offset: U64,
+    pub next: Option<U64>,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LightroomArtifactPreparation {
+    Begin {
+        session: String,
+        directory: NativePath,
+        capture_revision: String,
+        manifest_blake3: String,
+        maximum_bytes: U64,
+        open_deadline_ms: U64,
+    },
+    Member {
+        session: String,
+        member_index: U64,
+    },
+    Resolve {
+        receipt: String,
+    },
+    DiscardReceipt {
+        receipt: String,
+    },
+    Discard {
+        session: String,
+    },
+}
+impl LightroomArtifactPreparation {
+    pub fn validate(&self) -> Result<()> {
+        let session = match self {
+            Self::Begin {
+                session,
+                directory,
+                capture_revision,
+                manifest_blake3,
+                maximum_bytes,
+                open_deadline_ms,
+            } => {
+                validate_path(directory)?;
+                for digest in [capture_revision, manifest_blake3] {
+                    ensure!(
+                        digest.len() == 64
+                            && digest
+                                .bytes()
+                                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                        "artifact preparation digest"
+                    );
+                }
+                ensure!(
+                    maximum_bytes.0 > 0 && maximum_bytes.0 <= i64::MAX as u64,
+                    "artifact preparation byte limit"
+                );
+                ensure!(
+                    (1..=3_600_000).contains(&open_deadline_ms.0),
+                    "artifact preparation deadline"
+                );
+                session
+            }
+            Self::Member {
+                session,
+                member_index,
+            } => {
+                ensure!(member_index.0 < 4_096, "artifact member index bound");
+                session
+            }
+            Self::Resolve { receipt } | Self::DiscardReceipt { receipt } => receipt,
+            Self::Discard { session } => session,
+        };
+        uuid::Uuid::parse_str(session)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LightroomArtifactPreparationReply {
+    Begun {
+        session: String,
+        directory: NativePath,
+        manifest_path: NativePath,
+        manifest_physical: PhysicalObjectId,
+        capture_revision: String,
+        manifest_blake3: String,
+        manifest_bytes: U64,
+        members: U64,
+    },
+    Prepared {
+        session: String,
+        member_index: U64,
+        receipt: String,
+    },
+    Resolved {
+        receipt: String,
+        input_json: String,
+        input_blake3: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LightroomWorkbenchIo {
+    RootBegin {
+        operation: String,
+        workbench: String,
+        generation: String,
+        root: NativePath,
+        create: bool,
+    },
+    RootCurrent {
+        operation: String,
+        workbench: String,
+        generation: String,
+    },
+    RootRelease {
+        operation: String,
+        workbench: String,
+        generation: String,
+    },
+    CaptureStart {
+        operation: String,
+        workbench: String,
+        generation: String,
+        executable: NativePath,
+        staging: NativePath,
+        request: crate::lightroom::capture::Request,
+    },
+    CapturePoll {
+        operation: String,
+        workbench: String,
+        generation: String,
+    },
+    CaptureCancel {
+        operation: String,
+        workbench: String,
+        generation: String,
+    },
+    CaptureRetire {
+        operation: String,
+        workbench: String,
+        generation: String,
+    },
+    EvidenceBegin {
+        operation: String,
+        workbench: String,
+        generation: String,
+        capture_generation: String,
+        directory: NativePath,
+        source_generation: String,
+        protected: Vec<crate::lightroom_migration_worker::identity::FileKey>,
+        limits: crate::lightroom_migration_worker::source_reader::capture_wire::Limits,
+    },
+    EvidenceCurrent {
+        operation: String,
+        workbench: String,
+        generation: String,
+        capture_generation: String,
+    },
+    EvidenceManifestPage {
+        operation: String,
+        workbench: String,
+        generation: String,
+        capture_generation: String,
+        offset: U64,
+        limit: U64,
+    },
+    EvidenceRelease {
+        operation: String,
+        workbench: String,
+        generation: String,
+        capture_generation: String,
+    },
+    OriginalBegin {
+        operation: String,
+        workbench: String,
+        generation: String,
+        candidate: crate::lightroom::plan::OriginalCandidate,
+        maximum_result_bytes: U64,
+    },
+    OriginalCurrent {
+        operation: String,
+        workbench: String,
+        generation: String,
+        token: String,
+    },
+    OriginalPage {
+        operation: String,
+        workbench: String,
+        generation: String,
+        token: String,
+        offset: U64,
+        limit: U64,
+    },
+    OriginalRelease {
+        operation: String,
+        workbench: String,
+        generation: String,
+        token: String,
+    },
+    SealBegin {
+        operation: String,
+        workbench: String,
+        generation: String,
+        token: String,
+        output: NativePath,
+        approval_bytes: U64,
+        approval_blake3: String,
+        review_bytes: U64,
+        review_blake3: String,
+    },
+    SealChunk {
+        operation: String,
+        workbench: String,
+        generation: String,
+        token: String,
+        document: LightroomWorkbenchSealDocument,
+        offset: U64,
+        bytes: Vec<u8>,
+    },
+    SealStage {
+        operation: String,
+        workbench: String,
+        generation: String,
+        token: String,
+    },
+    SealSyncHash {
+        operation: String,
+        workbench: String,
+        generation: String,
+        token: String,
+        maximum_bytes: U64,
+    },
+    SealPublishBegin {
+        operation: String,
+        workbench: String,
+        generation: String,
+        token: String,
+        bytes: U64,
+        blake3: String,
+    },
+    SealPublish {
+        operation: String,
+        workbench: String,
+        generation: String,
+        token: String,
+    },
+    SealStatus {
+        operation: String,
+        workbench: String,
+        generation: String,
+        token: String,
+    },
+    SealAbort {
+        operation: String,
+        workbench: String,
+        generation: String,
+        token: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LightroomWorkbenchSealDocument {
+    Approval,
+    Review,
+    Seal,
+}
+impl LightroomWorkbenchIo {
+    fn ids(&self) -> [&str; 3] {
+        match self {
+            Self::RootBegin {
+                operation,
+                workbench,
+                generation,
+                ..
+            }
+            | Self::RootCurrent {
+                operation,
+                workbench,
+                generation,
+            }
+            | Self::RootRelease {
+                operation,
+                workbench,
+                generation,
+            }
+            | Self::CaptureStart {
+                operation,
+                workbench,
+                generation,
+                ..
+            }
+            | Self::CapturePoll {
+                operation,
+                workbench,
+                generation,
+            }
+            | Self::CaptureCancel {
+                operation,
+                workbench,
+                generation,
+            }
+            | Self::CaptureRetire {
+                operation,
+                workbench,
+                generation,
+            }
+            | Self::EvidenceBegin {
+                operation,
+                workbench,
+                generation,
+                ..
+            }
+            | Self::EvidenceCurrent {
+                operation,
+                workbench,
+                generation,
+                ..
+            }
+            | Self::EvidenceManifestPage {
+                operation,
+                workbench,
+                generation,
+                ..
+            }
+            | Self::EvidenceRelease {
+                operation,
+                workbench,
+                generation,
+                ..
+            }
+            | Self::OriginalBegin {
+                operation,
+                workbench,
+                generation,
+                ..
+            }
+            | Self::OriginalCurrent {
+                operation,
+                workbench,
+                generation,
+                ..
+            }
+            | Self::OriginalPage {
+                operation,
+                workbench,
+                generation,
+                ..
+            }
+            | Self::OriginalRelease {
+                operation,
+                workbench,
+                generation,
+                ..
+            }
+            | Self::SealBegin {
+                operation,
+                workbench,
+                generation,
+                ..
+            }
+            | Self::SealChunk {
+                operation,
+                workbench,
+                generation,
+                ..
+            }
+            | Self::SealStage {
+                operation,
+                workbench,
+                generation,
+                ..
+            }
+            | Self::SealSyncHash {
+                operation,
+                workbench,
+                generation,
+                ..
+            }
+            | Self::SealPublishBegin {
+                operation,
+                workbench,
+                generation,
+                ..
+            }
+            | Self::SealPublish {
+                operation,
+                workbench,
+                generation,
+                ..
+            }
+            | Self::SealStatus {
+                operation,
+                workbench,
+                generation,
+                ..
+            }
+            | Self::SealAbort {
+                operation,
+                workbench,
+                generation,
+                ..
+            } => [operation, workbench, generation],
+        }
+    }
+    pub fn validate(&self) -> Result<()> {
+        for id in self.ids() {
+            ensure!(
+                !id.is_empty() && id.len() <= 128 && id.is_ascii(),
+                "Workbench F identity"
+            );
+        }
+        match self {
+            Self::RootBegin { root, .. } => validate_path(root)?,
+            Self::CaptureStart {
+                executable,
+                staging,
+                request,
+                ..
+            } => {
+                validate_path(executable)?;
+                validate_path(staging)?;
+                validate_path(&request.source)?;
+                validate_path(&request.output)?;
+                request.limits.validate()?;
+            }
+            Self::EvidenceBegin {
+                directory,
+                capture_generation,
+                source_generation,
+                protected,
+                limits,
+                ..
+            } => {
+                validate_path(directory)?;
+                ensure!(
+                    !capture_generation.is_empty() && capture_generation.len() <= 128,
+                    "capture generation"
+                );
+                ensure!(
+                    !source_generation.is_empty() && source_generation.len() <= 128,
+                    "source generation"
+                );
+                ensure!(protected.len() <= 4096, "protected roster");
+                limits.validate()?;
+            }
+            Self::EvidenceManifestPage {
+                capture_generation,
+                offset,
+                limit,
+                ..
+            } => ensure!(
+                !capture_generation.is_empty()
+                    && capture_generation.len() <= 128
+                    && offset.0 < crate::lightroom::MANIFEST_BYTES as u64
+                    && (1..=CHUNK_BYTES as u64).contains(&limit.0),
+                "capture manifest page"
+            ),
+            Self::OriginalBegin {
+                candidate,
+                maximum_result_bytes,
+                ..
+            } => {
+                validate_path(&candidate.path)?;
+                ensure!(
+                    !candidate.token.is_empty()
+                        && candidate.token.len() <= 128
+                        && (1..=LIGHTROOM_ORIGINAL_BYTES).contains(&maximum_result_bytes.0),
+                    "original inspection admission"
+                );
+            }
+            Self::OriginalCurrent { token, .. } | Self::OriginalRelease { token, .. } => ensure!(
+                !token.is_empty() && token.len() <= 128,
+                "original inspection token"
+            ),
+            Self::OriginalPage { token, limit, .. } => ensure!(
+                !token.is_empty() && token.len() <= 128 && (1..=16 * 1024).contains(&limit.0),
+                "original inspection page"
+            ),
+            Self::SealBegin {
+                token,
+                output,
+                approval_bytes,
+                approval_blake3,
+                review_bytes,
+                review_blake3,
+                ..
+            } => {
+                validate_path(output)?;
+                ensure!(
+                    !token.is_empty()
+                        && token.len() <= 128
+                        && approval_bytes.0 > 0
+                        && approval_bytes.0 <= crate::lightroom::MANIFEST_BYTES as u64
+                        && review_bytes.0 > 0
+                        && review_bytes.0 <= 256 * 1024 * 1024
+                        && approval_blake3.len() == 64
+                        && review_blake3.len() == 64,
+                    "seal staging admission"
+                );
+            }
+            Self::SealChunk { token, bytes, .. } => ensure!(
+                !token.is_empty()
+                    && token.len() <= 128
+                    && !bytes.is_empty()
+                    && bytes.len() <= CHUNK_BYTES,
+                "seal document chunk admission"
+            ),
+            Self::SealStage { token, .. }
+            | Self::SealPublish { token, .. }
+            | Self::SealStatus { token, .. }
+            | Self::SealAbort { token, .. } => {
+                ensure!(!token.is_empty() && token.len() <= 128, "seal token")
+            }
+            Self::SealSyncHash {
+                token,
+                maximum_bytes,
+                ..
+            } => ensure!(
+                !token.is_empty()
+                    && token.len() <= 128
+                    && maximum_bytes.0 > 0
+                    && maximum_bytes.0 <= i64::MAX as u64,
+                "seal hash admission"
+            ),
+            Self::SealPublishBegin {
+                token,
+                bytes,
+                blake3,
+                ..
+            } => ensure!(
+                !token.is_empty()
+                    && token.len() <= 128
+                    && bytes.0 > 0
+                    && bytes.0 <= crate::lightroom::MANIFEST_BYTES as u64
+                    && blake3.len() == 64,
+                "seal publication admission"
+            ),
+            _ => {}
+        }
+        Ok(())
+    }
+    pub(crate) fn cleanup(&self) -> bool {
+        matches!(
+            self,
+            Self::RootRelease { .. }
+                | Self::CaptureCancel { .. }
+                | Self::CaptureRetire { .. }
+                | Self::EvidenceRelease { .. }
+                | Self::OriginalRelease { .. }
+                | Self::SealAbort { .. }
+        )
+    }
+}
+
+// Serde buffers tagged-enum contents in an internal representation that has no
+// u128 variant. Capture manifests keep their public/on-disk numeric grammar,
+// while this tagged wire representation uses canonical decimal strings for the
+// three revision timestamp positions. Remote derives construct the public types
+// directly, without a second retained manifest graph. Each wire decimal is at
+// most 39 bytes plus JSON quotes; it remains inside the existing message/parse
+// allowance, and the buffered string is consumed into the final u128.
+pub(crate) mod capture_manifest_wire {
+    use crate::{
+        lightroom::{Issue, capture, source::Revision, wal::WalReport},
+        storage_volume::NativePath,
+    };
+    use serde::{
+        Deserialize, Deserializer, Serialize, Serializer,
+        de::{SeqAccess, Visitor},
+        ser::SerializeSeq,
+    };
+
+    pub(crate) mod option_u128_decimal {
+        use serde::{Deserialize, Deserializer, Serialize, Serializer};
+        use std::borrow::Cow;
+
+        struct Decimal(u128);
+        impl Serialize for Decimal {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.collect_str(&self.0)
+            }
+        }
+
+        pub fn serialize<S: Serializer>(
+            value: &Option<u128>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            match value {
+                Some(value) => serializer.serialize_some(&Decimal(*value)),
+                None => serializer.serialize_none(),
+            }
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<u128>, D::Error> {
+            Option::<Cow<'de, str>>::deserialize(deserializer)?
+                .map(|value| {
+                    let parsed = value.parse::<u128>().map_err(serde::de::Error::custom)?;
+                    if value.is_empty()
+                        || !value.bytes().all(|byte| byte.is_ascii_digit())
+                        || (value.len() > 1 && value.starts_with('0'))
+                    {
+                        return Err(serde::de::Error::custom(
+                            "canonical unsigned decimal required",
+                        ));
+                    }
+                    Ok(parsed)
+                })
+                .transpose()
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(remote = "Revision")]
+    struct RevisionDef {
+        object: String,
+        bytes: u64,
+        #[serde(with = "option_u128_decimal")]
+        modified_ns: Option<u128>,
+        changed: String,
+    }
+
+    pub(super) mod revision {
+        use super::*;
+
+        pub fn serialize<S: Serializer>(
+            value: &Revision,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            RevisionDef::serialize(value, serializer)
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Revision, D::Error> {
+            RevisionDef::deserialize(deserializer)
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(remote = "capture::Artifact")]
+    struct ArtifactDef {
+        source: NativePath,
+        role: String,
+        relative: NativePath,
+        stored: String,
+        #[serde(with = "revision")]
+        revision: Revision,
+        blake3: String,
+    }
+
+    #[derive(Serialize)]
+    struct ArtifactRef<'a>(#[serde(with = "ArtifactDef")] &'a capture::Artifact);
+
+    struct ArtifactOwned(capture::Artifact);
+    impl<'de> Deserialize<'de> for ArtifactOwned {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            ArtifactDef::deserialize(deserializer).map(Self)
+        }
+    }
+
+    mod artifacts {
+        use super::*;
+
+        pub fn serialize<S: Serializer>(
+            values: &[capture::Artifact],
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            let mut sequence = serializer.serialize_seq(Some(values.len()))?;
+            for value in values {
+                sequence.serialize_element(&ArtifactRef(value))?;
+            }
+            sequence.end()
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Vec<capture::Artifact>, D::Error> {
+            struct ArtifactVisitor;
+            impl<'de> Visitor<'de> for ArtifactVisitor {
+                type Value = Vec<capture::Artifact>;
+
+                fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    formatter.write_str("a capture artifact sequence")
+                }
+
+                fn visit_seq<A: SeqAccess<'de>>(
+                    self,
+                    mut sequence: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
+                    while let Some(ArtifactOwned(value)) = sequence.next_element()? {
+                        values.push(value);
+                    }
+                    Ok(values)
+                }
+            }
+            deserializer.deserialize_seq(ArtifactVisitor)
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(remote = "capture::Entry")]
+    struct EntryDef {
+        path: NativePath,
+        role: String,
+        relative: NativePath,
+        directory: bool,
+        #[serde(with = "option_u128_decimal")]
+        modified_ns: Option<u128>,
+        changed: String,
+    }
+
+    #[derive(Serialize)]
+    struct EntryRef<'a>(#[serde(with = "EntryDef")] &'a capture::Entry);
+
+    struct EntryOwned(capture::Entry);
+    impl<'de> Deserialize<'de> for EntryOwned {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            EntryDef::deserialize(deserializer).map(Self)
+        }
+    }
+
+    mod entries {
+        use super::*;
+
+        pub fn serialize<S: Serializer>(
+            values: &[capture::Entry],
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            let mut sequence = serializer.serialize_seq(Some(values.len()))?;
+            for value in values {
+                sequence.serialize_element(&EntryRef(value))?;
+            }
+            sequence.end()
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Vec<capture::Entry>, D::Error> {
+            struct EntryVisitor;
+            impl<'de> Visitor<'de> for EntryVisitor {
+                type Value = Vec<capture::Entry>;
+
+                fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    formatter.write_str("a capture inventory sequence")
+                }
+
+                fn visit_seq<A: SeqAccess<'de>>(
+                    self,
+                    mut sequence: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
+                    while let Some(EntryOwned(value)) = sequence.next_element()? {
+                        values.push(value);
+                    }
+                    Ok(values)
+                }
+            }
+            deserializer.deserialize_seq(EntryVisitor)
+        }
+    }
+
+    mod optional_revision {
+        use super::*;
+
+        #[derive(Serialize)]
+        struct RevisionRef<'a>(#[serde(with = "RevisionDef")] &'a Revision);
+
+        struct RevisionOwned(Revision);
+        impl<'de> Deserialize<'de> for RevisionOwned {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                RevisionDef::deserialize(deserializer).map(Self)
+            }
+        }
+
+        pub fn serialize<S: Serializer>(
+            value: &Option<Revision>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            value.as_ref().map(RevisionRef).serialize(serializer)
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<Revision>, D::Error> {
+            Ok(Option::<RevisionOwned>::deserialize(deserializer)?.map(|value| value.0))
+        }
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(remote = "capture::Manifest")]
+    struct ManifestDef {
+        protocol: u32,
+        request: capture::Request,
+        state: String,
+        raw_byte_retention: String,
+        sqlite_consistency: String,
+        application_consistency: String,
+        cooperative_lock_protocol: String,
+        #[serde(with = "artifacts")]
+        artifacts: Vec<capture::Artifact>,
+        #[serde(with = "entries")]
+        companion_inventory: Vec<capture::Entry>,
+        absent_companions: Vec<NativePath>,
+        issues: Vec<Issue>,
+        wal: Option<WalReport>,
+        logical_blake3: Option<String>,
+        #[serde(with = "optional_revision")]
+        logical_revision: Option<Revision>,
+        revision_id: Option<String>,
+    }
+
+    pub fn serialize<S: Serializer>(
+        value: &capture::Manifest,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        ManifestDef::serialize(value, serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<capture::Manifest, D::Error> {
+        ManifestDef::deserialize(deserializer)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(clippy::large_enum_variant)]
+pub enum LightroomWorkbenchIoReply {
+    Root {
+        operation: String,
+        root: NativePath,
+        database_revision:
+            crate::lightroom_migration_worker::source_reader::capture_wire::FileRevision,
+        physical: crate::lightroom_migration_worker::identity::FileKey,
+    },
+    CaptureRunning {
+        operation: String,
+        pid: U64,
+        staging: NativePath,
+    },
+    CaptureComplete {
+        operation: String,
+        #[serde(with = "capture_manifest_wire")]
+        manifest: crate::lightroom::capture::Manifest,
+    },
+    Evidence {
+        operation: String,
+        capture_generation: String,
+        directory: NativePath,
+        #[serde(with = "capture_manifest_wire")]
+        manifest: crate::lightroom::capture::Manifest,
+        manifest_blake3: String,
+        manifest_bytes: U64,
+        authority: crate::lightroom_migration_worker::source_reader::CaptureSqlAuthority,
+    },
+    EvidenceManifestChunk {
+        operation: String,
+        capture_generation: String,
+        offset: U64,
+        total_bytes: U64,
+        next: Option<U64>,
+        bytes: Vec<u8>,
+    },
+    OriginalReady {
+        operation: String,
+        token: String,
+        bytes: U64,
+        blake3: String,
+    },
+    OriginalChunk {
+        operation: String,
+        token: String,
+        offset: U64,
+        bytes: Vec<u8>,
+    },
+    SealUpload {
+        operation: String,
+        token: String,
+        document: LightroomWorkbenchSealDocument,
+        offset: U64,
+    },
+    SealStaged {
+        operation: String,
+        token: String,
+        directory: NativePath,
+        database: NativePath,
+        physical: crate::lightroom_migration_worker::identity::FileKey,
+    },
+    SealHashed {
+        operation: String,
+        token: String,
+        #[serde(with = "capture_manifest_wire::revision")]
+        identity: crate::lightroom::source::Revision,
+        blake3: String,
+        directory: NativePath,
+        database: NativePath,
+    },
+    SealState {
+        operation: String,
+        token: String,
+        state: LightroomWorkbenchSealState,
+        directory: NativePath,
+        seal_path: NativePath,
+        approval_path: NativePath,
+        seal_blake3: Option<String>,
+    },
+    Released {
+        operation: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LightroomWorkbenchSealState {
+    Staging,
+    Staged,
+    Hashed,
+    PublishReady,
+    Published,
+    Aborted,
+}
+impl LightroomWorkbenchIoReply {
+    pub fn validate_for(&self, request: &LightroomWorkbenchIo) -> Result<()> {
+        let requested = request.ids()[0];
+        let actual = match self {
+            Self::Root {
+                operation,
+                root,
+                database_revision,
+                physical,
+            } => {
+                validate_path(root)?;
+                ensure!(
+                    database_revision.bytes <= i64::MAX as u64,
+                    "Workbench root size"
+                );
+                ensure!(
+                    physical.volume.0 != 0 || physical.index.0 != 0,
+                    "Workbench root identity"
+                );
+                operation
+            }
+            Self::CaptureRunning {
+                operation,
+                pid,
+                staging,
+            } => {
+                ensure!(pid.0 > 0, "capture pid");
+                validate_path(staging)?;
+                operation
+            }
+            Self::CaptureComplete {
+                operation,
+                manifest,
+            } => {
+                ensure!(
+                    manifest.protocol == crate::lightroom::PROTOCOL,
+                    "capture manifest protocol"
+                );
+                operation
+            }
+            Self::Evidence {
+                operation,
+                capture_generation,
+                manifest_blake3,
+                manifest_bytes,
+                authority,
+                ..
+            } => {
+                ensure!(
+                    !capture_generation.is_empty() && capture_generation.len() <= 128,
+                    "capture evidence generation"
+                );
+                ensure!(
+                    manifest_blake3.len() == 64
+                        && (1..=crate::lightroom::MANIFEST_BYTES as u64)
+                            .contains(&manifest_bytes.0),
+                    "capture manifest identity"
+                );
+                authority.validate()?;
+                operation
+            }
+            Self::EvidenceManifestChunk {
+                operation,
+                capture_generation,
+                offset,
+                total_bytes,
+                next,
+                bytes,
+            } => {
+                let end = offset.0.checked_add(bytes.len() as u64);
+                ensure!(
+                    !capture_generation.is_empty()
+                        && capture_generation.len() <= 128
+                        && offset.0 < total_bytes.0
+                        && total_bytes.0 <= crate::lightroom::MANIFEST_BYTES as u64
+                        && !bytes.is_empty()
+                        && bytes.len() <= CHUNK_BYTES
+                        && end.is_some_and(|end| end <= total_bytes.0)
+                        && *next == end.and_then(|end| (end < total_bytes.0).then_some(U64(end))),
+                    "capture manifest chunk"
+                );
+                operation
+            }
+            Self::OriginalReady {
+                operation,
+                token,
+                bytes,
+                blake3,
+            } => {
+                ensure!(
+                    !token.is_empty()
+                        && token.len() <= 128
+                        && bytes.0 > 0
+                        && bytes.0 <= LIGHTROOM_ORIGINAL_BYTES
+                        && blake3.len() == 64,
+                    "original ready reply"
+                );
+                operation
+            }
+            Self::OriginalChunk {
+                operation,
+                token,
+                offset: _,
+                bytes,
+            } => {
+                ensure!(
+                    !token.is_empty()
+                        && token.len() <= 128
+                        && !bytes.is_empty()
+                        && bytes.len() <= 16 * 1024,
+                    "original chunk reply"
+                );
+                operation
+            }
+            Self::SealUpload {
+                operation,
+                token,
+                offset,
+                ..
+            } => {
+                ensure!(!token.is_empty() && token.len() <= 128, "seal upload token");
+                ensure!(offset.0 <= 256 * 1024 * 1024, "seal upload offset");
+                operation
+            }
+            Self::SealStaged {
+                operation,
+                token,
+                directory,
+                database,
+                physical,
+            } => {
+                ensure!(!token.is_empty() && token.len() <= 128, "seal stage token");
+                validate_path(directory)?;
+                validate_path(database)?;
+                ensure!(
+                    physical.volume.0 != 0 || physical.index.0 != 0,
+                    "seal database identity"
+                );
+                operation
+            }
+            Self::SealHashed {
+                operation,
+                token,
+                identity,
+                blake3,
+                directory,
+                database,
+            } => {
+                ensure!(
+                    !token.is_empty() && token.len() <= 128 && blake3.len() == 64,
+                    "seal hash reply"
+                );
+                ensure!(identity.bytes > 0, "sealed database is empty");
+                validate_path(directory)?;
+                validate_path(database)?;
+                operation
+            }
+            Self::SealState {
+                operation,
+                token,
+                directory,
+                seal_path,
+                approval_path,
+                seal_blake3,
+                ..
+            } => {
+                ensure!(!token.is_empty() && token.len() <= 128, "seal state token");
+                validate_path(directory)?;
+                validate_path(seal_path)?;
+                validate_path(approval_path)?;
+                ensure!(
+                    seal_blake3.as_ref().is_none_or(|v| v.len() == 64),
+                    "seal state digest"
+                );
+                operation
+            }
+            Self::Released { operation } => operation,
+        };
+        ensure!(actual == requested, "Workbench F reply operation differs");
+        match (request, self) {
+            (
+                LightroomWorkbenchIo::EvidenceManifestPage {
+                    capture_generation,
+                    offset,
+                    limit,
+                    ..
+                },
+                LightroomWorkbenchIoReply::EvidenceManifestChunk {
+                    capture_generation: actual,
+                    offset: actual_offset,
+                    bytes,
+                    ..
+                },
+            ) => ensure!(
+                capture_generation == actual
+                    && offset == actual_offset
+                    && bytes.len() as u64 <= limit.0,
+                "capture manifest chunk binding differs"
+            ),
+            (LightroomWorkbenchIo::EvidenceManifestPage { .. }, _) => {
+                anyhow::bail!("capture manifest page reply kind differs")
+            }
+            (
+                LightroomWorkbenchIo::OriginalBegin { candidate, .. },
+                LightroomWorkbenchIoReply::OriginalReady { token, .. },
+            ) => ensure!(token == &candidate.token, "original ready token differs"),
+            (
+                LightroomWorkbenchIo::OriginalCurrent {
+                    token: expected, ..
+                },
+                LightroomWorkbenchIoReply::OriginalReady { token, .. },
+            ) => ensure!(token == expected, "original current token differs"),
+            (
+                LightroomWorkbenchIo::OriginalPage { token, offset, .. },
+                LightroomWorkbenchIoReply::OriginalChunk {
+                    token: actual,
+                    offset: actual_offset,
+                    ..
+                },
+            ) => ensure!(
+                token == actual && offset == actual_offset,
+                "original chunk binding differs"
+            ),
+            (
+                LightroomWorkbenchIo::OriginalRelease { .. },
+                LightroomWorkbenchIoReply::Released { .. },
+            ) => {}
+            (LightroomWorkbenchIo::OriginalBegin { .. }, _)
+            | (LightroomWorkbenchIo::OriginalCurrent { .. }, _)
+            | (LightroomWorkbenchIo::OriginalPage { .. }, _)
+            | (LightroomWorkbenchIo::OriginalRelease { .. }, _) => {
+                anyhow::bail!("original reply kind differs")
+            }
+            (
+                LightroomWorkbenchIo::SealChunk {
+                    token,
+                    document,
+                    offset,
+                    bytes,
+                    ..
+                },
+                LightroomWorkbenchIoReply::SealUpload {
+                    token: actual,
+                    document: actual_document,
+                    offset: next,
+                    ..
+                },
+            ) => ensure!(
+                token == actual
+                    && document == actual_document
+                    && next.0 == offset.0 + bytes.len() as u64,
+                "seal upload acknowledgement differs"
+            ),
+            (
+                LightroomWorkbenchIo::SealBegin { token, .. },
+                LightroomWorkbenchIoReply::SealUpload {
+                    token: actual,
+                    document,
+                    offset,
+                    ..
+                },
+            ) => ensure!(
+                token == actual
+                    && *document == LightroomWorkbenchSealDocument::Approval
+                    && offset.0 == 0,
+                "seal initial upload acknowledgement differs"
+            ),
+            (
+                LightroomWorkbenchIo::SealPublishBegin { token, .. },
+                LightroomWorkbenchIoReply::SealUpload {
+                    token: actual,
+                    document,
+                    offset,
+                    ..
+                },
+            ) => ensure!(
+                token == actual
+                    && *document == LightroomWorkbenchSealDocument::Seal
+                    && offset.0 == 0,
+                "seal publication upload acknowledgement differs"
+            ),
+            (
+                LightroomWorkbenchIo::SealStage { token, .. },
+                LightroomWorkbenchIoReply::SealStaged { token: actual, .. },
+            )
+            | (
+                LightroomWorkbenchIo::SealSyncHash { token, .. },
+                LightroomWorkbenchIoReply::SealHashed { token: actual, .. },
+            )
+            | (
+                LightroomWorkbenchIo::SealPublish { token, .. }
+                | LightroomWorkbenchIo::SealStatus { token, .. }
+                | LightroomWorkbenchIo::SealAbort { token, .. },
+                LightroomWorkbenchIoReply::SealState { token: actual, .. },
+            ) => ensure!(token == actual, "seal reply token differs"),
+            (LightroomWorkbenchIo::SealBegin { .. }, _)
+            | (LightroomWorkbenchIo::SealChunk { .. }, _)
+            | (LightroomWorkbenchIo::SealStage { .. }, _)
+            | (LightroomWorkbenchIo::SealSyncHash { .. }, _)
+            | (LightroomWorkbenchIo::SealPublishBegin { .. }, _)
+            | (LightroomWorkbenchIo::SealPublish { .. }, _)
+            | (LightroomWorkbenchIo::SealStatus { .. }, _)
+            | (LightroomWorkbenchIo::SealAbort { .. }, _) => {
+                anyhow::bail!("seal reply kind differs")
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+impl LightroomArtifactPreparationReply {
+    pub fn validate_for(&self, request: &LightroomArtifactPreparation) -> Result<()> {
+        match (request, self) {
+            (
+                LightroomArtifactPreparation::Begin {
+                    session,
+                    capture_revision,
+                    manifest_blake3,
+                    ..
+                },
+                Self::Begun {
+                    session: actual,
+                    directory,
+                    manifest_path,
+                    manifest_physical,
+                    capture_revision: revision,
+                    manifest_blake3: digest,
+                    manifest_bytes,
+                    members,
+                },
+            ) => {
+                validate_path(directory)?;
+                validate_path(manifest_path)?;
+                manifest_physical.validate()?;
+                ensure!(
+                    actual == session
+                        && revision == capture_revision
+                        && digest == manifest_blake3
+                        && (1..=crate::lightroom::MANIFEST_BYTES as u64)
+                            .contains(&manifest_bytes.0)
+                        && (1..=4_096).contains(&members.0),
+                    "artifact preparation admission reply differs"
+                );
+            }
+            (
+                LightroomArtifactPreparation::Member {
+                    session,
+                    member_index,
+                },
+                Self::Prepared {
+                    session: actual,
+                    member_index: actual_index,
+                    receipt,
+                },
+            ) => ensure!(
+                actual == session
+                    && actual_index == member_index
+                    && uuid::Uuid::parse_str(receipt).is_ok(),
+                "prepared artifact reply differs"
+            ),
+            (
+                LightroomArtifactPreparation::Resolve { receipt },
+                Self::Resolved {
+                    receipt: actual,
+                    input_json,
+                    input_blake3,
+                },
+            ) => ensure!(
+                actual == receipt
+                    && !input_json.is_empty()
+                    && input_json.len() <= 65_536
+                    && blake3::hash(input_json.as_bytes()).to_hex().as_str() == input_blake3,
+                "resolved artifact reply differs"
+            ),
+            _ => anyhow::bail!("artifact preparation reply kind differs"),
+        }
+        Ok(())
+    }
+}
+impl LightroomSealedDocumentPage {
+    pub fn validate_for(&self, request: &LightroomSealedRead) -> Result<()> {
+        uuid::Uuid::parse_str(&self.session)?;
+        validate_path(&self.directory)?;
+        validate_path(&self.path)?;
+        self.physical.validate()?;
+        ensure!(
+            (1..=crate::lightroom::MANIFEST_BYTES as u64).contains(&self.total_bytes.0)
+                && self.offset.0 <= self.total_bytes.0
+                && self.bytes.len() <= CHUNK_BYTES,
+            "sealed document response bounds"
+        );
+        ensure!(
+            self.blake3.len() == 64
+                && self
+                    .blake3
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "sealed document response digest"
+        );
+        match request {
+            LightroomSealedRead::Begin {
+                session, document, ..
+            } => ensure!(
+                self.session == *session
+                    && self.document == *document
+                    && self.offset.0 == 0
+                    && self.bytes.is_empty()
+                    && self.next == Some(U64(0)),
+                "sealed document admission reply differs"
+            ),
+            LightroomSealedRead::Page {
+                session,
+                offset,
+                limit,
+            } => {
+                let end = offset
+                    .0
+                    .checked_add(self.bytes.len() as u64)
+                    .context("sealed document response overflow")?;
+                ensure!(
+                    self.session == *session
+                        && self.offset == *offset
+                        && !self.bytes.is_empty()
+                        && self.bytes.len() as u64 <= limit.0
+                        && end <= self.total_bytes.0
+                        && self.next
+                            == if end < self.total_bytes.0 {
+                                Some(U64(end))
+                            } else {
+                                None
+                            },
+                    "sealed document page reply differs"
+                )
+            }
+            LightroomSealedRead::Discard { .. } => {
+                anyhow::bail!("sealed document discard returned a page")
             }
         }
         Ok(())
@@ -293,24 +1774,32 @@ impl AdmissionSnapshot {
     rename_all = "snake_case",
     deny_unknown_fields
 )]
-#[expect(
+#[allow(
     clippy::large_enum_variant,
     reason = "inline response variants preserve the bounded protocol root without an extra heap owner"
 )]
 pub enum Response {
+    Backup(crate::catalog_backup::managed_filesystem::Reply),
     ExportExecutor(crate::catalog_session::export_executor::Reply),
+    Import(crate::catalog_session::import::Reply),
+    RestoredOriginalRoot(RestoreOriginalRootReply),
     PreviewStore(crate::catalog_session::store::Reply),
     PreviewIo(crate::catalog_session::preview_io::Reply),
     PreviewStage(crate::catalog_session::preview_stage::Reply),
     ExportStage(crate::catalog_session::export_stage::Reply),
     PreviewConfiguration(Vec<u8>),
+    LightroomSealedDocument(Option<LightroomSealedDocumentPage>),
+    LightroomArtifactPreparation(Option<LightroomArtifactPreparationReply>),
+    LightroomWorkbenchIo(LightroomWorkbenchIoReply),
     ExportDirectory(PreparedExportDirectory),
     ExportDestinationSnapshot(ExportDestinationSnapshotReply),
     MigrationIdentity(MigrationIdentityReply),
     ExportAliasFact(ExportAliasFactReply),
+    Storage(crate::catalog_session::storage::Reply),
     InspectedExportOriginal(InspectedExportOriginal),
     ExportOriginal(ExportOriginalReply),
     ExportPublication(ExportPublicationReply),
+    MetadataFiles(crate::catalog_session::metadata_files::Reply),
     ExportProfile(ExportProfileReply),
     Bootstrap(CatalogBootstrap),
     Confirmed(SqlAdmissionConfirmed),
@@ -682,6 +2171,7 @@ pub(crate) fn encode_operation(value: &Operation) -> Result<Vec<u8>> {
         Operation::PreviewIo(r) => r.binary(),
         Operation::PreviewStage(r) => (!r.binary().is_empty()).then(|| r.binary()),
         Operation::ExportStage(r) => (!r.binary().is_empty()).then(|| r.binary()),
+        Operation::MetadataFiles(r) => (!r.binary().is_empty()).then(|| r.binary()),
         _ => return encode(value, MESSAGE_BYTES),
     };
     crate::catalog_session::preview_io::pack(value, binary, MESSAGE_BYTES)
@@ -693,6 +2183,7 @@ pub(crate) fn decode_operation(bytes: &[u8]) -> Result<Operation> {
         Operation::PreviewIo(r) => r.set_binary(binary)?,
         Operation::PreviewStage(r) => r.set_binary(binary.to_vec())?,
         Operation::ExportStage(r) => r.set_binary(binary.to_vec())?,
+        Operation::MetadataFiles(r) => r.set_binary(binary.to_vec())?,
         _ => ensure!(binary.is_empty(), "unexpected operation binary trailer"),
     }
     value.validate()?;
@@ -703,6 +2194,7 @@ pub(crate) fn encode_outcome(value: &Outcome) -> Result<Vec<u8>> {
         Ok(Response::PreviewIo(r)) => r.binary(),
         Ok(Response::PreviewStage(r)) => (!r.binary().is_empty()).then(|| r.binary()),
         Ok(Response::ExportProfile(r)) => r.binary(),
+        Ok(Response::Import(r)) => r.value.binary(),
         _ => return encode(value, MESSAGE_BYTES),
     };
     crate::catalog_session::preview_io::pack(value, binary, MESSAGE_BYTES)
@@ -714,6 +2206,7 @@ pub(crate) fn decode_outcome(bytes: &[u8]) -> Result<Outcome> {
         Ok(Response::PreviewIo(r)) => r.set_binary(binary)?,
         Ok(Response::PreviewStage(r)) => r.set_binary(binary.to_vec())?,
         Ok(Response::ExportProfile(r)) => r.set_binary(binary)?,
+        Ok(Response::Import(r)) => r.value.set_binary(binary)?,
         _ => ensure!(binary.is_empty(), "unexpected outcome binary trailer"),
     }
     Ok(value)
@@ -722,6 +2215,249 @@ pub(crate) fn decode_outcome(bytes: &[u8]) -> Result<Outcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_manifest_page_reply_is_bound_to_requested_progress() {
+        let request = LightroomWorkbenchIo::EvidenceManifestPage {
+            operation: "operation".into(),
+            workbench: "workbench".into(),
+            generation: "generation".into(),
+            capture_generation: "capture".into(),
+            offset: U64(7),
+            limit: U64(4),
+        };
+        request.validate().unwrap();
+        let reply = LightroomWorkbenchIoReply::EvidenceManifestChunk {
+            operation: "operation".into(),
+            capture_generation: "capture".into(),
+            offset: U64(7),
+            total_bytes: U64(12),
+            next: Some(U64(11)),
+            bytes: vec![1, 2, 3, 4],
+        };
+        reply.validate_for(&request).unwrap();
+
+        let mut oversized = reply.clone();
+        let LightroomWorkbenchIoReply::EvidenceManifestChunk {
+            bytes,
+            next,
+            total_bytes,
+            ..
+        } = &mut oversized
+        else {
+            unreachable!()
+        };
+        bytes.push(5);
+        *next = None;
+        *total_bytes = U64(12);
+        assert!(oversized.validate_for(&request).is_err());
+
+        let mut stalled = reply;
+        let LightroomWorkbenchIoReply::EvidenceManifestChunk { bytes, .. } = &mut stalled else {
+            unreachable!()
+        };
+        bytes.clear();
+        assert!(stalled.validate_for(&request).is_err());
+    }
+
+    #[test]
+    fn lightroom_capture_manifest_wire_preserves_numeric_disk_grammar_and_full_u128() -> Result<()>
+    {
+        use crate::lightroom::{
+            PROTOCOL,
+            capture::{Artifact, Entry, Manifest, Request},
+            source::Revision,
+        };
+        let root = std::env::temp_dir();
+        let revision = |modified_ns| Revision {
+            object: "object".into(),
+            bytes: 1,
+            modified_ns,
+            changed: "changed".into(),
+        };
+        let manifest = Manifest {
+            protocol: PROTOCOL,
+            request: Request {
+                source: NativePath::from_path(&root.join("source.lrcat")),
+                output: NativePath::from_path(&root.join("capture")),
+                include_auxiliary: true,
+                closed_application_evidence: Some("closed fixture".into()),
+                limits: crate::lightroom::Limits::default(),
+            },
+            state: "captured".into(),
+            raw_byte_retention: "complete".into(),
+            sqlite_consistency: "verified".into(),
+            application_consistency: "closed".into(),
+            cooperative_lock_protocol: "verified".into(),
+            artifacts: vec![Artifact {
+                source: NativePath::from_path(&root.join("source.lrcat")),
+                role: "main".into(),
+                relative: NativePath::from_path(std::path::Path::new("source.lrcat")),
+                stored: "raw/000000.bin".into(),
+                revision: revision(Some(u128::MAX)),
+                blake3: "f".repeat(64),
+            }],
+            companion_inventory: vec![Entry {
+                path: NativePath::from_path(&root.join("source.lrcat")),
+                role: "main".into(),
+                relative: NativePath::from_path(std::path::Path::new("source.lrcat")),
+                directory: false,
+                modified_ns: Some(u64::MAX as u128),
+                changed: "changed".into(),
+            }],
+            absent_companions: vec![],
+            issues: vec![],
+            wal: None,
+            logical_blake3: Some("e".repeat(64)),
+            logical_revision: Some(revision(Some(0))),
+            revision_id: Some("revision".into()),
+        };
+
+        let disk = serde_json::to_vec(&manifest)?;
+        assert!(
+            std::str::from_utf8(&disk)?.contains(&format!(r#""modified_ns":{}"#, u128::MAX)),
+            "public manifest timestamp grammar changed"
+        );
+        let disk_roundtrip: Manifest = serde_json::from_slice(&disk)?;
+        assert_eq!(
+            disk_roundtrip.artifacts[0].revision.modified_ns,
+            Some(u128::MAX)
+        );
+
+        let encoded = encode_outcome(&Ok(Response::LightroomWorkbenchIo(
+            LightroomWorkbenchIoReply::CaptureComplete {
+                operation: "operation".into(),
+                manifest,
+            },
+        )))?;
+        let Ok(Response::LightroomWorkbenchIo(LightroomWorkbenchIoReply::CaptureComplete {
+            manifest,
+            ..
+        })) = decode_outcome(&encoded)?
+        else {
+            anyhow::bail!("capture manifest reply shape")
+        };
+        assert_eq!(manifest.artifacts[0].revision.modified_ns, Some(u128::MAX));
+        assert_eq!(
+            manifest.companion_inventory[0].modified_ns,
+            Some(u64::MAX as u128)
+        );
+        assert_eq!(
+            manifest.logical_revision.as_ref().unwrap().modified_ns,
+            Some(0)
+        );
+        assert_eq!(
+            serde_json::to_vec(&manifest)?,
+            disk,
+            "wire roundtrip changed the public manifest"
+        );
+
+        let encoded = encode_outcome(&Ok(Response::LightroomWorkbenchIo(
+            LightroomWorkbenchIoReply::SealHashed {
+                operation: "operation".into(),
+                token: "token".into(),
+                identity: revision(Some(u128::MAX)),
+                blake3: "f".repeat(64),
+                directory: NativePath::from_path(&root),
+                database: NativePath::from_path(&root.join("logical.sqlite3")),
+            },
+        )))?;
+        let Ok(Response::LightroomWorkbenchIo(LightroomWorkbenchIoReply::SealHashed {
+            identity,
+            ..
+        })) = decode_outcome(&encoded)?
+        else {
+            anyhow::bail!("seal revision reply shape")
+        };
+        assert_eq!(identity.modified_ns, Some(u128::MAX));
+        Ok(())
+    }
+
+    fn seal_chunk(bytes: Vec<u8>) -> LightroomWorkbenchIo {
+        LightroomWorkbenchIo::SealChunk {
+            operation: "operation".into(),
+            workbench: "workbench".into(),
+            generation: "generation".into(),
+            token: "token".into(),
+            document: LightroomWorkbenchSealDocument::Review,
+            offset: U64(0),
+            bytes,
+        }
+    }
+
+    #[test]
+    fn workbench_seal_documents_are_chunk_framed_and_exactly_acknowledged() -> Result<()> {
+        let request = seal_chunk(vec![0xa5; CHUNK_BYTES]);
+        request.validate()?;
+        let encoded = encode_operation(&Operation::LightroomWorkbenchIo(request.clone()))?;
+        assert!(encoded.len() < MESSAGE_BYTES);
+        let reply = LightroomWorkbenchIoReply::SealUpload {
+            operation: "operation".into(),
+            token: "token".into(),
+            document: LightroomWorkbenchSealDocument::Review,
+            offset: U64(CHUNK_BYTES as u64),
+        };
+        reply.validate_for(&request)?;
+
+        assert!(seal_chunk(vec![0; CHUNK_BYTES + 1]).validate().is_err());
+        let mut wrong = reply;
+        if let LightroomWorkbenchIoReply::SealUpload { offset, .. } = &mut wrong {
+            *offset = U64(1);
+        }
+        assert!(wrong.validate_for(&request).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn import_outcome_uses_one_exact_16k_binary_trailer() -> Result<()> {
+        use crate::catalog_session::{PhysicalObjectId, import as i};
+        #[cfg(unix)]
+        let physical = |index| PhysicalObjectId::Unix {
+            device: U64(1),
+            inode: U64(index),
+        };
+        #[cfg(windows)]
+        let physical = |index| PhysicalObjectId::Windows {
+            volume_serial: U64(1),
+            file_index: U64(index),
+        };
+        let request = i::Request {
+            root: RootCapability {
+                epoch: LeaseId::new(),
+                token: LeaseId::new(),
+                session: LeaseId::new(),
+                canonical_root: NativePath::from_path(&std::env::temp_dir()),
+                root_physical: physical(2),
+                catalog_physical: physical(3),
+            },
+            transfer: LeaseId::new(),
+            step: U64(7),
+            action: i::Action::Read { offset: U64(0) },
+        };
+        let bytes = vec![0xa5; i::CHUNK_BYTES];
+        let reply = i::Reply {
+            root: request.root.clone(),
+            transfer: request.transfer.clone(),
+            step: request.step,
+            request_digest: request.digest()?,
+            value: i::Value::Chunk {
+                offset: U64(0),
+                checksum: blake3::hash(&bytes).to_hex().to_string(),
+                bytes: bytes.clone(),
+            },
+        };
+        reply.validate(&request)?;
+        let encoded = encode_outcome(&Ok(Response::Import(reply)))?;
+        assert!(encoded.len() < bytes.len() + 2048);
+        let Ok(Response::Import(decoded)) = decode_outcome(&encoded)? else {
+            anyhow::bail!("import outcome shape")
+        };
+        decoded.validate(&request)?;
+        assert_eq!(decoded.value.binary(), Some(bytes.as_slice()));
+        crate::application::desktop::test_import_relay_admission(&request, &decoded)?;
+        Ok(())
+    }
+
     #[test]
     fn maximum_export_executor_request_and_reply_round_trip() -> Result<()> {
         use crate::catalog_session::{PhysicalObjectId, export_executor as e};
@@ -957,18 +2693,15 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn configuration_and_native_path_boundaries_preserve_full_roster() -> Result<()> {
+    fn configuration_and_native_path_boundaries_preserve_bounded_roster() -> Result<()> {
         #[cfg(unix)]
         let path = NativePath::UnixBytes(b"/a".to_vec());
         #[cfg(windows)]
         let path = NativePath::WindowsWide("C:\\a".encode_utf16().collect());
         let mut startup = Startup::new(vec![])?;
-        let base = encode(&startup, CONFIG_BYTES)?.len();
-        let item = encode(&path, MESSAGE_BYTES)?.len();
-        let count = (CONFIG_BYTES - base + 1) / (item + 1);
+        let count = crate::catalog_session::import::ORIGINAL_ROOTS;
         startup.original_roots = vec![path.clone(); count];
         let encoded = encode(&startup, CONFIG_BYTES)?;
-        assert!(CONFIG_BYTES - encoded.len() < item + 1);
         let decoded: Startup = decode(&encoded, CONFIG_BYTES)?;
         decoded.validate()?;
         assert_eq!(decoded.original_roots.len(), count);
@@ -983,6 +2716,17 @@ mod tests {
             }
         }
         validate_path(&maximum)?;
+        let maximum_bytes = match &maximum {
+            NativePath::UnixBytes(units) => units.len(),
+            NativePath::WindowsWide(units) => units.len() * std::mem::size_of::<u16>(),
+        };
+        let mut oversized = Startup::new(vec![])?;
+        oversized.original_roots =
+            vec![
+                maximum.clone();
+                crate::catalog_session::import::ORIGINAL_ROOT_BYTES / maximum_bytes + 1
+            ];
+        assert!(oversized.validate().is_err());
         match &mut maximum {
             NativePath::UnixBytes(units) => units.push(b'a'),
             NativePath::WindowsWide(units) => units.push(b'a' as u16),

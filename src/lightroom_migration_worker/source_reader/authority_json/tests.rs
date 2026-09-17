@@ -122,6 +122,73 @@ fn authority_protected_count_and_cancel_precede_source_opens() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn capture_sql_authority_is_distinct_and_binding_complete() -> Result<()> {
+    use crate::{
+        application::U64,
+        lightroom::{PAGE_BYTES, source::Revision},
+        lightroom_migration_worker::source_reader::capture_wire,
+        storage_volume::NativePath,
+    };
+    let temp = tempfile::tempdir()?;
+    let capture_root = temp.path().canonicalize()?.join("capture");
+    let mut value = capture_wire::Authority {
+        protocol: 1,
+        build: crate::lightroom_migration_worker::worker::build_identity().into(),
+        workbench_instance: "w".into(),
+        workbench_generation: "g".into(),
+        filesystem_lease: "f".into(),
+        operation: "o".into(),
+        capture_generation: "c".into(),
+        expires_unix_ms: U64(u64::MAX),
+        capture_root: NativePath::from_path(&capture_root),
+        member: capture_wire::MEMBER.into(),
+        manifest_blake3: "1".repeat(64),
+        revision_id: "2".repeat(64),
+        logical_revision: Revision {
+            object: "object".into(),
+            bytes: 1,
+            modified_ns: None,
+            changed: "changed".into(),
+        }
+        .into(),
+        logical_blake3: "3".repeat(64),
+        maximum_bytes: U64(1),
+        physical: FileKey {
+            volume: U64(1),
+            index: U64(2),
+        },
+        companion_generation: "e".into(),
+        raw_roster_blake3: "4".repeat(64),
+        limits: capture_wire::Limits {
+            open_deadline_ms: U64(1000),
+            total_deadline_ms: U64(2000),
+            vm_steps: U64(1000),
+            schema_objects: U64(16),
+            schema_bytes: U64(PAGE_BYTES as u64),
+            page_bytes: U64(PAGE_BYTES as u64),
+            max_cell_bytes: U64(1024),
+            result_bytes: U64(1024 * 1024),
+            inline_bytes: U64(1024),
+            chunk_bytes: U64(1024),
+            max_rows: U64(100),
+        },
+        protected: vec![],
+        binding_blake3: String::new(),
+    };
+    value.binding_blake3 = value.computed_binding()?;
+    let encoded = serde_json::to_vec(&Authority::CaptureSql { value })?;
+    assert!(matches!(
+        decode(&encoded, &|| false)?,
+        Authority::CaptureSql { .. }
+    ));
+    let wrong = String::from_utf8(encoded)?.replacen("CaptureSql", "Sql", 1);
+    assert!(decode(wrong.as_bytes(), &|| false).is_err());
+    let sql = format!(r#"{{"mode":"CaptureSql","authority":{}}}"#, body(SEAL)?);
+    assert!(decode(sql.as_bytes(), &|| false).is_err());
+    Ok(())
+}
+
 fn artifact_body(path: &str) -> Result<String> {
     let descriptor = format!(
         r#"{{"protocol":1,"request":{{"retained_capture_record":1,"member_index":0,"mapping":{{"root":{path},"relative":{path},"copy_identity":["copy",1,null,"c"]}}}},"selected_input":"a","capture_revision":"b","manifest_blake3":"c","artifact":{{"source":{path},"role":"main","relative":{path},"stored":"member","revision":["original",1,null,"c"],"blake3":"d"}}}}"#

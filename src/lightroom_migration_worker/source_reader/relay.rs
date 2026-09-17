@@ -9,22 +9,26 @@ pub(crate) mod client;
 pub(crate) mod server;
 
 pub(crate) const CHUNK: usize = 16 * 1024;
+pub(crate) const COUNT: usize = 3;
 // Preserve the complete Source frame, including its four-byte length prefix.
 const FRAME: usize = crate::lightroom_migration_worker::protocol::FRAME_BYTES + 4;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Kind {
     Sql,
     Raw,
+    CaptureSql,
 }
 impl Kind {
+    pub(crate) const ALL: [Self; COUNT] = [Self::Sql, Self::Raw, Self::CaptureSql];
     pub(crate) fn index(self) -> usize {
         match self {
             Self::Sql => 0,
             Self::Raw => 1,
+            Self::CaptureSql => 2,
         }
     }
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "relay", deny_unknown_fields)]
 pub enum Command {
     Start {

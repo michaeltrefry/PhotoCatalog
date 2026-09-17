@@ -20,6 +20,7 @@ import edit_memory
 
 MAX_JSON=256*1024
 MAX_SAMPLES=16*1024*1024
+MAX_PATH_UNITS=32*1024
 PIXEL_PHASES={'correctness','kernel','full','support100mp','proxy_reference'}
 
 
@@ -50,6 +51,24 @@ def read_json(path, limit=MAX_JSON):
     if len(data)>limit:
         raise ValueError('JSON grew')
     return strict_json(data)
+
+
+def native_path(value):
+    if not isinstance(value,dict) or set(value)!= {'encoding','units'}:
+        raise ValueError('native path shape differs')
+    units=value['units']
+    if not isinstance(units,list) or not 1<=len(units)<=MAX_PATH_UNITS:
+        raise ValueError('native path unit bound')
+    if value['encoding']=='UnixBytes' and os.name=='posix':
+        if any(type(unit) is not int or not 0<=unit<=255 for unit in units) or 0 in units:
+            raise ValueError('invalid Unix native path units')
+        return Path(os.fsdecode(bytes(units)))
+    if value['encoding']=='WindowsWide' and os.name=='nt':
+        if any(type(unit) is not int or not 0<=unit<=65535 for unit in units) or 0 in units:
+            raise ValueError('invalid Windows native path units')
+        import struct
+        return Path(struct.pack('<'+'H'*len(units),*units).decode('utf-16-le','surrogatepass'))
+    raise ValueError('foreign native path encoding')
 
 
 def digest(path, algorithm, limit):
@@ -184,12 +203,18 @@ def overlap_proof(value,receipt,process_samples):
 
 
 def verify_case(root):
-    root=Path(root)
+    root=Path(root).resolve(strict=True)
     request=read_json(root/'request.json')
+    service=Path(request.get('service_root',''))
+    service_phases={'warm_service','first_raw','export','export_correctness','overlap_import','overlap_export'}
+    if (request.get('version')!=2 or Path(request.get('output',''))!=root or not service.is_absolute()
+        or root==service or root in service.parents or service in root.parents
+        or (request['phase'] in service_phases) != service.is_dir() or service.is_symlink()):
+        raise ValueError('split request storage identity differs')
     receipt=read_json(root/'receipt.json')
     if not receipt.get('probe_complete') or receipt.get('qualification_complete') is not False:
         raise ValueError('incomplete or overclaiming probe receipt')
-    for field in ('phase','fixture_id','operation','source_sha256','source_blake3'):
+    for field in ('phase','fixture_id','operation','source_sha256','source_blake3','output','service_root'):
         if receipt[field]!=request[field]:
             raise ValueError('request/receipt identity mismatch: '+field)
     if digest(request['source'],'sha256',request['decode']['max_encoded_bytes'])!=request['source_sha256']:

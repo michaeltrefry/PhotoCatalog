@@ -15,6 +15,11 @@ import time
 
 from preview_experiment import digest, exclusive, utc
 from preview_host import HostObservation, host_identity
+from schema_campaign_contract import CURRENT_SCHEMA
+
+PROTOCOL = 3
+NATIVE_PROTOCOL = 2
+SCHEMA_CONTRACT_SOURCE = Path(__file__).with_name("schema_campaign_contract.py")
 
 
 def anchor():
@@ -118,7 +123,7 @@ def validate_trial(row, kind, index):
 
 
 def validate_binding(binding, files):
-    if binding.get("version") != 2 or binding.get("catalog_schema") != 6 or binding.get("clean") is not True:
+    if binding.get("version") != PROTOCOL or binding.get("catalog_schema") != CURRENT_SCHEMA or binding.get("clean") is not True:
         raise ValueError("clean reviewed source binding required")
     revision = binding.get("source_revision", "")
     if len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision):
@@ -130,12 +135,21 @@ def validate_binding(binding, files):
             raise ValueError(f"reviewed identity mismatch: {name}")
 
 
+def validate_child_identity(result, profile, workload, dataset_blake3):
+    if (result.get("version") != NATIVE_PROTOCOL or result.get("catalog_schema") != CURRENT_SCHEMA
+            or result.get("complete") is not True or result.get("profile") != profile
+            or result.get("workload") != workload):
+        raise ValueError("child result identity mismatch")
+    if result.get("dataset_blake3") != dataset_blake3:
+        raise ValueError("child dataset identity mismatch")
+
+
 def run(args):
     if args.lane_token != "coordinator-authorized":
         raise ValueError("explicit coordinator lane required")
     args.output.mkdir(parents=False, exist_ok=False)
     root = Path(__file__).resolve().parents[1]
-    campaign = {"version": 2, "catalog_schema": 6, "complete": False, "started": anchor(), "children": [],
+    campaign = {"version": PROTOCOL, "catalog_schema": CURRENT_SCHEMA, "complete": False, "started": anchor(), "children": [],
                 "planned_measured_children": 44, "planned_verifiers": 44,
                 "automatic_retries": 0, "quietness_verified": False,
                 "metadata_count": 10000, "desktop_frame_time": "unavailable; S12",
@@ -144,7 +158,8 @@ def run(args):
     frozen = {}
     try:
         paths = {name: getattr(args, name) for name in ("binary", "worker", "archive", "storage", "fixture", "layout_receipt")}
-        paths.update(protocol=root/"docs/PREVIEW_STAGE_B_PROTOCOL.md", coordinator=Path(__file__))
+        paths.update(protocol=root/"docs/PREVIEW_STAGE_B_PROTOCOL.md", coordinator=Path(__file__),
+                     schema_contract=SCHEMA_CONTRACT_SOURCE)
         fixture = read_json(args.fixture, 65536)
         paths["dataset"] = Path(fixture["dataset"])
         frozen = {name: digest(path) for name, path in paths.items()}
@@ -190,10 +205,7 @@ def run(args):
                 if child["returncode"] != 0:
                     raise ValueError(f"measured child failed: {name}")
                 result = child["result"]
-                if result.get("version") != 2 or result.get("catalog_schema") != 6 or result.get("complete") is not True or result.get("profile") != profile or result.get("workload") != workload:
-                    raise ValueError("child result identity mismatch")
-                if result.get("dataset_blake3") != fixture["dataset_blake3"]:
-                    raise ValueError("child dataset identity mismatch")
+                validate_child_identity(result, profile, workload, fixture["dataset_blake3"])
                 child["verification_started"] = anchor()
                 with (folder/"verification.stdout").open("xb") as out, (folder/"verification.stderr").open("xb") as err:
                     verified = subprocess.run([str(args.binary), "verify", str(folder)], stdout=out, stderr=err, timeout=60, check=False)

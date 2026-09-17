@@ -192,9 +192,11 @@ pub(super) fn serve_mode(
     result
 }
 
+#[allow(clippy::large_enum_variant)]
 enum Roster {
     Sql(MigrationSource),
     Artifact(ArtifactReader),
+    CaptureSql(super::capture_source::CaptureSource),
 }
 impl Roster {
     fn open(
@@ -226,9 +228,16 @@ impl Roster {
                 &protected,
                 admit,
             )?)),
+            Authority::CaptureSql { value } => {
+                let opening = super::capture_source::opening_allocation(value.limits)?;
+                admit(opening)?;
+                Ok(Self::CaptureSql(
+                    super::capture_source::CaptureSource::open(value, cancel)?,
+                ))
+            }
         }
     }
-    fn read(&mut self, query: Read, cancel: &AtomicBool) -> Result<Vec<u8>> {
+    fn read(&mut self, query: Read, sequence: u64, cancel: &AtomicBool) -> Result<Vec<u8>> {
         ensure!(!cancel.load(Ordering::Acquire), "source read canceled");
         match (self, query) {
             (Self::Sql(source), Read::Sql(query)) => {
@@ -242,6 +251,38 @@ impl Roster {
                 let bytes =
                     ArtifactRead::chunk(source, offset.0, &|| cancel.load(Ordering::Acquire))?;
                 exact_json(&wire::Value::Chunk(bytes), RESULT_BYTES, cancel)
+            }
+            (Self::CaptureSql(source), Read::CaptureSql(query)) => {
+                let value = match query {
+                    super::capture_wire::Query::SchemaObjects => {
+                        wire::Value::CaptureSchemaObjects(source.schema())
+                    }
+                    super::capture_wire::Query::Variables => wire::Value::CaptureVariables {
+                        authority_binding: source.binding().into(),
+                        schema_roster_blake3: source.schema_digest().into(),
+                        values: source.variables_value(),
+                    },
+                    super::capture_wire::Query::TableRows {
+                        table_handle,
+                        cursor,
+                        limit,
+                    } => {
+                        let value = match source.table_rows(
+                            table_handle,
+                            cursor,
+                            usize::try_from(limit.0)?,
+                            sequence,
+                        )? {
+                            Ok(v) => super::capture_wire::TableValue::Batch(v),
+                            Err(v) => super::capture_wire::TableValue::Failure(v),
+                        };
+                        wire::Value::CaptureTable(value)
+                    }
+                    super::capture_wire::Query::Current => {
+                        wire::Value::CaptureCurrent(source.current()?)
+                    }
+                };
+                exact_json(&value, source.result_limit()?, cancel)
             }
             _ => anyhow::bail!("query does not belong to admitted source mode"),
         }
@@ -300,6 +341,7 @@ fn run(
             (&authority, role),
             (Authority::Sql { .. }, super::relay::Kind::Sql)
                 | (Authority::Artifact { .. }, super::relay::Kind::Raw)
+                | (Authority::CaptureSql { .. }, super::relay::Kind::CaptureSql)
         ),
         "managed Source role/authority mismatch"
     );
@@ -356,7 +398,7 @@ fn run(
                         &query,
                         120 * 1024,
                     )?);
-                    let bytes = roster.read(query, &controls.cancel)?;
+                    let bytes = roster.read(query, sequence.0, &controls.cancel)?;
                     let digest = crate::lightroom::digest(&bytes);
                     let next_chain = next_chain(&chain, sequence.0, &query_digest, &digest)?;
                     write_frame(
@@ -649,6 +691,14 @@ mod allocation_tests {
                 super::super::relay::Kind::Raw,
                 build,
                 Some(super::super::relay::Kind::Raw)
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_managed_handshake(
+                super::super::relay::Kind::CaptureSql,
+                build,
+                Some(super::super::relay::Kind::CaptureSql)
             )
             .is_ok()
         );

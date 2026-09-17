@@ -180,11 +180,11 @@ struct BindingDraft {
     relative: Option<NativePath>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct Evidence {
-    hash: String,
-    length: u64,
-    modified_ns: u128,
-    object: (u64, u64),
+pub(crate) struct Evidence {
+    pub(crate) hash: String,
+    pub(crate) length: u64,
+    pub(crate) modified_ns: u128,
+    pub(crate) object: (u64, u64),
 }
 impl Evidence {
     fn key(&self) -> String {
@@ -561,8 +561,8 @@ impl Catalog {
             &identity,
             old.as_ref().and_then(|v| v.volume_id.as_deref()),
         )?;
-        let file = open_regular(&path)?;
-        let key = object_key(&file)?;
+        let key = crate::catalog_session::storage::Observer(self.session.clone())
+            .object(&path, &AtomicBool::new(false))?;
         put_binding(
             &tx,
             asset,
@@ -650,19 +650,30 @@ impl Catalog {
             match storage_volume::match_mounts(&logical, snapshot) {
                 MountMatch::Unique(mount) => {
                     result.state = "online_unverified".into();
-                    result.detail =
-                        "Volume found; content verification required before reconnect".into();
+                    result.detail = "Volume found. The current path has not been verified.".into();
                     if let Some(relative) = b.relative {
                         match storage_volume::candidate_path(&mount, &relative) {
                             Ok(p) => {
                                 result.candidate = Some(NativePath::from_path(&p));
-                                let observation = storage_volume::locate(&p);
-                                result.state = match observation.state {
-                                    LocationState::Available => "online_unverified",
-                                    LocationState::MissingPath => "missing",
-                                    _ => "unavailable",
-                                }
-                                .into();
+                                let observation =
+                                    crate::catalog_session::storage::Observer(self.session.clone())
+                                        .locate(&p, &AtomicBool::new(false))?;
+                                let (state, detail) = match observation.state {
+                                    LocationState::Available => (
+                                        "online_unverified",
+                                        "Original found. This availability check has not verified its current contents.",
+                                    ),
+                                    LocationState::MissingPath => (
+                                        "missing",
+                                        "Volume found. The original is missing from its recorded location.",
+                                    ),
+                                    _ => (
+                                        "unavailable",
+                                        "Volume found. The original could not be accessed.",
+                                    ),
+                                };
+                                result.state = state.into();
+                                result.detail = detail.into();
                             }
                             Err(e) => {
                                 result.state = "unavailable".into();
@@ -671,10 +682,28 @@ impl Catalog {
                         }
                     }
                 }
-                MountMatch::Offline => result.state = "offline".into(),
-                MountMatch::Ambiguous(_) => result.state = "ambiguous".into(),
-                MountMatch::Indeterminate => result.state = "indeterminate".into(),
-                MountMatch::IdentityUnavailable => result.state = "identity_unavailable".into(),
+                MountMatch::Offline => {
+                    result.state = "offline".into();
+                    result.detail = "Known volume is not mounted".into();
+                }
+                MountMatch::Ambiguous(_) => {
+                    result.state = "ambiguous".into();
+                    result.detail =
+                        "Multiple mounted volumes report the same persistent identity; explicit relink required"
+                            .into();
+                }
+                MountMatch::Indeterminate => {
+                    result.state = "indeterminate".into();
+                    result.detail =
+                        "Mount snapshot is incomplete; volume availability cannot be determined"
+                            .into();
+                }
+                MountMatch::IdentityUnavailable => {
+                    result.state = "identity_unavailable".into();
+                    result.detail =
+                        "No persistent volume identity is available; explicit relink required"
+                            .into();
+                }
             }
         }
         Ok(result)
@@ -1146,11 +1175,21 @@ impl Catalog {
                     && current.old_binding == data.old_binding,
                 "asset changed after planning"
             );
-            verify_destination(data.destination.as_ref(), data.evidence.as_ref(), cancel)?;
+            verify_destination(
+                &crate::catalog_session::storage::Observer(self.session.clone()),
+                data.destination.as_ref(),
+                data.evidence.as_ref(),
+                cancel,
+            )?;
             visit_sources(&tx, plan, sequence, |source, status, data| {
                 check_source_snapshot(&tx, source, data, false, false)?;
                 if status == "matched" && !data.embedded {
-                    verify_destination(data.destination.as_ref(), data.evidence.as_ref(), cancel)?;
+                    verify_destination(
+                        &crate::catalog_session::storage::Observer(self.session.clone()),
+                        data.destination.as_ref(),
+                        data.evidence.as_ref(),
+                        cancel,
+                    )?;
                 }
                 Ok(())
             })?;
@@ -1259,10 +1298,20 @@ impl Catalog {
         // Recheck all bytes and object identities immediately before commit;
         // no database/filesystem atomicity is claimed after this observation.
         visit_items(&tx, plan, |sequence, _, data| {
-            verify_destination(data.destination.as_ref(), data.evidence.as_ref(), cancel)?;
+            verify_destination(
+                &crate::catalog_session::storage::Observer(self.session.clone()),
+                data.destination.as_ref(),
+                data.evidence.as_ref(),
+                cancel,
+            )?;
             visit_sources(&tx, plan, sequence, |_, status, data| {
                 if status == "matched" && !data.embedded {
-                    verify_destination(data.destination.as_ref(), data.evidence.as_ref(), cancel)?;
+                    verify_destination(
+                        &crate::catalog_session::storage::Observer(self.session.clone()),
+                        data.destination.as_ref(),
+                        data.evidence.as_ref(),
+                        cancel,
+                    )?;
                 }
                 Ok(())
             })?;
@@ -1678,12 +1727,16 @@ fn check_source_snapshot(
     );
     Ok(())
 }
-fn binding_draft(path: &Path) -> BindingDraft {
-    let location = storage_volume::locate(path);
-    BindingDraft {
+fn binding_draft(
+    observer: &crate::catalog_session::storage::Observer,
+    path: &Path,
+    cancel: &AtomicBool,
+) -> Result<BindingDraft> {
+    let location = observer.locate(path, cancel)?;
+    Ok(BindingDraft {
         identity: location.volume.and_then(|v| v.persistent_identity),
         relative: location.relative_in_volume,
-    }
+    })
 }
 fn validate_candidates(paths: &[NativePath]) -> Result<()> {
     ensure!(paths.len() <= 32, "at most 32 explicit candidates per item");
@@ -1938,6 +1991,7 @@ fn mapped_candidates(
     }
 }
 fn evaluate(
+    observer: &crate::catalog_session::storage::Observer,
     paths: &[NativePath],
     expected: Option<&str>,
     catalog_root: &Path,
@@ -1957,14 +2011,14 @@ fn evaluate(
             continue;
         }
         let checked = path.to_path().map_err(anyhow::Error::from).and_then(|p| {
-            let evidence = read_evidence(&p, cancel)?;
+            let evidence = observer.evidence(&p, cancel)?;
             let canonical = fs::canonicalize(&p)?;
             ensure!(
                 !canonical.starts_with(catalog_root),
                 "catalog-managed files cannot be originals or sidecar sources"
             );
             ensure!(
-                quick_evidence_matches(&canonical, &evidence)?,
+                observer.quick(&canonical, &evidence, cancel)?,
                 "candidate alias changed during resolution"
             );
             Ok((NativePath::from_path(&canonical), evidence))
@@ -2145,7 +2199,7 @@ fn validate_collisions(db: &Connection, plan: &str) -> Result<()> {
     );
     Ok(())
 }
-fn quick_evidence_matches(path: &Path, expected: &Evidence) -> Result<bool> {
+pub(crate) fn quick_evidence_matches(path: &Path, expected: &Evidence) -> Result<bool> {
     let file = open_regular(path)?;
     let metadata = file.metadata()?;
     Ok(object_key(&file)? == expected.object
@@ -2157,13 +2211,14 @@ fn quick_evidence_matches(path: &Path, expected: &Evidence) -> Result<bool> {
             == expected.modified_ns)
 }
 fn verify_destination(
+    observer: &crate::catalog_session::storage::Observer,
     path: Option<&NativePath>,
     expected: Option<&Evidence>,
     cancel: &AtomicBool,
 ) -> Result<()> {
     let path = path.context("missing planned destination")?.to_path()?;
     ensure!(
-        Some(&read_evidence(&path, cancel)?) == expected,
+        Some(&observer.evidence(&path, cancel)?) == expected,
         "destination content or file identity changed after preview: {}",
         path.display()
     );
@@ -2193,7 +2248,7 @@ pub(crate) fn open_regular(path: &Path) -> Result<File> {
     );
     Ok(file)
 }
-fn read_evidence(path: &Path, cancel: &AtomicBool) -> Result<Evidence> {
+pub(crate) fn read_evidence(path: &Path, cancel: &AtomicBool) -> Result<Evidence> {
     read_evidence_with(path, cancel, |_| {})
 }
 fn read_evidence_with(

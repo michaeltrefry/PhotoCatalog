@@ -4,6 +4,16 @@ use crate::lightroom::{
     capture::CaptureProcess,
     plan::{Plan, desktop::InspectionPin},
 };
+use crate::{
+    filesystem_worker::wire::{
+        LightroomWorkbenchIo, LightroomWorkbenchIoReply, LightroomWorkbenchSealDocument,
+        LightroomWorkbenchSealState,
+    },
+    lightroom_migration_worker::{
+        identity::FileKey,
+        source_reader::capture_wire::{self, TableValue},
+    },
+};
 use std::time::Duration;
 
 // Rust drops these fields in declaration order: all SQLite/source handles
@@ -11,12 +21,32 @@ use std::time::Duration;
 struct Owner {
     plan: Option<Plan>,
     review: Option<selection::SelectionReview>,
-    pin: InspectionPin,
+    pin: Option<InspectionPin>,
+    managed: Option<Arc<dyn ManagedIo>>,
+    root_operation: String,
+    workbench: String,
+    generation: String,
+    root: NativePath,
+    root_identity: Option<FileKey>,
+    poisoned: bool,
     version: i64,
     config: Config,
 }
+pub(super) fn owner_layout() -> usize {
+    std::mem::size_of::<Owner>()
+}
 fn encode(value: &impl Serialize, limit: usize) -> Result<String> {
     Ok(String::from_utf8(core::bounded_json(value, limit)?)?)
+}
+
+#[derive(Serialize)]
+struct SealResponse<'a> {
+    seal: &'a core::migration_source::InputSeal,
+    approval_json: &'a str,
+    approval: &'a selection::ApprovalDocument,
+    directory: &'a NativePath,
+    seal_path: &'a NativePath,
+    approval_path: &'a NativePath,
 }
 fn count(value: U64, maximum: usize) -> Result<usize> {
     let n = usize::try_from(value.0)?;
@@ -25,6 +55,20 @@ fn count(value: U64, maximum: usize) -> Result<usize> {
 }
 fn error_text(error: &anyhow::Error) -> String {
     format!("{error:#}").chars().take(4096).collect()
+}
+fn retain_failed_managed_open(
+    shared: &Arc<Mutex<Shared>>,
+    error: anyhow::Error,
+    _plan: Option<Box<Plan>>,
+) -> ! {
+    let mut state = shared.lock().unwrap_or_else(|value| value.into_inner());
+    state.fatal = true;
+    state.status.error = Some(error_text(&error));
+    state.status.phase = Phase::Failed;
+    drop(state);
+    loop {
+        thread::park_timeout(Duration::from_secs(60));
+    }
 }
 fn finish(
     shared: &Arc<Mutex<Shared>>,
@@ -77,7 +121,8 @@ pub(super) fn run(
     receiver: mpsc::Receiver<Message>,
     shared: Arc<Mutex<Shared>>,
     closing: Arc<AtomicBool>,
-) {
+    managed: Option<Arc<dyn ManagedIo>>,
+) -> Result<()> {
     let (initial, initial_generation, control) = {
         let s = shared.lock().unwrap_or_else(|e| e.into_inner());
         (
@@ -88,25 +133,91 @@ pub(super) fn run(
     };
     let opened = (|| -> Result<Owner> {
         control.check()?;
-        let root = native(&config.root, config.limits.native_path_units)?;
-        if matches!(config.mode, OpenMode::Create) {
-            drop(Plan::create(&root)?);
-        }
-        control.check()?;
-        let pin = InspectionPin::open(&root)?;
-        let plan = pin.open_plan(control.clone())?;
-        let version = plan.data_version()?;
+        let (root, pin, root_identity, plan, version) = if let Some(io) = &managed {
+            let opening_workbench = shared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .status
+                .workbench
+                .clone();
+            let request = LightroomWorkbenchIo::RootBegin {
+                operation: initial.clone(),
+                workbench: opening_workbench.clone(),
+                generation: initial_generation.clone(),
+                root: config.root.clone(),
+                create: matches!(config.mode, OpenMode::Create),
+            };
+            let reply = io.filesystem(request.clone(), &control.cancel)?;
+            reply.validate_for(&request)?;
+            let LightroomWorkbenchIoReply::Root { root, physical, .. } = reply else {
+                anyhow::bail!("Workbench root reply kind")
+            };
+            let local = match native(&root, config.limits.native_path_units) {
+                Ok(local) => local,
+                Err(error) => retain_failed_managed_open(&shared, error, None),
+            };
+            let opened = if matches!(config.mode, OpenMode::Create) {
+                Plan::create_managed(&local, &physical)
+            } else {
+                Plan::open_managed(&local, &physical)
+            };
+            let mut plan = match opened {
+                Ok(plan) => plan,
+                Err(failure) => retain_failed_managed_open(
+                    &shared,
+                    failure.error.context(
+                        "managed inspection admission failed; F root authority remains retained",
+                    ),
+                    failure.plan,
+                ),
+            };
+            plan.set_execution(Some(control.clone()));
+            let version = match plan.data_version() {
+                Ok(version) => version,
+                Err(error) => retain_failed_managed_open(&shared, error, Some(Box::new(plan))),
+            };
+            (root, None, Some(physical), plan, version)
+        } else {
+            let root = native(&config.root, config.limits.native_path_units)?;
+            if matches!(config.mode, OpenMode::Create) {
+                drop(Plan::create(&root)?);
+            }
+            control.check()?;
+            let pin = InspectionPin::open(&root)?;
+            let plan = pin.open_plan(control.clone())?;
+            let version = plan.data_version()?;
+            (
+                NativePath::from_path(pin.root()),
+                Some(pin),
+                None,
+                plan,
+                version,
+            )
+        };
+        let workbench = shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .status
+            .workbench
+            .clone();
         Ok(Owner {
             plan: Some(plan),
             review: None,
             pin,
+            managed,
+            root_operation: initial.clone(),
+            workbench,
+            generation: initial_generation.clone(),
+            root,
+            root_identity,
+            poisoned: false,
             version,
             config,
         })
     })();
     let mut owner = match opened {
         Ok(owner) => {
-            let root = NativePath::from_path(owner.pin.root());
+            let root = owner.root.clone();
             {
                 let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
                 s.status.initialized = true;
@@ -126,15 +237,16 @@ pub(super) fn run(
             owner
         }
         Err(error) => {
+            let detail = error_text(&error);
             finish(
                 &shared,
                 &initial,
                 &initial_generation,
-                Err(error),
+                Err(anyhow::anyhow!(detail.clone())),
                 None,
                 &closing,
             );
-            return;
+            return Err(anyhow::anyhow!(detail));
         }
     };
     while !closing.load(Ordering::Acquire) {
@@ -167,12 +279,16 @@ pub(super) fn run(
                 continue;
             }
         }
-        let result = (|| -> Result<String> {
+        let mut result = (|| -> Result<String> {
             control.check()?;
-            owner.pin.verify()?;
+            owner.verify_root(&control)?;
             if let Some(plan) = &mut owner.plan {
                 plan.set_execution(Some(control.clone()));
-                owner.pin.verify_plan(plan)?;
+                if let Some(pin) = &owner.pin {
+                    pin.verify_plan(plan)?;
+                } else if let Some(identity) = &owner.root_identity {
+                    plan.verify_managed_identity(identity)?;
+                }
                 let observed = plan.data_version()?;
                 if observed != owner.version {
                     owner.version = observed;
@@ -186,29 +302,916 @@ pub(super) fn run(
             }
             match request {
                 Ok(action) => owner.action(action.decode(&control)?, &control, &shared),
-                Err(query) => owner.query(query, &control),
+                Err(query) => owner.query(query, &control, &operation),
             }
         })();
+        let managed_failure = owner
+            .managed
+            .as_ref()
+            .and_then(|managed| managed.admit().err());
+        if result.is_ok()
+            && let Some(error) = managed_failure.as_ref()
+        {
+            result = Err(anyhow::anyhow!(format!(
+                "managed authority failed before result publication: {error:#}"
+            )));
+        }
+        let fatal = owner.poisoned || managed_failure.is_some();
+        if fatal {
+            owner.poisoned = true;
+            shared
+                .lock()
+                .unwrap_or_else(|value| value.into_inner())
+                .fatal = true;
+            closing.store(true, Ordering::Release);
+        }
         let review = owner.review.as_ref().map(|r| r.summary().token.clone());
         finish(&shared, &operation, &generation, result, review, &closing);
+        if fatal {
+            break;
+        }
     }
+    let close = owner.close();
+    if let Err(error) = close {
+        shared
+            .lock()
+            .unwrap_or_else(|value| value.into_inner())
+            .fatal = true;
+        if owner.managed.is_some() {
+            // A failed SQLite/F close retains the exact Owner in this process.
+            // The outer supervisor observes Failed during shutdown and
+            // checked-reaps W; no Drained frame can be emitted first.
+            let mut state = shared.lock().unwrap_or_else(|value| value.into_inner());
+            state.fatal = true;
+            state.status.error = Some(error_text(&error));
+            state.status.phase = Phase::Failed;
+            drop(state);
+            loop {
+                thread::park_timeout(Duration::from_secs(60));
+            }
+        }
+        return Err(error);
+    }
+    if owner.poisoned {
+        anyhow::bail!("managed Workbench generation is poisoned")
+    }
+    Ok(())
     // Owner drops Plan/Review first, then identity pin. Any capture subprocess
     // has already dropped/reaped inside action before this point.
 }
 impl Owner {
+    fn current_operation(&self, shared: &Arc<Mutex<Shared>>) -> String {
+        shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .status
+            .operation
+            .clone()
+    }
+    fn capture_limits(&self) -> capture_wire::Limits {
+        capture_wire::Limits {
+            open_deadline_ms: U64(self.config.limits.deadline_ms.clamp(1, 120_000)),
+            total_deadline_ms: U64(self.config.limits.deadline_ms.max(1)),
+            vm_steps: U64(self.config.limits.vm_steps.max(1)),
+            schema_objects: U64(capture_wire::MAX_SCHEMA_OBJECTS as u64),
+            schema_bytes: U64(core::PAGE_BYTES as u64),
+            page_bytes: U64(self.config.limits.page_bytes.min(core::PAGE_BYTES) as u64),
+            max_cell_bytes: U64(self.config.limits.row_bytes.min(64 * 1024 * 1024) as u64),
+            result_bytes: U64(self.config.limits.result_bytes.min(
+                crate::lightroom_migration_worker::source_reader::capture_wire::MAX_RESULT_BYTES,
+            ) as u64),
+            inline_bytes: U64(self.config.limits.page_bytes.min(core::PAGE_BYTES) as u64),
+            chunk_bytes: U64(
+                crate::lightroom_migration_worker::source_reader::capture_wire::MAX_CHUNK_BYTES
+                    as u64,
+            ),
+            max_rows: U64(capture_wire::MAX_ROWS as u64),
+        }
+    }
+    fn begin_evidence(
+        &self,
+        operation: &str,
+        directory: NativePath,
+        control: &Control,
+    ) -> Result<(
+        String,
+        NativePath,
+        core::capture::Manifest,
+        String,
+        U64,
+        crate::lightroom_migration_worker::source_reader::CaptureSqlAuthority,
+    )> {
+        let io = self
+            .managed
+            .as_ref()
+            .context("managed filesystem owner absent")?;
+        let capture_generation = token();
+        let mut protected = Vec::new();
+        if let Some(identity) = &self.root_identity {
+            protected.push(identity.clone());
+        }
+        let request = LightroomWorkbenchIo::EvidenceBegin {
+            operation: operation.into(),
+            workbench: self.workbench.clone(),
+            generation: self.generation.clone(),
+            capture_generation: capture_generation.clone(),
+            directory,
+            source_generation: token(),
+            protected,
+            limits: self.capture_limits(),
+        };
+        let reply = io.filesystem(request.clone(), &control.cancel)?;
+        reply.validate_for(&request)?;
+        let LightroomWorkbenchIoReply::Evidence {
+            capture_generation: actual,
+            directory,
+            manifest,
+            manifest_blake3,
+            manifest_bytes,
+            authority,
+            ..
+        } = reply
+        else {
+            anyhow::bail!("capture evidence reply kind")
+        };
+        ensure!(
+            actual == capture_generation,
+            "capture evidence generation differs"
+        );
+        Ok((
+            capture_generation,
+            directory,
+            manifest,
+            manifest_blake3,
+            manifest_bytes,
+            authority,
+        ))
+    }
+    fn evidence_manifest(
+        &self,
+        operation: &str,
+        capture_generation: &str,
+        manifest_blake3: &str,
+        manifest_bytes: U64,
+        authority_manifest_blake3: &str,
+        control: &Control,
+    ) -> Result<String> {
+        let io = self
+            .managed
+            .as_ref()
+            .context("managed filesystem owner absent")?;
+        let collected = (|| -> Result<String> {
+            let total = usize::try_from(manifest_bytes.0)?;
+            let mut bytes = Vec::with_capacity(total);
+            let mut hasher = blake3::Hasher::new();
+            while bytes.len() < total {
+                control.check()?;
+                let offset = bytes.len();
+                let request = LightroomWorkbenchIo::EvidenceManifestPage {
+                    operation: operation.into(),
+                    workbench: self.workbench.clone(),
+                    generation: self.generation.clone(),
+                    capture_generation: capture_generation.into(),
+                    offset: U64(offset as u64),
+                    limit: U64(
+                        crate::filesystem_worker::wire::CHUNK_BYTES.min(total - offset) as u64,
+                    ),
+                };
+                let reply = io.filesystem(request.clone(), &control.cancel)?;
+                reply.validate_for(&request)?;
+                let LightroomWorkbenchIoReply::EvidenceManifestChunk {
+                    offset: actual,
+                    total_bytes,
+                    next,
+                    bytes: fragment,
+                    ..
+                } = reply
+                else {
+                    anyhow::bail!("capture manifest page reply kind")
+                };
+                ensure!(
+                    actual.0 == offset as u64 && total_bytes == manifest_bytes,
+                    "capture manifest page identity changed"
+                );
+                let end = offset
+                    .checked_add(fragment.len())
+                    .context("capture manifest page overflow")?;
+                ensure!(
+                    !fragment.is_empty()
+                        && end <= total
+                        && next == (end < total).then_some(U64(end as u64)),
+                    "capture manifest page did not advance"
+                );
+                hasher.update(&fragment);
+                bytes.extend_from_slice(&fragment);
+            }
+            ensure!(
+                bytes.len() == total
+                    && hasher.finalize().to_hex().as_str() == manifest_blake3
+                    && manifest_blake3 == authority_manifest_blake3,
+                "capture manifest paged digest differs"
+            );
+            Ok(String::from_utf8(bytes)?)
+        })();
+        // A failed or canceled page keeps F's evidence lease retained for the
+        // generation's existing checked reconciliation path. The partial Vec
+        // drops here and no inspection-plan transaction has started.
+        collected
+    }
+    fn evidence_current(
+        &self,
+        operation: &str,
+        capture_generation: &str,
+        control: &Control,
+    ) -> Result<()> {
+        let io = self.managed.as_ref().context("managed owner absent")?;
+        let request = LightroomWorkbenchIo::EvidenceCurrent {
+            operation: operation.into(),
+            workbench: self.workbench.clone(),
+            generation: self.generation.clone(),
+            capture_generation: capture_generation.into(),
+        };
+        let reply = io.filesystem(request.clone(), &control.cancel)?;
+        reply.validate_for(&request)?;
+        ensure!(
+            matches!(reply, LightroomWorkbenchIoReply::Evidence { .. }),
+            "capture evidence current reply kind"
+        );
+        Ok(())
+    }
+    fn release_evidence(&self, operation: &str, capture_generation: &str) -> Result<()> {
+        let io = self.managed.as_ref().context("managed owner absent")?;
+        let request = LightroomWorkbenchIo::EvidenceRelease {
+            operation: operation.into(),
+            workbench: self.workbench.clone(),
+            generation: self.generation.clone(),
+            capture_generation: capture_generation.into(),
+        };
+        let reply = io.filesystem(request.clone(), &AtomicBool::new(false))?;
+        reply.validate_for(&request)?;
+        ensure!(
+            matches!(reply, LightroomWorkbenchIoReply::Released { .. }),
+            "capture evidence release reply kind"
+        );
+        Ok(())
+    }
+    fn seal_upload(
+        &self,
+        operation: &str,
+        token: &str,
+        document: LightroomWorkbenchSealDocument,
+        bytes: &[u8],
+        control: &Control,
+    ) -> Result<()> {
+        let io = self.managed.as_ref().context("managed owner absent")?;
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            control.check()?;
+            let end = offset
+                .checked_add(crate::filesystem_worker::wire::CHUNK_BYTES)
+                .context("seal upload offset overflow")?
+                .min(bytes.len());
+            let request = LightroomWorkbenchIo::SealChunk {
+                operation: operation.into(),
+                workbench: self.workbench.clone(),
+                generation: self.generation.clone(),
+                token: token.into(),
+                document,
+                offset: U64(offset as u64),
+                bytes: bytes[offset..end].to_vec(),
+            };
+            let reply = io.filesystem(request.clone(), &control.cancel)?;
+            reply.validate_for(&request)?;
+            offset = end;
+        }
+        Ok(())
+    }
+    fn seal_managed(
+        &mut self,
+        operation: &str,
+        review_token: &str,
+        approval_blake3: &str,
+        approval_json: &str,
+        output: NativePath,
+        control: &Control,
+    ) -> Result<selection::SealedSelection> {
+        let io = self
+            .managed
+            .as_ref()
+            .context("managed owner absent")?
+            .clone();
+        let mut review = self
+            .review
+            .take()
+            .context("prepare an explicit selection review first")?;
+        let mut retained_token = None;
+        let mut publication_started = false;
+        let result = (|| -> Result<selection::SealedSelection> {
+            let preparation = review.prepare_managed_seal(
+                review_token,
+                approval_blake3,
+                approval_json.as_bytes(),
+                output,
+                control.cancel.clone(),
+            )?;
+            let seal_token = token();
+            retained_token = Some(seal_token.clone());
+            let request = LightroomWorkbenchIo::SealBegin {
+                operation: operation.into(),
+                workbench: self.workbench.clone(),
+                generation: self.generation.clone(),
+                token: seal_token.clone(),
+                output: preparation.output.clone(),
+                approval_bytes: U64(preparation.approval_bytes.len() as u64),
+                approval_blake3: core::digest(&preparation.approval_bytes),
+                review_bytes: U64(preparation.review_bytes.len() as u64),
+                review_blake3: core::digest(&preparation.review_bytes),
+            };
+            let reply = io.filesystem(request.clone(), &control.cancel)?;
+            reply.validate_for(&request)?;
+            self.seal_upload(
+                operation,
+                &seal_token,
+                LightroomWorkbenchSealDocument::Approval,
+                &preparation.approval_bytes,
+                control,
+            )?;
+            self.seal_upload(
+                operation,
+                &seal_token,
+                LightroomWorkbenchSealDocument::Review,
+                &preparation.review_bytes,
+                control,
+            )?;
+            let request = LightroomWorkbenchIo::SealStage {
+                operation: operation.into(),
+                workbench: self.workbench.clone(),
+                generation: self.generation.clone(),
+                token: seal_token.clone(),
+            };
+            let reply = io.filesystem(request.clone(), &control.cancel)?;
+            reply.validate_for(&request)?;
+            let LightroomWorkbenchIoReply::SealStaged {
+                directory,
+                database,
+                physical,
+                ..
+            } = reply
+            else {
+                anyhow::bail!("seal stage reply kind")
+            };
+            let protected = vec![
+                self.root_identity
+                    .clone()
+                    .context("managed inspection identity missing")?,
+            ];
+            ensure!(
+                !protected.contains(&physical),
+                "sealed snapshot aliases the mutable inspection database"
+            );
+            let progress = control.processed.clone();
+            if let Err(error) = review.backup_managed(
+                review_token,
+                &database,
+                &physical,
+                control.cancel.clone(),
+                move |value| progress.store(value.completed, Ordering::Release),
+                || io.commit(),
+            ) {
+                self.poisoned = true;
+                return Err(error).context("managed destination backup failed");
+            }
+            let request = LightroomWorkbenchIo::SealSyncHash {
+                operation: operation.into(),
+                workbench: self.workbench.clone(),
+                generation: self.generation.clone(),
+                token: seal_token.clone(),
+                maximum_bytes: U64(preparation.snapshot_bytes),
+            };
+            let reply = io.filesystem(request.clone(), &control.cancel)?;
+            reply.validate_for(&request)?;
+            let LightroomWorkbenchIoReply::SealHashed {
+                identity,
+                blake3,
+                database,
+                ..
+            } = reply
+            else {
+                anyhow::bail!("seal hash reply kind")
+            };
+            let seal = review.managed_input_seal(&preparation, database, identity, blake3)?;
+            let remaining = self.config.limits.deadline_ms.clamp(1, 120_000);
+            let limits = core::migration_source::ReadLimits {
+                open_deadline_ms: self.config.limits.deadline_ms.max(1),
+                deadline_ms: remaining,
+                vm_steps: self.config.limits.vm_steps.min(1_000_000_000),
+                ..Default::default()
+            };
+            let source =
+                io.source_sql_open(seal.clone(), limits, protected, control.cancel.clone())?;
+            io.source_retire(&source)
+                .context("SQL13 source did not drain")?;
+            review.current_managed_seal(review_token)?;
+            self.verify_root(control)?;
+            let seal_bytes = core::bounded_json(&seal, core::MANIFEST_BYTES)?;
+            let seal_digest = core::digest(&seal_bytes);
+            let request = LightroomWorkbenchIo::SealPublishBegin {
+                operation: operation.into(),
+                workbench: self.workbench.clone(),
+                generation: self.generation.clone(),
+                token: seal_token.clone(),
+                bytes: U64(seal_bytes.len() as u64),
+                blake3: seal_digest.clone(),
+            };
+            let reply = io.filesystem(request.clone(), &control.cancel)?;
+            reply.validate_for(&request)?;
+            self.seal_upload(
+                operation,
+                &seal_token,
+                LightroomWorkbenchSealDocument::Seal,
+                &seal_bytes,
+                control,
+            )?;
+            // Publication is the selection point. After this request begins,
+            // success wins over cancellation and an unknown reply is reconciled
+            // only with the exact status operation, never by replaying publish.
+            control.check()?;
+            let publish = LightroomWorkbenchIo::SealPublish {
+                operation: operation.into(),
+                workbench: self.workbench.clone(),
+                generation: self.generation.clone(),
+                token: seal_token.clone(),
+            };
+            publication_started = true;
+            let published = match io.filesystem(publish.clone(), &AtomicBool::new(false)) {
+                Ok(reply) => {
+                    reply.validate_for(&publish)?;
+                    reply
+                }
+                Err(unknown) => {
+                    let status = LightroomWorkbenchIo::SealStatus {
+                        operation: operation.into(),
+                        workbench: self.workbench.clone(),
+                        generation: self.generation.clone(),
+                        token: seal_token.clone(),
+                    };
+                    let reply = io
+                        .filesystem(status.clone(), &AtomicBool::new(false))
+                        .with_context(|| {
+                            format!("seal publication outcome unknown: {unknown:#}")
+                        })?;
+                    reply.validate_for(&status)?;
+                    reply
+                }
+            };
+            let LightroomWorkbenchIoReply::SealState {
+                state,
+                seal_path,
+                approval_path,
+                seal_blake3,
+                ..
+            } = published
+            else {
+                anyhow::bail!("seal publication reply kind")
+            };
+            ensure!(
+                state == LightroomWorkbenchSealState::Published
+                    && seal_blake3.as_deref() == Some(seal_digest.as_str()),
+                "seal publication did not reach exact published receipt"
+            );
+            Ok(selection::SealedSelection {
+                seal,
+                approval: preparation.approval.clone(),
+                approval_bytes: preparation.approval_bytes.clone(),
+                directory,
+                seal_path,
+                approval_path,
+            })
+        })();
+        let result = match (result, retained_token, publication_started) {
+            (Err(primary), Some(token), false) => {
+                let abort = LightroomWorkbenchIo::SealAbort {
+                    operation: operation.into(),
+                    workbench: self.workbench.clone(),
+                    generation: self.generation.clone(),
+                    token,
+                };
+                match io.filesystem(abort.clone(), &AtomicBool::new(false)) {
+                    Ok(reply) => {
+                        if let Err(cleanup) = reply.validate_for(&abort) {
+                            Err(primary.context(format!(
+                                "seal abort receipt validation also failed: {cleanup:#}"
+                            )))
+                        } else {
+                            Err(primary)
+                        }
+                    }
+                    Err(cleanup) => Err(primary.context(format!(
+                        "seal abort also failed and remains retained: {cleanup:#}"
+                    ))),
+                }
+            }
+            (result, _, _) => result,
+        };
+        self.review = Some(review);
+        result
+    }
+    fn add_capture_managed(
+        &mut self,
+        operation: &str,
+        directory: NativePath,
+        control: &Control,
+    ) -> Result<String> {
+        let io = self
+            .managed
+            .as_ref()
+            .context("managed owner absent")?
+            .clone();
+        let (capture_generation, directory, manifest, manifest_blake3, manifest_bytes, authority) =
+            self.begin_evidence(operation, directory, control)?;
+        let manifest_json = self.evidence_manifest(
+            operation,
+            &capture_generation,
+            &manifest_blake3,
+            manifest_bytes,
+            &authority.manifest_blake3,
+            control,
+        )?;
+        let binding = authority.binding_blake3.clone();
+        let source = io.source_open(authority, control.cancel.clone())?;
+        let source_result = (|| -> Result<capture_wire::SchemaObjects> {
+            let schema = io.source_schema(&source)?;
+            ensure!(
+                schema.authority_binding == binding,
+                "CaptureSql schema authority differs"
+            );
+            let current = io.source_current(&source)?;
+            ensure!(
+                current.authority_binding == binding
+                    && current.schema_roster_blake3 == schema.schema_roster_blake3,
+                "CaptureSql current binding differs"
+            );
+            Ok(schema)
+        })();
+        let retired = io.source_retire(&source);
+        let schema = match (source_result, retired) {
+            (Ok(schema), Ok(())) => schema,
+            (Err(primary), Ok(())) => return Err(primary),
+            (Ok(_), Err(retire)) => {
+                return Err(retire).context("CaptureSql did not drain");
+            }
+            (Err(primary), Err(retire)) => {
+                return Err(
+                    primary.context(format!("CaptureSql checked drain also failed: {retire:#}"))
+                );
+            }
+        };
+        // This is the final fallible filesystem observation before the short
+        // plan transaction. The evidence lease remains retained through commit.
+        self.evidence_current(operation, &capture_generation, control)?;
+        self.verify_root(control)?;
+        let revision = self.plan(control)?.add_capture_managed(
+            &directory,
+            &manifest,
+            &manifest_json,
+            &schema,
+            || io.commit(),
+        )?;
+        self.release_evidence(operation, &capture_generation)?;
+        Ok(revision)
+    }
+    fn resume_managed(
+        &mut self,
+        operation: &str,
+        revision: &str,
+        maximum: usize,
+        control: &Control,
+    ) -> Result<core::plan::Progress> {
+        let io = self
+            .managed
+            .as_ref()
+            .context("managed owner absent")?
+            .clone();
+        let directory = self.plan(control)?.managed_capture(revision)?.0;
+        let (capture_generation, _, manifest, _, _, authority) =
+            self.begin_evidence(operation, directory, control)?;
+        ensure!(
+            manifest.revision_id.as_deref() == Some(revision),
+            "capture revision differs"
+        );
+        let binding = authority.binding_blake3.clone();
+        let source = io.source_open(authority, control.cancel.clone())?;
+        let source_result = (|| -> Result<usize> {
+            let schema = io.source_schema(&source)?;
+            ensure!(
+                schema.authority_binding == binding,
+                "CaptureSql schema authority differs"
+            );
+            let (stable_digest, pending) = self.plan(control)?.managed_resume_roster(revision)?;
+            ensure!(
+                schema.schema_roster_blake3 == stable_digest,
+                "captured schema roster changed"
+            );
+            let mut retained = 0usize;
+            for mut stable in pending {
+                if retained >= maximum {
+                    break;
+                }
+                control.check()?;
+                let fresh = schema
+                    .tables
+                    .get(usize::try_from(stable.descriptor.ordinal.0)?)
+                    .context("fresh CaptureSql table ordinal missing")?;
+                let mut comparable = fresh.clone();
+                let handle = std::mem::take(&mut comparable.table_handle);
+                ensure!(
+                    comparable == stable.descriptor,
+                    "captured stable table descriptor changed"
+                );
+                let mut cursor = stable.cursor.clone();
+                loop {
+                    let request_rows = (maximum - retained).min(capture_wire::MAX_ROWS);
+                    if request_rows == 0 {
+                        break;
+                    }
+                    let value =
+                        io.source_rows(&source, handle.clone(), cursor.clone(), request_rows)?;
+                    let next_cursor = match &value {
+                        TableValue::Batch(batch) => {
+                            ensure!(
+                                batch.authority_binding == binding
+                                    && batch.schema_roster_blake3 == stable_digest
+                                    && batch.table_handle == handle,
+                                "CaptureSql batch binding differs"
+                            );
+                            batch.next_cursor.clone()
+                        }
+                        TableValue::Failure(failure) => {
+                            ensure!(
+                                failure.authority_binding == binding
+                                    && failure.schema_roster_blake3 == stable_digest
+                                    && failure.table_handle == handle,
+                                "CaptureSql failure binding differs"
+                            );
+                            failure.cursor.clone()
+                        }
+                    };
+                    self.verify_root(control)?;
+                    let added = self.plan(control)?.apply_managed_table(
+                        revision,
+                        &stable,
+                        value,
+                        || io.commit(),
+                    )?;
+                    cursor = next_cursor;
+                    stable.cursor.clone_from(&cursor);
+                    retained = retained.checked_add(added).context("retained row count")?;
+                    control.progress(retained as u64);
+                    if added == 0 || retained >= maximum {
+                        break;
+                    }
+                }
+            }
+            let current = io.source_current(&source)?;
+            ensure!(
+                current.authority_binding == binding
+                    && current.schema_roster_blake3 == stable_digest,
+                "CaptureSql terminal current binding differs"
+            );
+            Ok(retained)
+        })();
+        let retired = io.source_retire(&source);
+        let retained = match (source_result, retired) {
+            (Ok(retained), Ok(())) => retained,
+            (Err(primary), Ok(())) => return Err(primary),
+            (Ok(_), Err(retire)) => {
+                return Err(retire).context("CaptureSql did not drain");
+            }
+            (Err(primary), Err(retire)) => {
+                return Err(
+                    primary.context(format!("CaptureSql checked drain also failed: {retire:#}"))
+                );
+            }
+        };
+        self.evidence_current(operation, &capture_generation, control)?;
+        self.verify_root(control)?;
+        let stage = self
+            .plan(control)?
+            .finish_managed_resume(revision, || io.commit())?;
+        self.release_evidence(operation, &capture_generation)?;
+        Ok(core::plan::Progress {
+            revision_id: revision.into(),
+            retained_this_call: retained,
+            stage,
+        })
+    }
+    fn inspect_originals_managed(
+        &mut self,
+        operation: &str,
+        revision: &str,
+        maximum: usize,
+        packets: bool,
+        control: &Control,
+    ) -> Result<usize> {
+        let io = self
+            .managed
+            .as_ref()
+            .context("managed owner absent")?
+            .clone();
+        let candidates = self
+            .plan(control)?
+            .managed_original_candidates(revision, maximum, packets)?;
+        let mut processed = 0usize;
+        for candidate in candidates {
+            control.check()?;
+            let begin = LightroomWorkbenchIo::OriginalBegin {
+                operation: operation.into(),
+                workbench: self.workbench.clone(),
+                generation: self.generation.clone(),
+                candidate: candidate.clone(),
+                maximum_result_bytes: U64(self.config.limits.result_bytes as u64),
+            };
+            let reply = io.filesystem(begin.clone(), &control.cancel)?;
+            reply.validate_for(&begin)?;
+            let LightroomWorkbenchIoReply::OriginalReady {
+                token,
+                bytes,
+                blake3,
+                ..
+            } = reply
+            else {
+                anyhow::bail!("original begin reply kind")
+            };
+            ensure!(token == candidate.token, "original begin token differs");
+            let length = usize::try_from(bytes.0)?;
+            let mut encoded = Vec::new();
+            encoded.try_reserve_exact(length)?;
+            while encoded.len() < length {
+                control.check()?;
+                let page = LightroomWorkbenchIo::OriginalPage {
+                    operation: operation.into(),
+                    workbench: self.workbench.clone(),
+                    generation: self.generation.clone(),
+                    token: token.clone(),
+                    offset: U64(encoded.len() as u64),
+                    limit: U64((length - encoded.len()).min(16 * 1024) as u64),
+                };
+                let part = io.filesystem(page.clone(), &control.cancel)?;
+                part.validate_for(&page)?;
+                let LightroomWorkbenchIoReply::OriginalChunk {
+                    token: actual,
+                    offset,
+                    bytes,
+                    ..
+                } = part
+                else {
+                    anyhow::bail!("original page reply kind")
+                };
+                ensure!(
+                    actual == token && offset.0 == encoded.len() as u64,
+                    "original page continuity"
+                );
+                encoded.extend_from_slice(&bytes);
+            }
+            ensure!(
+                crate::lightroom::digest(&encoded) == blake3,
+                "original result digest differs"
+            );
+            let observation: core::plan::OriginalObservation = serde_json::from_slice(&encoded)?;
+            let current = LightroomWorkbenchIo::OriginalCurrent {
+                operation: operation.into(),
+                workbench: self.workbench.clone(),
+                generation: self.generation.clone(),
+                token: token.clone(),
+            };
+            let current_reply = io.filesystem(current.clone(), &control.cancel)?;
+            current_reply.validate_for(&current)?;
+            ensure!(
+                matches!(current_reply, LightroomWorkbenchIoReply::OriginalReady { ref token, ref blake3, .. } if token == &candidate.token && blake3 == &crate::lightroom::digest(&encoded)),
+                "original current evidence differs"
+            );
+            self.verify_root(control)?;
+            self.plan(control)?
+                .apply_managed_original(&candidate, observation, || io.commit())?;
+            let release = LightroomWorkbenchIo::OriginalRelease {
+                operation: operation.into(),
+                workbench: self.workbench.clone(),
+                generation: self.generation.clone(),
+                token,
+            };
+            let released = io.filesystem(release.clone(), &AtomicBool::new(false))?;
+            released.validate_for(&release)?;
+            processed += 1;
+            control.progress(processed as u64);
+        }
+        self.verify_root(control)?;
+        self.plan(control)?
+            .finish_managed_originals(revision, || io.commit())?;
+        Ok(processed)
+    }
+    fn verify_root(&mut self, control: &Control) -> Result<()> {
+        if let Some(io) = &self.managed {
+            let request = LightroomWorkbenchIo::RootCurrent {
+                operation: self.root_operation.clone(),
+                workbench: self.workbench.clone(),
+                generation: self.generation.clone(),
+            };
+            let reply = io.filesystem(request.clone(), &control.cancel)?;
+            reply.validate_for(&request)?;
+            let LightroomWorkbenchIoReply::Root { physical, root, .. } = reply else {
+                anyhow::bail!("Workbench root current reply kind")
+            };
+            ensure!(root == self.root, "Workbench root changed");
+            ensure!(
+                self.root_identity.as_ref() == Some(&physical),
+                "Workbench inspection object changed"
+            );
+            if let Some(plan) = &self.plan {
+                plan.verify_managed_identity(&physical)?;
+            }
+        } else {
+            self.pin
+                .as_ref()
+                .context("inspection pin absent")?
+                .verify()?;
+        }
+        Ok(())
+    }
+    fn close(&mut self) -> Result<()> {
+        let mut failures = Vec::new();
+        if let Some(review) = self.review.take()
+            && let Err((review, error)) = review.close_checked()
+        {
+            self.review = Some(*review);
+            self.poisoned = true;
+            failures.push(format!("selection review close: {error:#}"));
+        }
+        if let Some(plan) = self.plan.take()
+            && let Err((plan, error)) = plan.close_checked()
+        {
+            self.plan = Some(*plan);
+            self.poisoned = true;
+            failures.push(format!("inspection plan close: {error:#}"));
+        }
+        if failures.is_empty()
+            && !self.poisoned
+            && let Some(io) = &self.managed
+        {
+            let request = LightroomWorkbenchIo::RootRelease {
+                operation: self.root_operation.clone(),
+                workbench: self.workbench.clone(),
+                generation: self.generation.clone(),
+            };
+            match io.filesystem(request.clone(), &AtomicBool::new(false)) {
+                Ok(reply) => {
+                    if let Err(error) = reply.validate_for(&request) {
+                        failures.push(format!("Workbench root release receipt: {error:#}"));
+                    } else if !matches!(reply, LightroomWorkbenchIoReply::Released { .. }) {
+                        failures.push("Workbench root release reply kind".into());
+                    }
+                }
+                Err(error) => failures.push(format!("Workbench root release: {error:#}")),
+            }
+        }
+        if !failures.is_empty() {
+            anyhow::bail!("Workbench close failed: {}", failures.join("; "));
+        }
+        Ok(())
+    }
     fn plan(&mut self, control: &Control) -> Result<&mut Plan> {
         ensure!(
             self.review.is_none(),
             "ReleaseReview required before opening inspection writer"
         );
         if self.plan.is_none() {
-            let plan = self.pin.open_plan(control.clone())?;
+            let managed_identity = self.root_identity.clone();
+            let mut plan = if let Some(identity) = &managed_identity {
+                match Plan::open_managed(&self.root.to_path()?, identity) {
+                    Ok(plan) => plan,
+                    Err(failure) => {
+                        self.plan = failure.plan.map(|plan| *plan);
+                        self.poisoned = true;
+                        return Err(failure.error)
+                            .context("managed inspection writer admission failed");
+                    }
+                }
+            } else {
+                self.pin
+                    .as_ref()
+                    .context("inspection pin absent")?
+                    .open_plan(control.clone())?
+            };
+            plan.set_execution(Some(control.clone()));
             self.version = plan.data_version()?;
             self.plan = Some(plan);
         }
         let plan = self.plan.as_mut().context("inspection owner unavailable")?;
         plan.set_execution(Some(control.clone()));
-        self.pin.verify_plan(plan)?;
+        if let Some(pin) = &self.pin {
+            pin.verify_plan(plan)?;
+        } else if let Some(identity) = &self.root_identity {
+            plan.verify_managed_identity(identity)?;
+        }
         Ok(plan)
     }
     fn action(
@@ -233,6 +1236,55 @@ impl Owner {
             Action::Capture { request } => {
                 native(&request.source, path_limit)?;
                 native(&request.output, path_limit)?;
+                if let Some(io) = &self.managed {
+                    let request_f = LightroomWorkbenchIo::CaptureStart {
+                        operation: self.current_operation(shared),
+                        workbench: self.workbench.clone(),
+                        generation: self.generation.clone(),
+                        executable: self.config.capture_executable.clone(),
+                        staging: self.config.capture_staging.clone(),
+                        request,
+                    };
+                    let mut reply = io.filesystem(request_f.clone(), &control.cancel)?;
+                    reply.validate_for(&request_f)?;
+                    loop {
+                        match reply {
+                            LightroomWorkbenchIoReply::CaptureRunning { pid, staging, .. } => {
+                                let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
+                                state.status.capture_pid = Some(u32::try_from(pid.0)?);
+                                state.status.capture_staging = Some(staging);
+                            }
+                            LightroomWorkbenchIoReply::CaptureComplete { manifest, .. } => {
+                                let retire = LightroomWorkbenchIo::CaptureRetire {
+                                    operation: self.current_operation(shared),
+                                    workbench: self.workbench.clone(),
+                                    generation: self.generation.clone(),
+                                };
+                                let retired = io.filesystem(retire.clone(), &control.cancel)?;
+                                retired.validate_for(&retire)?;
+                                return encode(&manifest, limit);
+                            }
+                            _ => anyhow::bail!("capture filesystem reply kind"),
+                        }
+                        if let Err(error) = control.check() {
+                            let cancel = LightroomWorkbenchIo::CaptureCancel {
+                                operation: self.current_operation(shared),
+                                workbench: self.workbench.clone(),
+                                generation: self.generation.clone(),
+                            };
+                            let _ = io.filesystem(cancel, &AtomicBool::new(false));
+                            return Err(error);
+                        }
+                        let poll = LightroomWorkbenchIo::CapturePoll {
+                            operation: self.current_operation(shared),
+                            workbench: self.workbench.clone(),
+                            generation: self.generation.clone(),
+                        };
+                        thread::sleep(Duration::from_millis(10));
+                        reply = io.filesystem(poll.clone(), &control.cancel)?;
+                        reply.validate_for(&poll)?;
+                    }
+                }
                 let executable = native(&self.config.capture_executable, path_limit)?;
                 let staging = native(&self.config.capture_staging, path_limit)?;
                 let mut child = CaptureProcess::spawn(&executable, &staging, &request)?;
@@ -263,17 +1315,30 @@ impl Owner {
                 for excluded in &inventory.exclusions {
                     native_units(excluded, path_limit)?;
                 }
-                let digest = self.plan(control)?.register_inventory(&inventory)?;
+                let digest = if let Some(io) = self.managed.clone() {
+                    self.plan(control)?
+                        .register_inventory_managed(&inventory, || io.commit())?
+                } else {
+                    self.plan(control)?.register_inventory(&inventory)?
+                };
                 encode(&serde_json::json!({"inventory_digest":digest}), limit)
             }
             Action::AddCapture { directory } => {
-                let directory = native(&directory, path_limit)?;
-                let revision = self.plan(control)?.add_capture(&directory)?;
+                let revision = if self.managed.is_some() {
+                    self.add_capture_managed(&self.current_operation(shared), directory, control)?
+                } else {
+                    let directory = native(&directory, path_limit)?;
+                    self.plan(control)?.add_capture(&directory)?
+                };
                 encode(&serde_json::json!({"revision":revision}), limit)
             }
             Action::Resume { revision, max_rows } => {
                 let rows = count(max_rows, 100_000)?;
-                let progress = self.plan(control)?.resume(&revision, rows)?;
+                let progress = if self.managed.is_some() {
+                    self.resume_managed(&self.current_operation(shared), &revision, rows, control)?
+                } else {
+                    self.plan(control)?.resume(&revision, rows)?
+                };
                 encode(&progress, limit)
             }
             Action::InspectOriginals {
@@ -283,7 +1348,17 @@ impl Owner {
             } => {
                 let rows = count(rows, 1000)?;
                 let packets = matches!(inspection, OriginalInspection::Packets);
-                let processed = self.plan(control)?.check_paths(&revision, rows, packets)?;
+                let processed = if self.managed.is_some() {
+                    self.inspect_originals_managed(
+                        &self.current_operation(shared),
+                        &revision,
+                        rows,
+                        packets,
+                        control,
+                    )?
+                } else {
+                    self.plan(control)?.check_paths(&revision, rows, packets)?
+                };
                 control.progress(processed as u64);
                 encode(
                     &serde_json::json!({"revision":revision,"processed":U64(processed as u64),"inspection":inspection}),
@@ -295,8 +1370,17 @@ impl Owner {
                 family,
                 reason,
             } => {
-                self.plan(control)?
-                    .assign_family(&revision, &family, &reason)?;
+                if let Some(io) = self.managed.clone() {
+                    self.plan(control)?.assign_family_managed(
+                        &revision,
+                        &family,
+                        &reason,
+                        || io.commit(),
+                    )?;
+                } else {
+                    self.plan(control)?
+                        .assign_family(&revision, &family, &reason)?;
+                }
                 encode(
                     &serde_json::json!({"revision":revision,"family":family}),
                     limit,
@@ -308,8 +1392,11 @@ impl Owner {
                 expected_evidence,
                 reason,
             } => {
+                let managed = self.managed.clone();
                 let plan = self.plan(control)?;
-                plan.desktop_choose(&family, &revision, &expected_evidence, &reason)?;
+                plan.desktop_choose(&family, &revision, &expected_evidence, &reason, || {
+                    managed.as_ref().map_or(Ok(()), |io| io.commit())
+                })?;
                 encode(
                     &serde_json::json!({"family":family,"revision":revision,"evidence":expected_evidence}),
                     limit,
@@ -322,20 +1409,51 @@ impl Owner {
                 );
                 let requested = native(&request.inspection, path_limit)?;
                 ensure!(
-                    requested == self.pin.root().join("inspection.sqlite3"),
+                    requested == self.root.to_path()?.join("inspection.sqlite3"),
                     "selection inspection differs from pinned workbench"
                 );
-                drop(self.plan.take());
+                self.plan(control)?
+                    .preflight_selection(&request, limits)
+                    .context("selection semantic preflight before writer close")?;
+                if let Some(plan) = self.plan.take()
+                    && let Err((plan, error)) = plan.close_checked()
+                {
+                    self.plan = Some(*plan);
+                    self.poisoned = true;
+                    return Err(error).context("inspection plan close before review");
+                }
+                self.verify_root(control)?;
                 let progress = control.processed.clone();
-                let review = selection::SelectionReview::open(
-                    request,
-                    limits,
-                    control.cancel.clone(),
-                    move |p| {
-                        progress.store(p.completed, Ordering::Release);
-                    },
-                )?;
-                self.pin.verify_review(&review)?;
+                let managed_identity = self.root_identity.clone();
+                let review = if let Some(identity) = &managed_identity {
+                    match selection::SelectionReview::open_managed(
+                        request,
+                        limits,
+                        control.cancel.clone(),
+                        identity,
+                        move |p| progress.store(p.completed, Ordering::Release),
+                    ) {
+                        Ok(review) => review,
+                        Err(failure) => {
+                            self.plan = failure.plan.map(|plan| *plan);
+                            self.poisoned = true;
+                            return Err(failure.error)
+                                .context("managed selection reader admission failed");
+                        }
+                    }
+                } else {
+                    let review = selection::SelectionReview::open(
+                        request,
+                        limits,
+                        control.cancel.clone(),
+                        move |p| progress.store(p.completed, Ordering::Release),
+                    )?;
+                    self.pin
+                        .as_ref()
+                        .context("inspection pin absent")?
+                        .verify_review(&review)?;
+                    review
+                };
                 let encoded = encode(review.summary(), limit)?;
                 self.review = Some(review);
                 Ok(encoded)
@@ -363,41 +1481,86 @@ impl Owner {
                     response_bound <= limit,
                     "seal response requires a larger result_bytes budget before publication"
                 );
+                let result = if self.managed.is_some() {
+                    let operation = self.current_operation(shared);
+                    self.seal_managed(
+                        &operation,
+                        &review_token,
+                        &approval_blake3,
+                        &approval_json,
+                        output,
+                        control,
+                    )?
+                } else {
+                    let review = self
+                        .review
+                        .as_mut()
+                        .context("prepare an explicit selection review first")?;
+                    let progress = control.processed.clone();
+                    review.seal(
+                        &review_token,
+                        &approval_blake3,
+                        approval_json.as_bytes(),
+                        output,
+                        control.cancel.clone(),
+                        move |p| {
+                            progress.store(p.completed, Ordering::Release);
+                        },
+                    )?
+                };
+                // The immutable approval bytes remain exact strings; serialize
+                // the typed response directly so full-width seal timestamps do
+                // not pass through serde_json::Value's narrower number graph.
+                let approval_json = String::from_utf8(result.approval_bytes)?;
+                encode(
+                    &SealResponse {
+                        seal: &result.seal,
+                        approval_json: &approval_json,
+                        approval: &result.approval,
+                        directory: &result.directory,
+                        seal_path: &result.seal_path,
+                        approval_path: &result.approval_path,
+                    },
+                    limit,
+                )
+            }
+            Action::ApprovalDocuments { draft_json } => {
                 let review = self
                     .review
-                    .as_mut()
+                    .as_ref()
                     .context("prepare an explicit selection review first")?;
-                let progress = control.processed.clone();
-                let result = review.seal(
-                    &review_token,
-                    &approval_blake3,
-                    approval_json.as_bytes(),
-                    output,
-                    control.cancel.clone(),
-                    move |p| {
-                        progress.store(p.completed, Ordering::Release);
-                    },
-                )?;
-                // The immutable approval bytes remain exact strings; no integer
-                // or NativePath reserialization changes approval authority.
                 encode(
-                    &serde_json::json!({"seal":result.seal,"approval_json":String::from_utf8(result.approval_bytes)?,"approval":result.approval,"directory":result.directory,"seal_path":result.seal_path,"approval_path":result.approval_path}),
+                    &review.approval_documents(draft_json.as_bytes(), control.cancel.clone())?,
                     limit,
                 )
             }
             Action::ReleaseReview => {
-                drop(self.review.take());
+                if let Some(review) = self.review.take()
+                    && let Err((review, error)) = review.close_checked()
+                {
+                    self.review = Some(*review);
+                    self.poisoned = true;
+                    return Err(error).context("selection review close");
+                }
+                self.verify_root(control)?;
                 self.plan(control)?;
                 encode(&serde_json::json!({"review_released":true}), limit)
             }
         }
     }
-    fn query(&mut self, query: Query, control: &Control) -> Result<String> {
+    fn query(&mut self, query: Query, control: &Control, operation: &str) -> Result<String> {
         let maximum = self.config.limits.result_bytes;
         match query {
             Query::CaptureManifest { directory } => {
-                let directory = native(&directory, self.config.limits.native_path_units)?;
-                encode(&core::capture::read_manifest(&directory)?, maximum)
+                if self.managed.is_some() {
+                    let (capture_generation, _, manifest, _, _, _) =
+                        self.begin_evidence(operation, directory, control)?;
+                    self.release_evidence(operation, &capture_generation)?;
+                    encode(&manifest, maximum)
+                } else {
+                    let directory = native(&directory, self.config.limits.native_path_units)?;
+                    encode(&core::capture::read_manifest(&directory)?, maximum)
+                }
             }
             Query::SelectionSummary => encode(
                 self.review
@@ -604,4 +1767,54 @@ fn sequence_page(rows: Vec<serde_json::Value>, maximum: usize) -> Result<String>
         &serde_json::json!({"next":next,"exhausted":rows.is_empty(),"rows":rows}),
         maximum,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seal_response_preserves_full_width_timestamp_without_a_value_graph() -> Result<()> {
+        let seal: core::migration_source::InputSeal = serde_json::from_str(&format!(
+            r#"[1,{{"encoding":"UnixBytes","units":[47,115,101,97,108]}},["object",1,{},"changed"],"",["document","selected_migration_test","roster"],[],[]]"#,
+            u128::MAX
+        ))?;
+        assert!(serde_json::to_value(&seal).is_err());
+        let destination = NativePath::from_path(std::path::Path::new("/destination"));
+        let approval = selection::ApprovalDocument {
+            protocol: 1,
+            review_token: "review".into(),
+            scope: selection::ApprovalScope::SelectedMigrationTest,
+            destination: destination.clone(),
+            policy: crate::catalog_migration::importer::Policy {
+                import_source: "fixture".into(),
+                overlap: crate::catalog_migration::importer::OverlapPolicy::RequireDecision,
+                keyword_overlap:
+                    crate::catalog_migration::importer::KeywordOverlap::RequireDecision,
+                artifacts: vec![],
+                supplements: vec![],
+            },
+            supplements: vec![],
+            authorization: "fixture".into(),
+        };
+        let encoded = encode(
+            &SealResponse {
+                seal: &seal,
+                approval_json: "{}",
+                approval: &approval,
+                directory: &destination,
+                seal_path: &destination,
+                approval_path: &destination,
+            },
+            core::MANIFEST_BYTES,
+        )?;
+        #[derive(serde::Deserialize)]
+        struct Decoded {
+            seal: core::migration_source::InputSeal,
+        }
+        let decoded: Decoded = serde_json::from_str(&encoded)?;
+        assert_eq!(decoded.seal.identity.modified_ns, Some(u128::MAX));
+        assert!(encoded.contains(&u128::MAX.to_string()));
+        Ok(())
+    }
 }

@@ -13,10 +13,11 @@ import edit_request
 from edit_verify import digest,read_json,owned
 
 
-def validate_record_paths(record,root,case):
+def validate_record_paths(record,root,service_root,case):
     case_id=case['id']
     output=Path(root)/(case_id+'-output')
     expected=dict(probe_output=str(output),request_path=str(output/'request.json'),
+        service_root=str(Path(service_root)/(case_id+'-service')),
         verification_path=str(Path(root)/('verify-'+case_id+'-verification.json')),
         probe_supervisor_path=str(Path(root)/case_id/'result.json'),
         verify_supervisor_path=str(Path(root)/('verify-'+case_id)/'result.json'),
@@ -28,9 +29,11 @@ def validate_record_paths(record,root,case):
 def validate_funding(binding,funding):
     if not edit_aggregate.same(binding.get('funding'),funding):
         raise ValueError('funded peak differs from complete registry')
-    for name in ('retained_bound_bytes','active_bound_bytes','copies_bound_bytes','free_reserve_bytes','minimum_free_bytes'):
+    for name in ('retained_bound_bytes','active_bound_bytes','copies_bound_bytes'):
         if type(binding.get(name)) is not int or binding[name]!=funding[name]:
             raise ValueError('top-level funding differs')
+    if not edit_aggregate.same(binding.get('volumes'),funding['volumes']):
+        raise ValueError('top-level volume funding differs')
     for owner in ('outer_owner','preparation_owner'):
         if not edit_aggregate.same(binding.get(owner),funding[owner]):
             raise ValueError(owner+' evidence admission differs')
@@ -64,6 +67,28 @@ def validate_execution(binding):
     by_id={source['id']:source for source in sources}
     originals={source['id']:source for source in manifest['inputs']}
     preparation=Path(binding['preparation_root']).resolve(strict=True)
+    storage=binding.get('storage_roots')
+    if not isinstance(storage,dict) or set(storage)!= {'artifact','service'}:
+        raise ValueError('exact split storage roots required')
+    roots={}
+    for name,value in storage.items():
+        if (not isinstance(value,dict) or set(value)!= {'path','parent','parent_device','parent_inode'}
+            or type(value.get('parent_device')) is not int or type(value.get('parent_inode')) is not int):
+            raise ValueError(name+' storage descriptor differs')
+        path=Path(value.get('path',''))
+        parent=Path(value.get('parent','')).resolve(strict=True)
+        identity=os.stat(parent)
+        if (not path.is_absolute() or path.exists() or path.is_symlink()
+            or path.parent!=parent or value.get('parent_device')!=identity.st_dev
+            or value.get('parent_inode')!=identity.st_ino):
+            raise ValueError(name+' storage root identity changed')
+        roots[name]=path
+    if (roots['artifact']==roots['service'] or roots['artifact'] in roots['service'].parents
+        or roots['service'] in roots['artifact'].parents
+        or storage['artifact']['parent_device']==storage['service']['parent_device']):
+        raise ValueError('service and artifact roots must use distinct physical filesystems')
+    if preparation.parent!=roots['artifact'].parent or os.stat(preparation).st_dev!=storage['artifact']['parent_device']:
+        raise ValueError('preparation must be an external artifact-root sibling')
     for source in sources:
         path=owned(preparation,source['path'])
         limit=2*1024**3 if source['id'] in edit_fixtures.FIXTURES else normal['decode']['max_encoded_bytes']
@@ -95,10 +120,11 @@ def validate_execution(binding):
     records=binding['case_records']
     if len(records)!=len(cases) or len(binding['actions'])!=2*len(cases):
         raise ValueError('complete paired action/record coverage required')
-    root=Path(records[0]['probe_output']).parent
+    root=roots['artifact']
+    service_root=roots['service']
     for index,(case,record) in enumerate(zip(cases,records,strict=True)):
-        validate_record_paths(record,root,case)
-        expected_request=edit_request.expand_request(case,by_id[case['fixture_id']],normal,root,
+        validate_record_paths(record,root,service_root,case)
+        expected_request=edit_request.expand_request(case,by_id[case['fixture_id']],normal,root,service_root,
             binding['worker']['path'],background['directory'])
         if record['id']!=case['id'] or not edit_aggregate.same(record['request'],expected_request):
             raise ValueError('resolved request differs from frozen source/case/defaults')

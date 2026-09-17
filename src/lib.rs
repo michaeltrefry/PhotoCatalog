@@ -1,6 +1,6 @@
 //! UI-independent SQLite catalog core. JPEG thumbnails remain provisional.
 /// Current on-disk catalog schema; probes must preflight before timed opens.
-pub const CURRENT_SCHEMA_VERSION: i64 = 12;
+pub const CURRENT_SCHEMA_VERSION: i64 = 13;
 
 #[cfg(all(test, feature = "internal-capacity-probes"))]
 mod capacity_probes;
@@ -13,6 +13,7 @@ pub mod catalog_exports;
 pub mod catalog_image_exports;
 pub mod catalog_images;
 pub mod catalog_metadata;
+pub mod catalog_metadata_write;
 pub mod catalog_migration;
 mod catalog_row;
 pub mod catalog_session;
@@ -328,6 +329,10 @@ pub(crate) fn initialize_catalog_connection(
             tx.execute_batch(catalog_storage::REVIEW_SCHEMA)?;
             tx.pragma_update(None, "user_version", 12)?;
         }
+        if version < 13 {
+            tx.execute_batch(catalog_metadata_write::SCHEMA)?;
+            tx.pragma_update(None, "user_version", 13)?;
+        }
         tx.commit()?;
         db.pragma_update(None, "foreign_keys", true)?;
     }
@@ -335,6 +340,9 @@ pub(crate) fn initialize_catalog_connection(
 }
 
 impl Catalog {
+    pub(crate) fn managed_physical_identity(&self) -> Option<catalog_session::PhysicalObjectId> {
+        self.session.managed_physical_identity()
+    }
     pub(crate) fn require_jobs_released(&self) -> Result<()> {
         self.session.require_jobs_released(&self.root)
     }

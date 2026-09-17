@@ -69,6 +69,71 @@ pub(crate) fn reject_links(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+/// Upper bound for all retained path-preparation grants owned by one managed
+/// closed-roster Source. Windows may retain every original-prefix spelling and
+/// its prepared verbatim spelling; Unix uses a strict subset of this bound.
+/// Two complete prefix rosters cover Raw's directory plus member or Sql's
+/// database plus URI, while companion and conversion work is linear. This is a
+/// storage allowance only and does not reduce the existing native-path limit.
+pub(crate) fn managed_opening_reservation_maximum() -> Result<usize> {
+    use crate::lightroom_migration_worker::memory::layout::{add, mul};
+    let units = crate::catalog_session::PATH_UNITS;
+    #[cfg(unix)]
+    {
+        // Raw: two native conversions, root traversal scratch, joined path,
+        // retained Source spelling and CString scratch.
+        let raw = add(
+            mul(2, units)?,
+            add(
+                add(mul(4, units)?, 9)?,
+                add(
+                    add(mul(2, units)?, 1)?,
+                    add(mul(5, add(mul(2, units)?, 1)?)?, 9)?,
+                )?,
+            )?,
+        )?;
+        // Sql: normalized bytes plus the worst-case percent-escaped URI and
+        // the simultaneously live rusqlite CString.
+        let escaped = add(
+            add("file:".len(), mul(3, units)?)?,
+            "?mode=ro&immutable=1".len(),
+        )?;
+        let sql = add(units, add(mul(2, escaped)?, 1)?)?;
+        Ok(raw.max(sql))
+    }
+    #[cfg(windows)]
+    {
+        let expanded = add(units, 8)?; // longest verbatim/UNC prefix delta
+        let normalized_buffer = mul(2, expanded.max(512))?;
+        let wide = add(
+            mul(2, add(units, 1)?)?,
+            add(normalized_buffer, mul(2, expanded)?)?,
+        )?;
+        let wtf8_payload = mul(3, expanded)?;
+        let file_path = add(
+            wide,
+            add(
+                add(wtf8_payload, mul(2, wtf8_payload)?.max(8))?,
+                mul(2, add(mul(3, expanded)?, 1)?)?,
+            )?,
+        )?;
+        let prefixes = add(units, 1)?;
+        let prefix_roster = add(
+            mul(units, std::mem::size_of::<PathBuf>())?,
+            add(mul(2, units)?, units)?,
+        )?;
+        let prepared = add(prefix_roster, mul(prefixes, file_path)?)?;
+        let companions = add(
+            mul(3, std::mem::size_of::<PathBuf>())?,
+            mul(3, add(add(units, 8)?, file_path)?)?,
+        )?;
+        // Raw prepares a directory and joined member. Sql prepares one Source,
+        // three companions and a SQLite URI. Two full prefix rosters plus the
+        // companion/URI linear work dominate both routes.
+        add(mul(2, prepared)?, add(companions, file_path)?)
+    }
+}
 #[cfg(windows)]
 struct PreparedPaths {
     checks: Vec<PathBuf>,

@@ -44,6 +44,10 @@ pub struct Plan {
     pub expected: Option<FileRevision>,
     pub payload_digest: String,
     pub payload_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_existing_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias_limits: Option<crate::catalog_export_alias::AliasLimits>,
 }
 impl From<ExportPlan> for Plan {
     fn from(p: ExportPlan) -> Self {
@@ -54,6 +58,8 @@ impl From<ExportPlan> for Plan {
             expected: p.expected,
             payload_digest: p.payload_digest,
             payload_bytes: p.payload_bytes,
+            max_existing_bytes: p.max_existing_bytes,
+            alias_limits: p.alias_limits,
         }
     }
 }
@@ -71,6 +77,8 @@ impl TryFrom<Plan> for ExportPlan {
             expected: p.expected,
             payload_digest: p.payload_digest,
             payload_bytes: p.payload_bytes,
+            max_existing_bytes: p.max_existing_bytes,
+            alias_limits: p.alias_limits,
         })
     }
 }

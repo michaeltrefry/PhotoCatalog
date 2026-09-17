@@ -44,6 +44,9 @@ p { line-height: 1.6; }
 .app-header nav { display: flex; gap: 4px; }
 .app-header nav button { text-transform: uppercase; letter-spacing: .065em; font-size: 12px; background: transparent; border-color: transparent; padding: 8px 13px; }
 .app-header nav button[aria-current] { color: var(--accent); background: #272421; }
+.measurement-banner { display: flex; flex: none; align-items: center; gap: 12px; min-height: 36px; padding: 5px 12px; color: #e8c79a; background: #27251f; border-bottom: 1px solid #4b4132; font-size: 12px; }
+.measurement-banner > span:first-child { font-weight: 600; }
+.measurement-banner > span:not(:first-child) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .welcome { max-width: 630px; margin: auto; padding: 32px; }
 .welcome-mark { color: var(--accent); font-size: 38px; margin-bottom: 24px; }
 .welcome h1 { font-size: clamp(32px, 4vw, 48px); line-height: 1.13; font-weight: 500; letter-spacing: -.03em; margin-bottom: 24px; }
@@ -135,12 +138,19 @@ kbd { color: var(--muted); font: inherit; margin-left: 8px; }
 .error-notice span { flex: 1; }
 .error-notice button { flex: none; }
 .activity { display: flex; flex: none; align-items: center; gap: 15px; padding: 8px 14px; background: #27251f; color: #e8c79a; font-size: 12px; }
-dialog { width: min(620px, calc(100vw - 60px)); max-height: calc(100vh - 70px); padding: 0; border: 1px solid #4b515a; border-radius: 7px; color: var(--text); background: var(--panel); box-shadow: 0 24px 80px #0008; }
+dialog { width: min(620px, calc(100vw - 32px)); max-width: calc(100vw - 32px); max-height: calc(100dvh - 32px); padding: 0; overflow: hidden; border: 1px solid #4b515a; border-radius: 7px; color: var(--text); background: var(--panel); box-shadow: 0 24px 80px #0008; }
+dialog[open] { display: flex; flex-direction: column; }
 dialog::backdrop { background: #0009; }
-.dialog-title { display: flex; align-items: center; gap: 20px; padding: 15px 20px; background: var(--toolbar); border-bottom: 1px solid var(--border); }
-.dialog-title h2 { flex: 1; margin: 0; font-size: 17px; }
-.dialog-title button { background: transparent; border: 0; font-size: 21px; padding: 0 5px; }
-.dialog-body { padding: 20px; overflow: auto; }
+.dialog-title { display: flex; flex: none; align-items: center; gap: 16px; padding: 16px 20px; background: var(--toolbar); border-bottom: 1px solid var(--border); }
+.dialog-title h2 { flex: 1; min-width: 0; overflow-wrap: anywhere; margin: 0; font-size: 17px; }
+.dialog-title button { flex: none; background: transparent; border: 0; font-size: 21px; padding: 0 5px; }
+.dialog-body { flex: 1 1 auto; min-height: 0; min-width: 0; padding: 20px; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; overflow-wrap: anywhere; }
+.dialog-body :where(fieldset, section, article, details, label) { min-width: 0; }
+.dialog-body :where(input, select, textarea, button) { max-width: 100%; }
+.dialog-body :where(pre, textarea) { max-width: 100%; max-height: min(320px, 40dvh); overflow: auto; }
+.dialog-body pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.dialog-body .button-group { flex-wrap: wrap; }
+.dialog-body input[type=checkbox] { flex: none; }
 .dialog-body li { margin-bottom: 10px; }
 @media (max-width: 1120px) { .left-panel { width: 200px; } .right-panel { width: 278px; } .catalog-name { display: none; } .app-header nav { margin-left: auto; } .search-form input { width: 170px; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; animation: none !important; transition: none !important; } }
@@ -150,3 +160,8 @@ dialog::backdrop { background: #0009; }
 .import-counts dd { margin: 0; font-variant-numeric: tabular-nums; }
 
 .filter-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 16px; }
+@media (max-width: 600px) {
+  .dialog-title { padding: 12px 16px; }
+  .dialog-body { padding: 16px; }
+  .filter-fields { grid-template-columns: minmax(0, 1fr); }
+}

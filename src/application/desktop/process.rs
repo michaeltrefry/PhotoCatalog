@@ -192,6 +192,8 @@ impl Owner {
                         .spawn(move || {
                             if let Err(e) = parent_control(control, &state) {
                                 state.fail(format!("desktop control: {e}"));
+                                state.state.lock().unwrap().control_reader_failed = true;
+                                state.wake.notify_all();
                             }
                         })?,
                 );
@@ -351,8 +353,14 @@ impl Owner {
     pub fn drain(&mut self) -> Result<()> {
         if self.supervisor.as_ref().is_some_and(|s| !s.is_finished()) {
             let mut state = self.shared.state.lock().unwrap();
-            while !state.reaped && state.drain_error.is_none() {
+            while !state.reaped && state.drain_error.is_none() && !state.control_reader_failed {
                 state = self.shared.wake.wait(state).unwrap();
+            }
+            if !state.reaped && state.control_reader_failed {
+                return Err(error(
+                    ErrorCode::Native,
+                    "desktop control reader failed; catalog process and pipe custody retained",
+                ));
             }
             if let Some(message) = &state.drain_error {
                 return Err(error(ErrorCode::Native, message));
@@ -670,6 +678,7 @@ fn parent_control(mut r: impl Read, shared: &Shared) -> std::io::Result<()> {
                 | Kind::DrainError
                 | Kind::Drained
                 | Kind::MigrationReply
+                | Kind::BackupAdmissionReply
         ) {
             return Err(wire::invalid("unexpected control frame"));
         }
@@ -736,6 +745,16 @@ fn parent_control(mut r: impl Read, shared: &Shared) -> std::io::Result<()> {
         } else {
             None
         };
+        let decoded_backup = if kind == Kind::BackupAdmissionReply {
+            let reply = serde_json::from_slice::<super::backup::AdmissionReply>(&bytes)
+                .map_err(|_| wire::invalid("invalid backup admission reply"))?;
+            reply
+                .validate()
+                .map_err(|_| wire::invalid("backup admission reply field bounds"))?;
+            Some(reply)
+        } else {
+            None
+        };
         let decoded_error = if kind == Kind::BytesError {
             Some(
                 serde_json::from_slice::<BridgeError>(&bytes)
@@ -760,6 +779,15 @@ fn parent_control(mut r: impl Read, shared: &Shared) -> std::io::Result<()> {
                 "migration success reply exceeds configured allowance",
             ));
         }
+        if bytes.len() > shared.limits.reply_bytes
+            && decoded_backup
+                .as_ref()
+                .is_some_and(|reply| matches!(reply, super::backup::AdmissionReply::Ok(_)))
+        {
+            return Err(wire::invalid(
+                "backup admission success reply exceeds configured allowance",
+            ));
+        }
         let entry = {
             let mut state = shared.state.lock().unwrap();
             let pending = state
@@ -771,12 +799,16 @@ fn parent_control(mut r: impl Read, shared: &Shared) -> std::io::Result<()> {
                 (Kind::Reply, Delivery::Command(_))
                     | (Kind::BytesError, Delivery::Bytes { .. })
                     | (Kind::MigrationReply, Delivery::Migration(_))
+                    | (Kind::BackupAdmissionReply, Delivery::BackupAdmission(_))
             ) {
                 return Err(wire::invalid("reply kind does not match request"));
             }
             state.pending.remove(&id).unwrap()
         };
         match (kind, entry.delivery) {
+            (Kind::BackupAdmissionReply, Delivery::BackupAdmission(tx)) => {
+                let _ = tx.send(decoded_backup.unwrap());
+            }
             (Kind::MigrationReply, Delivery::Migration(tx)) => {
                 let _ = tx.send(decoded_migration.unwrap());
             }
@@ -931,6 +963,7 @@ fn parent_binary(mut r: impl Read, shared: &Shared) -> std::io::Result<()> {
 }
 
 enum ChildPending {
+    BackupAdmission(super::backup::Pending),
     Migration(super::lightroom_migration::Pending),
     Command(Pending),
     Bytes(PendingBytes, BytesRequest),
@@ -996,15 +1029,16 @@ fn output_writer(
                         store = None;
                     }
                 }
-                if let Some(out) = proxy.next(filesystem::Lane::Control) {
-                    RelayOutput { out, offset: 0 }
-                        .frame(session)
-                        .write(&mut w)?;
-                }
-                if relay.is_none() {
-                    relay = proxy
-                        .next(filesystem::Lane::Data)
-                        .map(|out| RelayOutput { out, offset: 0 });
+                if let Some(out) = proxy.next_relay(relay.is_none()) {
+                    match out.lane {
+                        filesystem::Lane::Control => RelayOutput { out, offset: 0 }
+                            .frame(session)
+                            .write(&mut w)?,
+                        filesystem::Lane::Data => relay = Some(RelayOutput { out, offset: 0 }),
+                        filesystem::Lane::Admission | filesystem::Lane::Store => {
+                            unreachable!("relay selector returned a reserved lane")
+                        }
+                    }
                 }
                 if let Some(m) = &mut relay {
                     m.frame(session).write(&mut w)?;
@@ -1094,13 +1128,14 @@ fn checked_message(kind: Kind, id: u64, value: &impl serde::Serialize, limit: us
         Kind::MigrationReply,
         "migration replies use their bounded identity-preserving encoder"
     );
-    let bytes = serde_json::to_vec(value).unwrap_or_default();
-    if bytes.len() <= limit {
+    if let Ok(bytes) = crate::lightroom::bounded_json(value, limit) {
         Message::new(kind, id, bytes)
     } else {
         let e = error(ErrorCode::ResourceLimit, "desktop reply byte limit");
         let bytes = if kind == Kind::Reply {
             serde_json::to_vec(&Reply::Error { error: e }).unwrap()
+        } else if kind == Kind::BackupAdmissionReply {
+            serde_json::to_vec(&super::backup::AdmissionReply::error(e)).unwrap()
         } else {
             serde_json::to_vec(&e).unwrap()
         };
@@ -1119,6 +1154,27 @@ fn collect(
     for id in ids {
         let p = state.pending.remove(&id).unwrap();
         let ready = match p {
+            ChildPending::BackupAdmission(p) => match p.receiver.try_recv() {
+                Ok(reply) => ChildPending::Reply(checked_message(
+                    Kind::BackupAdmissionReply,
+                    id,
+                    &reply,
+                    limit,
+                )),
+                Err(mpsc::TryRecvError::Empty) => {
+                    state.pending.insert(id, ChildPending::BackupAdmission(p));
+                    continue;
+                }
+                Err(_) => ChildPending::Reply(checked_message(
+                    Kind::BackupAdmissionReply,
+                    id,
+                    &super::backup::AdmissionReply::error(error(
+                        ErrorCode::Closed,
+                        "backup admission actor disconnected",
+                    )),
+                    limit,
+                )),
+            },
             ChildPending::Migration(p) => match p.receiver.try_recv() {
                 Ok(reply) => ChildPending::Reply(reply.message(id, limit)),
                 Err(mpsc::TryRecvError::Empty) => {
@@ -1420,8 +1476,8 @@ pub(super) fn worker_main() -> anyhow::Result<()> {
             session,
             &mut |kind, bytes| {
                 if proxy.is_some()
-                    && kind != Kind::MigrationAdmission
-                    && !paired_preview_route(kind, bytes)?
+                    && !matches!(kind, Kind::MigrationAdmission | Kind::BackupAdmission)
+                    && !paired_catalog_route(kind, bytes)?
                 {
                     return Ok(Err(error(
                         ErrorCode::InvalidRequest,
@@ -1468,27 +1524,66 @@ pub(super) fn worker_main() -> anyhow::Result<()> {
 }
 // Explicit paired admission covers the qualified preview surface. The default
 // desktop constructor stays legacy until the remaining custody routes qualify.
-fn paired_preview_route(kind: Kind, bytes: &[u8]) -> anyhow::Result<bool> {
+fn paired_catalog_route(kind: Kind, bytes: &[u8]) -> anyhow::Result<bool> {
     if kind == Kind::Bytes {
         return Ok(true);
     }
     if kind != Kind::Command {
         return Ok(false);
     }
-    Ok(matches!(
-        serde_json::from_slice::<Request>(bytes)?,
+    // Catalog commands execute in C. Independent G owners have no public
+    // fallback into C; a new request variant requires an explicit owner.
+    Ok(match serde_json::from_slice::<Request>(bytes)? {
+        Request::Lightroom { .. }
+        | Request::LightroomMigration { .. }
+        | Request::BackupCreate { .. }
+        | Request::BackupInspect { .. }
+        | Request::BackupRestore { .. }
+        | Request::BackupStatus
+        | Request::BackupCancel { .. } => false,
         Request::OpenExisting { .. }
-            | Request::Create { .. }
-            | Request::Status
-            | Request::Close { .. }
-            | Request::Preview { .. }
-            | Request::PreviewStatus { .. }
-            | Request::CancelPreview { .. }
-            | Request::ReleaseViewport { .. }
-            | Request::Export { .. }
-    ))
+        | Request::Create { .. }
+        | Request::Status
+        | Request::Close { .. }
+        | Request::ImportStart { .. }
+        | Request::ImportResume { .. }
+        | Request::ImportStatus { .. }
+        | Request::ImportCancel { .. }
+        | Request::RestoreStatus { .. }
+        | Request::ResumeRestoredJobs { .. }
+        | Request::Folders { .. }
+        | Request::Images { .. }
+        | Request::Search { .. }
+        | Request::Image { .. }
+        | Request::Variant { .. }
+        | Request::Variants { .. }
+        | Request::CreateVariant { .. }
+        | Request::SaveRecipe { .. }
+        | Request::Undo { .. }
+        | Request::Redo { .. }
+        | Request::History { .. }
+        | Request::Cull { .. }
+        | Request::Preview { .. }
+        | Request::PreviewStatus { .. }
+        | Request::CancelPreview { .. }
+        | Request::ReleaseViewport { .. }
+        | Request::PreviewSettings { .. }
+        | Request::Metadata { .. }
+        | Request::MetadataWrite { .. }
+        | Request::Organization { .. }
+        | Request::EditCopy { .. }
+        | Request::Relink { .. }
+        | Request::Export { .. } => true,
+    })
 }
 fn dispatch(bridge: &Bridge, kind: Kind, bytes: &[u8]) -> anyhow::Result<Result<ChildPending>> {
+    if kind == Kind::BackupAdmission {
+        let request: super::backup::AdmissionRequest = serde_json::from_slice(bytes)?;
+        request.validate()?;
+        return Ok(bridge
+            .backup_admission(request)
+            .map(ChildPending::BackupAdmission));
+    }
     if kind == Kind::MigrationAdmission {
         return Ok(bridge
             .migration_admission(serde_json::from_slice(bytes)?)
@@ -1605,7 +1700,7 @@ fn child_input_relay(
         anyhow::ensure!(
             matches!(
                 f.kind,
-                Kind::Command | Kind::Bytes | Kind::MigrationAdmission
+                Kind::Command | Kind::Bytes | Kind::MigrationAdmission | Kind::BackupAdmission
             ),
             "unexpected request kind"
         );
@@ -1694,6 +1789,7 @@ fn child_input_relay(
         match admitted {
             Ok(p) => {
                 let c = match &p {
+                    ChildPending::BackupAdmission(p) => p.cancel.clone(),
                     ChildPending::Migration(p) => p.cancel.clone(),
                     ChildPending::Command(p) => p.cancellation(),
                     ChildPending::Bytes(p, _) => p.cancellation(),
@@ -1708,6 +1804,13 @@ fn child_input_relay(
                     // Dispatch either never entered the actor or failed to
                     // enqueue. No action has executed on this refusal path.
                     super::lightroom_migration::Reply::Refused(e).message(id, limits.reply_bytes)
+                } else if kind == Kind::BackupAdmission {
+                    checked_message(
+                        Kind::BackupAdmissionReply,
+                        id,
+                        &super::backup::AdmissionReply::error(e),
+                        limits.reply_bytes,
+                    )
                 } else if kind == Kind::Command {
                     checked_message(
                         Kind::Reply,
@@ -1757,7 +1860,7 @@ fn child_input(
 mod tests {
     use super::*;
     #[test]
-    fn paired_preview_route_admits_preview_and_export_lifecycle() {
+    fn paired_catalog_route_admits_preview_import_and_export_lifecycle() {
         let path = crate::storage_volume::NativePath::from_path(std::path::Path::new("/fixture"));
         let catalog = "catalog".to_owned();
         for request in [
@@ -1767,6 +1870,25 @@ mod tests {
             Request::Close {
                 catalog: catalog.clone(),
             },
+            Request::ImportStart {
+                catalog: catalog.clone(),
+                source: crate::storage_volume::NativePath::from_path(std::path::Path::new(
+                    "/fixture/source",
+                )),
+            },
+            Request::ImportResume {
+                catalog: catalog.clone(),
+                source: crate::storage_volume::NativePath::from_path(std::path::Path::new(
+                    "/fixture/source",
+                )),
+            },
+            Request::ImportStatus {
+                catalog: catalog.clone(),
+            },
+            Request::ImportCancel {
+                catalog: catalog.clone(),
+                import: "import".into(),
+            },
             Request::Preview {
                 catalog: catalog.clone(),
                 key: crate::catalog_edits::VariantKey::master("asset"),
@@ -1775,6 +1897,7 @@ mod tests {
                 viewport: "view".into(),
                 generation: crate::application::U64(1),
                 foreground: true,
+                diagnostics: false,
             },
             Request::PreviewStatus {
                 catalog: catalog.clone(),
@@ -1795,19 +1918,12 @@ mod tests {
             },
         ] {
             assert!(
-                paired_preview_route(Kind::Command, &serde_json::to_vec(&request).unwrap())
+                paired_catalog_route(Kind::Command, &serde_json::to_vec(&request).unwrap())
                     .unwrap()
             );
         }
-        let request = Request::ImportCancel {
-            catalog: catalog.clone(),
-            import: "import".into(),
-        };
-        assert!(
-            !paired_preview_route(Kind::Command, &serde_json::to_vec(&request).unwrap()).unwrap()
-        );
-        assert!(paired_preview_route(Kind::Bytes, b"{}").unwrap());
-        assert!(!paired_preview_route(Kind::Hello, b"{}").unwrap());
+        assert!(paired_catalog_route(Kind::Bytes, b"{}").unwrap());
+        assert!(!paired_catalog_route(Kind::Hello, b"{}").unwrap());
     }
 
     #[test]
@@ -1964,7 +2080,7 @@ mod tests {
                 request: Box::new(request),
             };
             assert!(
-                paired_preview_route(Kind::Command, &serde_json::to_vec(&outer).unwrap()).unwrap()
+                paired_catalog_route(Kind::Command, &serde_json::to_vec(&outer).unwrap()).unwrap()
             );
         }
     }
@@ -2077,6 +2193,37 @@ mod tests {
         assert_eq!(usage.load(Ordering::Acquire), 0);
         assert!(shared.lock().unwrap().retained.remove(&1).is_none());
     }
+    #[test]
+    fn failed_control_reader_returns_retained_owner_without_waiting_for_reap() {
+        let shared = super::super::tests::shared(1024);
+        shared.fail("injected control reader failure");
+        shared.state.lock().unwrap().control_reader_failed = true;
+        let (release, held) = mpsc::sync_channel(0);
+        let supervisor = thread::spawn(move || {
+            let _ = held.recv();
+            (None, vec![])
+        });
+        let mut owner = Owner {
+            child: None,
+            threads: vec![],
+            supervisor: Some(supervisor),
+            shared: shared.clone(),
+            pid: 0,
+            fixture_child: None,
+        };
+        for _ in 0..2 {
+            shared.stop();
+            let error = owner.drain().unwrap_err();
+            assert!(error.message.contains("custody retained"));
+            assert!(owner.supervisor.is_some());
+            let state = shared.state.lock().unwrap();
+            assert!(!state.reaped && !state.child_finished && !state.local_verified);
+            assert_ne!(state.phase, TransportPhase::Closed);
+        }
+        release.send(()).unwrap();
+        owner.supervisor.take().unwrap().join().unwrap();
+    }
+
     #[test]
     fn failed_os_wait_preserves_owner_until_explicit_success() {
         #[cfg(unix)]

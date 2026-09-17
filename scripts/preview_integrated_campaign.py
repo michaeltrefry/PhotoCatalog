@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fixed 10M retained-page experiment on a raw copied schema-6 fixture only (current protocol 3).
+"""Fixed 10M retained-page experiment on a raw copied current fixture (protocol 4).
 
 Never opens a source database through SQLite. Both commands require a reviewed
 binding and an explicit execution lane; copying and hashing are untimed setup.
@@ -16,30 +16,20 @@ import subprocess
 from preview_experiment import digest, exclusive
 from preview_host import HostObservation, host_identity
 from preview_navigation_campaign import anchor, read_json, expected_trials, validate_trial, distribution
+from schema_campaign_contract import (
+    CURRENT_SCHEMA, INDEX_SQL, alias_initial_state, proof_fields, schema6_initial_rows,
+    validate_migration_receipt,
+)
 
-CURRENT_SCHEMA = 6
-PROTOCOL = 3
-SCHEMA6_TABLES = ["edit_changes", "edit_copy_items", "edit_copy_jobs", "edit_recipe_nodes", "edit_redo_nodes", "edit_variants", "export_alias_directories", "export_alias_dirty", "export_alias_paths", "export_alias_state", "photo_export_blobs", "photo_export_items", "photo_export_jobs"]
-
-
-def schema6_initial_rows(tables):
-    """Derived migration rows; no filesystem projection runs in preparation."""
-    counts = dict(tables)
-    assets, bound = counts.get("assets"), counts.get("storage_bindings")
-    if type(assets) is not int or type(bound) is not int or not 0 <= bound <= assets:
-        raise ValueError("binding cardinality required for schema6 alias initialization")
-    return [[name, 1 if name == "export_alias_state" else bound if name == "export_alias_dirty" else 0]
-            for name in SCHEMA6_TABLES]
+PROTOCOL = 4
+SCHEMA_CONTRACT_SOURCE = Path(__file__).with_name("schema_campaign_contract.py")
 
 
-def schema6_alias_state(tables):
-    schema6_initial_rows(tables)
-    counts = dict(tables)
-    return {"unbound": counts["assets"] - counts["storage_bindings"], "dirty": counts["storage_bindings"]}
+# Public compatibility alias for historical receipt tooling.
+schema6_alias_state = alias_initial_state
 
 
 SUFFIXES = ("", "-wal", "-shm", "-journal")
-INDEX_SQL = "CREATE INDEX organization_lens_capture ON organization_assets(lens,capture,sequence)"
 
 
 def ancestry_evidence(source):
@@ -48,20 +38,20 @@ def ancestry_evidence(source):
     if set(entries) not in ({"proof","native"},{"proof","native","verification"}):
         raise ValueError("original schema4-to-5 ancestry required")
     payloads, parsed = read_ancestry(entries)
-    upgrade_payloads, upgrade = ({}, {})
-    if source.get("schema_version") == CURRENT_SCHEMA:
-        upgrade_entries = source.get("schema6_migration", {})
-        if set(upgrade_entries) != {"proof", "native"}:
-            raise ValueError("separate schema5-to-6 migration proof required")
-        upgrade_payloads, upgrade = read_ancestry(upgrade_entries)
     proof,native=parsed["proof"],parsed["native"]
     if (proof.get("schema_before"),proof.get("schema_after"),native.get("schema_before"),native.get("schema_after"))!=(4,5,4,5):
         raise ValueError("original migration must remain explicitly 4-to-5")
     if proof.get("native_receipt_sha256")!=entries["native"]["sha256"] or native.get("protocol")!=1 or native.get("complete") is not True or native.get("mode")!="migrate_fixture" or native.get("count")!=10000000 or native.get("engine_version")!="3.51.1":
         raise ValueError("native migration identity mismatch")
-    main=upgrade["proof"].get("owned_copy_before_sha256") if upgrade else source["files"][""]["sha256"]
-    if proof.get("owned_copy_after_sha256")!=main or proof.get("owned_copy_before_sha256")==main:
-        raise ValueError("donor is not the pristine migrated main")
+    final_main=source["files"][""]["sha256"]
+    current_entries=source.get("schema13_migration", {})
+    if source.get("schema_version") == CURRENT_SCHEMA:
+        if set(current_entries) != {"proof", "native"}:
+            raise ValueError("separate current-schema migration proof required")
+        current_payloads,current=read_ancestry(current_entries)
+    schema5_main=proof.get("owned_copy_after_sha256")
+    if proof.get("owned_copy_before_sha256")==schema5_main:
+        raise ValueError("schema4-to-5 physical migration identity changed")
     logical=native.get("logical_before")
     if not isinstance(logical,str) or len(logical)!=64 or any(c not in "0123456789abcdef" for c in logical) or any(row.get(field)!=logical for row in (proof,native) for field in ("logical_before","logical_after")):
         raise ValueError("migration logical identity changed")
@@ -74,26 +64,57 @@ def ancestry_evidence(source):
         raise ValueError("migration index or observer failed")
     if "verification" in parsed:
         verified=parsed["verification"]
-        if verified.get("kind")!="schema5_verification" or verified.get("schema_before")!=5 or verified.get("schema_after")!=5 or any(verified.get(f)!=main for f in ("owned_copy_before_sha256","owned_copy_after_sha256")) or any(verified.get(f)!=logical for f in ("logical_before","logical_after")) or any(verified.get(f)!=tables for f in ("table_counts_before","table_counts_after")) or verified.get("index_sql")!=INDEX_SQL:
+        if verified.get("kind")!="schema5_verification" or verified.get("schema_before")!=5 or verified.get("schema_after")!=5 or any(verified.get(f)!=schema5_main for f in ("owned_copy_before_sha256","owned_copy_after_sha256")) or any(verified.get(f)!=logical for f in ("logical_before","logical_after")) or any(verified.get(f)!=tables for f in ("table_counts_before","table_counts_after")) or verified.get("index_sql")!=INDEX_SQL:
             raise ValueError("later verification cannot replace original migration ancestry")
-    if upgrade:
-        newer, current = upgrade["proof"], upgrade["native"]
-        if newer.get("native_receipt_sha256") != source["schema6_migration"]["native"]["sha256"]:
-            raise ValueError("schema6 native receipt binding differs")
-        if newer.get("owned_copy_before_sha256") != main or newer.get("owned_copy_after_sha256") != source["files"][""]["sha256"] or newer.get("owned_copy_after_sha256") == main:
-            raise ValueError("schema6 migration physical lineage differs")
-        if current.get("protocol") != 2 or current.get("catalog_schema") != CURRENT_SCHEMA or current.get("complete") is not True or current.get("mode") != "migrate_fixture" or current.get("count") != 10000000 or current.get("engine_version") != "3.51.1":
-            raise ValueError("schema6 native identity differs")
-        for item in (newer, current):
-            if not isinstance(item.get("alias_initial_state"), dict) or any(type(item["alias_initial_state"].get(key)) is not int for key in ("unbound", "dirty")) or any(type(n) is not int for _,n in item.get("added_tables", [])):
-                raise ValueError("schema6 alias initialization requires integer counts")
-            if item.get("schema_before") != 5 or item.get("schema_after") != CURRENT_SCHEMA or item.get("identity_scope") != "pre_existing_tables" or item.get("added_tables") != schema6_initial_rows(tables) or item.get("alias_initial_state") != schema6_alias_state(tables):
-                raise ValueError("schema6 migration must report edit/export and derived alias initial rows separately")
-            if any(item.get(f) != logical for f in ("logical_before", "logical_after")) or any(item.get(f) != tables for f in ("table_counts_before", "table_counts_after")) or item.get("index_sql") != INDEX_SQL:
-                raise ValueError("schema6 migration changed pre-existing typed rows/index")
-        if set(SCHEMA6_TABLES).intersection(dict(tables)) or newer.get("observer", {}).get("exit_code") != 0 or newer.get("observer", {}).get("error") is not None:
-            raise ValueError("schema6 legacy table set or observer failed")
-        payloads.update({"schema6_"+key:value for key,value in upgrade_payloads.items()})
+    if source.get("schema_version") == CURRENT_SCHEMA:
+        source_schema=5
+        expected_before=tables
+        before_hash=schema5_main
+        schema6_entries=source.get("schema6_migration")
+        if schema6_entries:
+            if set(schema6_entries)!={"proof","native"}:
+                raise ValueError("complete schema5-to-6 migration proof required")
+            schema6_payloads,schema6=read_ancestry(schema6_entries)
+            older,newer=schema6["proof"],schema6["native"]
+            if older.get("native_receipt_sha256")!=schema6_entries["native"]["sha256"]:
+                raise ValueError("schema6 native receipt binding differs")
+            validate_migration_receipt(newer,10000000,5,6)
+            if newer.get("engine_version")!="3.51.1" or older.get("observer",{}).get("exit_code")!=0 or older.get("observer",{}).get("error") is not None:
+                raise ValueError("schema6 migration execution differs")
+            if older.get("kind")!="schema5_to_6_migration":
+                raise ValueError("schema6 migration kind differs")
+            for field in proof_fields(6):
+                if older.get(field)!=newer.get(field):
+                    raise ValueError("schema6 proof/native identity differs")
+            if newer.get("logical_before")!=logical:
+                raise ValueError("schema6 migration predecessor logical identity differs")
+            if older.get("owned_copy_before_sha256")!=before_hash or older.get("owned_copy_after_sha256")==before_hash:
+                raise ValueError("schema6 migration physical lineage differs")
+            before_hash=older["owned_copy_after_sha256"]
+            expected_before=sorted(tables+schema6_initial_rows(tables))
+            source_schema=6
+            payloads.update({"schema6_"+key:value for key,value in schema6_payloads.items()})
+        current_proof,current_native=current["proof"],current["native"]
+        if current_proof.get("native_receipt_sha256")!=current_entries["native"]["sha256"]:
+            raise ValueError("current native receipt binding differs")
+        validate_migration_receipt(current_native,10000000,source_schema,CURRENT_SCHEMA)
+        if current_native.get("engine_version")!="3.51.1" or current_proof.get("observer",{}).get("exit_code")!=0 or current_proof.get("observer",{}).get("error") is not None:
+            raise ValueError("current migration execution differs")
+        if current_proof.get("kind")!=f"schema{source_schema}_to_13_migration":
+            raise ValueError("current migration kind differs")
+        for field in proof_fields(CURRENT_SCHEMA):
+            if current_proof.get(field)!=current_native.get(field):
+                raise ValueError("current proof/native identity differs")
+        if current_native.get("table_counts_before")!=expected_before:
+            raise ValueError("current migration predecessor tables differ")
+        current_logical=current_native.get("logical_before")
+        if (source_schema==5 and current_logical!=logical) or (source_schema==6 and current_logical==logical):
+            raise ValueError("current migration predecessor logical identity differs")
+        if current_proof.get("owned_copy_before_sha256")!=before_hash or current_proof.get("owned_copy_after_sha256")!=final_main or current_proof.get("owned_copy_after_sha256")==before_hash:
+            raise ValueError("current migration physical lineage differs")
+        payloads.update({"schema13_"+key:value for key,value in current_payloads.items()})
+    elif schema5_main!=final_main:
+        raise ValueError("donor is not the pristine migrated main")
     return payloads
 
 
@@ -186,13 +207,14 @@ def prepare(args):
     expected = None
     try:
         paths = {name:getattr(args,name) for name in ("binary","archive","storage","source_binding","dataset")}
-        paths.update(coordinator=Path(__file__),protocol=Path(__file__).resolve().parents[1]/"docs/PREVIEW_INTEGRATED_PROTOCOL.md")
+        paths.update(coordinator=Path(__file__),schema_contract=SCHEMA_CONTRACT_SOURCE,
+                     protocol=Path(__file__).resolve().parents[1]/"docs/PREVIEW_INTEGRATED_PROTOCOL.md")
         files = {k:digest(v) for k,v in paths.items()}
         binding = read_json(args.binding,65536)
         checked_binding(binding,files,"prepare")
         source = read_json(args.source_binding,65536)
         if source.get("catalog_count") != 10000000 or source.get("schema_version") != CURRENT_SCHEMA or source.get("source_catalog") != str(args.source_catalog):
-            raise ValueError("exact schema-6 10M source binding required")
+            raise ValueError("exact schema-13 10M source binding required")
         expected = source["files"]
         source_revision=source.get("source_revision", "")
         if len(source_revision)!=40 or any(c not in "0123456789abcdef" for c in source_revision):
@@ -292,7 +314,7 @@ def run(args):
         fixture = read_json(args.fixture,65536)
         bundle = args.fixture.parent
         paths = {k:getattr(args,k) for k in ("binary","worker","archive","storage","fixture","source_binding")}
-        paths.update(dataset=Path(fixture["dataset"]),overlay=bundle/"overlay-receipt.json",copy=bundle/"copy-receipt.json",preparation=bundle/"preparation.json",coordinator=Path(__file__),protocol=root/"docs/PREVIEW_INTEGRATED_PROTOCOL.md",navigation_coordinator=root/"scripts/preview_navigation_campaign.py")
+        paths.update(dataset=Path(fixture["dataset"]),overlay=bundle/"overlay-receipt.json",copy=bundle/"copy-receipt.json",preparation=bundle/"preparation.json",coordinator=Path(__file__),schema_contract=SCHEMA_CONTRACT_SOURCE,protocol=root/"docs/PREVIEW_INTEGRATED_PROTOCOL.md",navigation_coordinator=root/"scripts/preview_navigation_campaign.py")
         copied_proof=read_json(paths["copy"],65536)
         for name,entry in copied_proof.get("ancestry",{}).get("files",{}).items():
             paths["ancestry_"+name]=Path(entry["path"])
@@ -303,7 +325,7 @@ def run(args):
             raise ValueError("fixed two-profile plan required")
         source = read_json(args.source_binding,65536)
         if source.get("schema_version") != CURRENT_SCHEMA or copied_proof.get("version") != PROTOCOL or copied_proof.get("schema_version") != CURRENT_SCHEMA:
-            raise ValueError("explicit schema6 preparation required before measurement")
+            raise ValueError("explicit schema13 preparation required before measurement")
         payloads=ancestry_evidence(source)
         if set(payloads)!={name.removeprefix("ancestry_") for name in paths if name.startswith("ancestry_")}:
             raise ValueError("copied ancestry missing")

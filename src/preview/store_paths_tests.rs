@@ -114,7 +114,7 @@ fn relocation_roundtrip(root: &Path, manifest: Option<&Path>, legacy: bool) -> R
         store
             .db
             .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?,
-        5
+        6
     );
     if legacy {
         assert_eq!(

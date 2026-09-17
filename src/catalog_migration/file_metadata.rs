@@ -415,11 +415,25 @@ struct Observation {
     #[serde(default)]
     parse_inputs: Option<usize>,
     #[serde(default)]
-    issues: Vec<Issue>,
+    issues: Option<Vec<Issue>>,
     #[serde(default)]
     state: Option<String>,
     #[serde(default)]
     error: Option<String>,
+}
+impl Observation {
+    fn validate(&self) -> Result<()> {
+        if self.status.is_some() {
+            ensure!(
+                self.revision.is_some()
+                    && self.packets.is_some()
+                    && self.parse_inputs.is_some()
+                    && self.issues.is_some(),
+                "inspection proof incomplete"
+            );
+        }
+        Ok(())
+    }
 }
 #[derive(Deserialize)]
 struct PacketDetail {
@@ -578,7 +592,9 @@ fn historical(
             revision: None,
             packets: None,
             parse_inputs: None,
-            issues: vec![],
+            // Preserve the historical digest shape for a document with no
+            // inspection roster. Explicit absent observations retain null.
+            issues: Some(vec![]),
             state: None,
             error: Some("No retained inspection for this path".into()),
         }
@@ -645,14 +661,7 @@ fn historical(
         },
         "origin packet/parse-input count or contiguous roster differs"
     );
-    if result.observation.status.is_some() {
-        ensure!(
-            result.observation.revision.is_some()
-                && result.observation.packets.is_some()
-                && result.observation.parse_inputs.is_some(),
-            "inspection proof incomplete"
-        );
-    }
+    result.observation.validate()?;
     Ok(result)
 }
 fn reconstruct(db: &Connection, h: &Historical, origin: Origin) -> Result<Option<Inspection>> {
@@ -701,7 +710,11 @@ fn reconstruct(db: &Connection, h: &Historical, origin: Origin) -> Result<Option
     let mut out = Inspection {
         revision: revision.clone(),
         status,
-        issues: h.observation.issues.clone(),
+        issues: h
+            .observation
+            .issues
+            .clone()
+            .context("inspection issue roster missing")?,
         packets: vec![],
         parse_inputs: vec![],
     };
@@ -1353,6 +1366,40 @@ pub(crate) mod tests {
     use crate::catalog_migration::originals::{OriginalDecision, OriginalRequest, SourceKey};
     use crate::lightroom::migration_source::{SupplementPin, tests::Fixture};
     const XML:&[u8]=br#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmlns:u="urn:opaque" xmp:Rating="4"><u:unknown>keep all</u:unknown></rdf:Description></rdf:RDF>"#;
+
+    #[test]
+    fn absent_inspection_keeps_null_issue_roster_but_inspected_requires_one() -> Result<()> {
+        let absent: Observation = serde_json::from_value(serde_json::json!({
+            "origin": "sidecar_xmp",
+            "status": null,
+            "revision": null,
+            "packets": 0,
+            "parse_inputs": 0,
+            "issues": null,
+            "state": "absent",
+            "error": null
+        }))?;
+        absent.validate()?;
+        assert!(absent.issues.is_none());
+
+        let inspected: Observation = serde_json::from_value(serde_json::json!({
+            "origin": "sidecar_xmp",
+            "status": "Complete",
+            "revision": {
+                "length": 1,
+                "blake3": "a".repeat(64),
+                "modified_unix_ns": null
+            },
+            "packets": 0,
+            "parse_inputs": 0,
+            "issues": null,
+            "state": "inspected",
+            "error": null
+        }))?;
+        assert!(inspected.validate().is_err());
+        Ok(())
+    }
+
     pub(crate) struct Test {
         _fixture: Fixture,
         _temp: tempfile::TempDir,

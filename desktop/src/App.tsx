@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { PreviewSettingsPanel } from './components/PreviewSettingsPanel';
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { command, chooseFolder, desktopAvailable, errorText, imageKey, type BackupStatus, type CatalogStatus, type CullOperation, type Data, type Folder, type GridImage, type HistoryEntry, type ImportStatus, type Variant } from './bridge';
+import { command, chooseFolder, desktopAvailable, errorText, imageKey, isBusyError, type BackupStatus, type CatalogStatus, type CullOperation, type Data, type Folder, type GridImage, type HistoryEntry, type ImportStatus, type Variant } from './bridge';
 import { Dialog, ErrorNotice, Section } from './components/Controls';
 import { FolderTree } from './components/FolderTree';
 import { CatalogActivity } from './components/CatalogActivity';
@@ -15,6 +16,11 @@ import { copyTerminal } from './editCopy';
 import { usePhotoExport } from './state/usePhotoExport';
 import { useLightroom } from './state/useLightroom';
 import { LightroomPanel, LightroomActivity } from './components/LightroomPanel';
+import type { SealedSelectionLocation } from './components/LightroomMigrationPanel';
+import type {ExactDocument} from './lightroom';
+import { LightroomMigrationActivity } from './components/LightroomMigrationActivity';
+import { useLightroomMigration } from './state/useLightroomMigration';
+import { terminalMigration } from './lightroomMigration';
 import { terminal as exportTerminal } from './photoExport';
 import { ExportPanel, type ExportGate } from './components/ExportPanel';
 import { MetadataPanel } from './components/MetadataPanel';
@@ -26,9 +32,12 @@ import { RecipeControls } from './components/RecipeControls';
 import { CompatibilityStatus } from './components/CompatibilityStatus';
 import { Viewport } from './components/Viewport';
 import { EditQueue, type EditSnapshot } from './state/editQueue';
+import { recipeControlsHeld } from './state/editAdmission';
 import { ActionGate } from './state/actionGate';
+import { beginMeasurement, finalizeMeasurement, initializeMeasurement, measurementDurable, measurementEnded, measurementPresented, measurementSearchResponse, setMeasurementExportActive, startScrollMeasurement, stopScrollMeasurement, subscribeMeasurement, type MeasurementStatus } from './performanceMeasurement';
 
 const initialStatus: CatalogStatus = { phase: 'closed', catalog: null, jobs_held: false, pending_commands: 0, active_previews: 0, cancel_requested: false, message: null };
+const LightroomMigrationPanel=lazy(()=>import('./components/LightroomMigrationPanel').then(module=>({default:module.LightroomMigrationPanel})));
 export function App() {
   const [status, setStatus] = useState(initialStatus);
   const [catalogName, setCatalogName] = useState('');
@@ -46,18 +55,23 @@ export function App() {
   const [folderEpoch, setFolderEpoch] = useState(0);
   const [showImport, setShowImport] = useState(false);
   const [showBackup, setShowBackup] = useState(false);
+  const [showPreviewSettings, setShowPreviewSettings] = useState(false);
   const [showOrganization, setShowOrganization] = useState(false);
   const [showMetadata, setShowMetadata] = useState(false);
   const [showRelink, setShowRelink] = useState(false);
   const [showCopy, setShowCopy] = useState(false);
   const [showExport, setShowExport] = useState(false);
   const [showLightroom, setShowLightroom] = useState(false);
+  const [showLightroomMigration, setShowLightroomMigration] = useState(false);
+  const [sealedSelection, setSealedSelection] = useState<SealedSelectionLocation | null>(null);
+  const [preparedSupplements,setPreparedSupplements]=useState<ExactDocument[]>([]);
   const [copyRefreshing, setCopyRefreshing] = useState<{ catalog: string; stamp: string } | null>(null);
   const [previewEpoch, setPreviewEpoch] = useState(0);
   const [organizationScopeName, setOrganizationScopeName] = useState('');
   const [backupStatus, setBackupStatus] = useState<BackupStatus | null>(null);
   const [importStatus, setImportStatus] = useState<ImportStatus | null>(null);
   const [loading, setLoading] = useState(false);
+  const [browseMeasurement, setBrowseMeasurement] = useState<number | undefined>();
   const [selected, setSelected] = useState<GridImage | null>(null);
   const selectedRef = useRef<GridImage | null>(null); selectedRef.current = selected;
   const [queue, setQueue] = useState<EditQueue | null>(null);
@@ -72,6 +86,7 @@ export function App() {
   const [history, setHistory] = useState<HistoryEntry[] | null>(null);
   const gate = useRef(new ActionGate());
   const [transitioning, setTransitioning] = useState(false);
+  const [measurement, setMeasurement] = useState<MeasurementStatus>({ enabled: false, samples: 0, scrollState: 'idle', scrollFrames: 0, finalizing: false, finalized: false, receiptPath: null, error: null });
   const perform = useCallback(async (action: () => Promise<void>) => {
     await gate.current.run(async () => {
       setTransitioning(true);
@@ -87,12 +102,33 @@ export function App() {
   const copies = useEditCopy(catalog);
   const outputs = usePhotoExport(catalog);
   const inspection = useLightroom(desktopAvailable);
+  const migration = useLightroomMigration(desktopAvailable);
   const [exportPending, setExportPending] = useState<string | null>(null);
   const exportDirectHeld = catalog !== null && exportPending === catalog;
   const copyEditingHeld = copies.busy || copyRefreshing?.catalog === catalog;
   const copyRefreshed = useRef('');
-  const storageWriteHold = storage.writeHeld || outputs.writeHeld || exportDirectHeld;
-  const exportBlocked = exportDirectHeld || outputs.writeHeld || status.phase !== 'ready' || status.jobs_held || storage.writeHeld || copies.busy || copyRefreshing?.catalog === catalog;
+  const migrationWriteHold = !!(catalog && migration.snapshot?.catalog === catalog && !terminalMigration(migration.snapshot) && !['uploading', 'ready'].includes(migration.snapshot.phase));
+  const storageWriteHold = storage.writeHeld || outputs.writeHeld || exportDirectHeld || migrationWriteHold;
+  const recipeControlsWriteHeld = recipeControlsHeld({
+    transitioning,
+    storage: storage.writeHeld,
+    directExport: exportDirectHeld,
+    migration: migrationWriteHold,
+    copy: copyEditingHeld,
+    export: outputs.recipeWriteHeld,
+  });
+  const importActive = !!importStatus && ['discovering', 'draining', 'cancel_requested'].includes(importStatus.phase);
+  const importActiveRef = useRef(importActive); importActiveRef.current = importActive;
+  const importIdRef = useRef<string | null>(importActive ? importStatus.id : null); importIdRef.current = importActive ? importStatus.id : null;
+  // Receipt context is the last observed status at input start. The sample's
+  // timestamp lets qualification correlate it with job and native trace intervals.
+  const exportActive = outputs.ready && outputs.operation?.kind === 'run'
+    && ['running', 'waiting_for_previews', 'cancel_requested'].includes(outputs.operation.phase)
+    && !['draining', 'yielding', 'finished'].includes(outputs.operation.stage);
+  const exportActiveRef = useRef(exportActive); exportActiveRef.current = exportActive;
+  useEffect(() => { setMeasurementExportActive(exportActive); }, [exportActive]);
+  const measurementContext = () => ({ duringImport: importActiveRef.current, importId: importIdRef.current, duringExport: exportActiveRef.current });
+  const exportBlocked = exportDirectHeld || outputs.writeHeld || migrationWriteHold || status.phase !== 'ready' || status.jobs_held || storage.writeHeld || copies.busy || copyRefreshing?.catalog === catalog;
   const exportBlockedRef = useRef(exportBlocked); exportBlockedRef.current = exportBlocked;
   const exportGate: ExportGate = async action => {
     let result!: Awaited<ReturnType<typeof action>>;
@@ -109,6 +145,11 @@ export function App() {
   };
   const exportRefreshed = useRef('');
   useEffect(() => {
+    const unsubscribe = subscribeMeasurement(setMeasurement);
+    if (desktopAvailable) void initializeMeasurement();
+    return unsubscribe;
+  }, []);
+  useEffect(() => {
     const operation = outputs.operation;
     if (!catalog || !operation || !exportTerminal(operation)) return;
     const stamp = `${catalog}:${operation.id}`;
@@ -123,6 +164,14 @@ export function App() {
     // pending draft intact while refreshing the guarded read-only image state.
     return () => abort.abort();
   }, [catalog, outputs.operation]);
+  const migrationRefreshed = useRef('');
+  useEffect(() => {
+    const operation = migration.snapshot;
+    if (!catalog || !operation || operation.catalog !== catalog || operation.phase !== 'complete' || !operation.result) return;
+    const stamp = `${catalog}:${operation.guard.operation}:${operation.result.blake3}`;
+    if (migrationRefreshed.current === stamp) return;
+    migrationRefreshed.current = stamp; setFolderEpoch(value => value + 1); setCursor(null); setPrevious([]); setRefresh(value => value + 1);
+  }, [catalog, migration.snapshot]);
 
   useEffect(() => {
     if (!desktopAvailable) return;
@@ -145,7 +194,7 @@ export function App() {
     let timer: ReturnType<typeof setTimeout>;
     const poll = async () => {
       try { const next = await command({ command: 'status' }, 'status'); if (!stopped) setStatus(next); }
-      catch (e) { if (!stopped) setError(errorText(e)); }
+      catch (e) { if (!stopped && !isBusyError(e)) setError(errorText(e)); }
       if (!stopped) timer = setTimeout(() => { void poll(); }, 500);
     };
     void poll(); return () => { stopped = true; clearTimeout(timer); };
@@ -158,7 +207,13 @@ export function App() {
 
   const attachVariant = useCallback((variant: Variant) => {
     if (!catalog) return;
-    const next = new EditQueue(variant, (base, recipe) => command({ command: 'save_recipe', args: { catalog, key: base.key, expected_revision: base.revision, recipe } }, 'variant'));
+    let next: EditQueue;
+    next = new EditQueue(variant, (base, recipe) => command({ command: 'save_recipe', args: { catalog, key: base.key, expected_revision: base.revision, recipe } }, 'variant'), event => {
+      if (event.outcome === 'durable') {
+        measurementDurable(event.ordinal);
+        measurementPresented(event.ordinal, () => queueRef.current === next && next.value.variant.revision === event.revision && document.querySelector('.edit-status')?.textContent === 'Changes saved');
+      } else measurementEnded(event.ordinal, event.outcome === 'superseded' ? 'superseded' : 'backend_error');
+    }, isBusyError);
     queueRef.current = next; setQueue(next);
   }, [catalog]);
   const select = useCallback(async (row: GridImage) => {
@@ -217,12 +272,12 @@ export function App() {
 
   useEffect(() => {
     if (!catalog || status.phase !== 'ready' || scope === undefined) return;
-    const abort = new AbortController(); setLoading(true);
+    const abort = new AbortController(), measured = beginMeasurement('browse', measurementContext()); setLoading(true);
     void command({ command: 'search', args: { catalog, options: { ...filters, folder: scope?.id ?? null, folder_recursive: recursive, text: appliedSearch || null }, cursor, limit: 100 } }, 'images', abort.signal)
-      .then(next => { if (!abort.signal.aborted) { setPage(next); setError(''); } })
-      .catch(e => { if (!abort.signal.aborted) setError(errorText(e)); })
+      .then(next => { if (!abort.signal.aborted) { measurementSearchResponse(measured, next.rows.length); setBrowseMeasurement(measured); setPage(next); setError(''); } })
+      .catch(e => { if (!abort.signal.aborted) { measurementEnded(measured, 'backend_error'); setError(errorText(e)); } })
       .finally(() => { if (!abort.signal.aborted) setLoading(false); });
-    return () => abort.abort();
+    return () => { abort.abort(); measurementEnded(measured, 'canceled'); };
   }, [catalog, status.phase, scope, recursive, appliedSearch, filters, cursor, refresh]);
 
   const open = async (create: boolean) => perform(async () => {
@@ -238,25 +293,44 @@ export function App() {
   });
   const close = async () => perform(async () => {
     if (!catalog) return;
-    try { await queueRef.current?.flush(); setBusy('Closing catalog'); setStatus(await command({ command: 'close', args: { catalog } }, 'status')); setSelected(null); queueRef.current = null; setQueue(null); setImportStatus(null); setPage({ rows: [], next: null, has_more: false, page_complete: true, scanned: 0 }); }
+    try { await queueRef.current?.flush(); if (migration.snapshot?.catalog === catalog && !terminalMigration(migration.snapshot)) { await migration.request({ action: 'cancel', guard: migration.snapshot.guard }); throw new Error('Migration cancellation was requested. Close the catalog after guarded status reaches a checked terminal state.'); } setBusy('Closing catalog'); setStatus(await command({ command: 'close', args: { catalog } }, 'status')); setSelected(null); queueRef.current = null; setQueue(null); setImportStatus(null); setPage({ rows: [], next: null, has_more: false, page_complete: true, scanned: 0 }); }
     catch (e) { setError(errorText(e)); } finally { setBusy(''); }
   });
   const changeScope = async (next: Folder | null) => perform(async () => {
     try { await queueRef.current?.flush(); setScope(next); setCursor(null); setPrevious([]); setSelected(null); queueRef.current = null; setQueue(null); }
     catch (e) { setError(errorText(e)); }
   });
-  const cull = useCallback(async (operation: CullOperation, advance: boolean) => perform(async () => {
-    if (!catalog || !selected || storageWriteHold) return;
-    try {
-      await queueRef.current?.flush();
-      const result = await command({ command: 'cull', args: { catalog, key: selected.key, expected_revision: selected.metadata_revision, operation } }, 'culled');
-      const changed: GridImage = { ...selected, metadata_revision: result.metadata_revision,
-        ...(operation.operation === 'rating' ? { rating: String(operation.value) } : operation.operation === 'flag' ? { flag: operation.value } : { label: operation.value }) };
-      setSelected(changed); setPage(value => ({ ...value, rows: value.rows.map(row => row.image_id === changed.image_id ? changed : row) }));
-      if (advance) { const at = page.rows.findIndex(row => row.image_id === selected.image_id); if (at >= 0 && at + 1 < page.rows.length) { const next = page.rows[at + 1]; const variant = await command({ command: 'variant', args: { catalog, key: next.key } }, 'variant'); setSelected(next); attachVariant(variant); } }
-      setError('');
-    } catch (e) { setError(errorText(e)); }
-  }), [catalog, selected, page.rows, attachVariant, perform, storageWriteHold]);
+  const cull = useCallback(async (operation: CullOperation, advance: boolean) => {
+    if (!catalog || !selected || storageWriteHold || gate.current.locked) return;
+    const measured = beginMeasurement('cull', measurementContext());
+    return perform(async () => {
+      let committed = false;
+      try {
+        await queueRef.current?.flush();
+        const result = await command({ command: 'cull', args: { catalog, key: selected.key, expected_revision: selected.metadata_revision, operation } }, 'culled');
+        const changed: GridImage = { ...selected, metadata_revision: result.metadata_revision,
+          ...(operation.operation === 'rating' ? { rating: String(operation.value) } : operation.operation === 'flag' ? { flag: operation.value } : { label: operation.value }) };
+        measurementDurable(measured);
+        committed = true;
+        setSelected(changed); setPage(value => ({ ...value, rows: value.rows.map(row => row.image_id === changed.image_id ? changed : row) }));
+        measurementPresented(measured, () => {
+          const tile = [...document.querySelectorAll<HTMLElement>('.photo-tile')].find(value => value.dataset.image === changed.image_id);
+          if (!tile || tile.dataset.metadataRevision !== result.metadata_revision) return false;
+          if (operation.operation === 'rating') {
+            const stars = operation.value === 0 ? '' : '★'.repeat(operation.value);
+            return tile.dataset.rating === String(operation.value) && tile.querySelector('.stars')?.textContent === stars;
+          }
+          if (operation.operation === 'flag') {
+            const flag = tile.querySelector<HTMLElement>('.photo-flag');
+            return tile.dataset.flag === operation.value && (operation.value === 'unflagged' ? !flag : flag?.title === (operation.value === 'pick' ? 'Pick' : 'Reject'));
+          }
+          return false;
+        });
+        if (advance) { const at = page.rows.findIndex(row => row.image_id === selected.image_id); if (at >= 0 && at + 1 < page.rows.length) { const next = page.rows[at + 1]; const variant = await command({ command: 'variant', args: { catalog, key: next.key } }, 'variant'); setSelected(next); attachVariant(variant); } }
+        setError('');
+      } catch (e) { if (!committed) measurementEnded(measured, 'backend_error'); setError(errorText(e)); }
+    });
+  }, [catalog, selected, page.rows, attachVariant, perform, storageWriteHold]);
   useEffect(() => {
     const keydown = (event: KeyboardEvent) => {
       if (document.querySelector('dialog[open]') || (event.target instanceof HTMLElement && (event.target.closest('input,textarea,select') || event.target.isContentEditable)) || event.metaKey || event.ctrlKey || event.altKey) return;
@@ -284,14 +358,18 @@ export function App() {
   });
 
   return <div className="app-shell">
-    <header className="app-header"><div className="wordmark"><span className="brand-mark" aria-hidden="true">▧</span>LensWorks</div>
+      <header className="app-header"><div className="wordmark"><span className="brand-mark" aria-hidden="true">▧</span>LensWorks</div>
       <span className="catalog-name" title={catalogName}>{catalog ? catalogName.split(/[\\/]/).filter(Boolean).at(-1) || 'Catalog' : 'Local photo library'}</span>
       {catalog && <nav aria-label="Workspace">{(['library', 'cull', 'develop'] as const).map(value => <button key={value} aria-current={mode === value ? 'page' : undefined} onClick={() => setMode(value)}>{value}</button>)}</nav>}
       {desktopAvailable && <button className="quiet" disabled={transitioning} onClick={() => void perform(async () => { await queueRef.current?.flush(); setShowBackup(true); })}>Backups…</button>}
       {desktopAvailable && <button className="quiet" onClick={() => setShowLightroom(true)}>Inspect Lightroom…</button>}
+      {desktopAvailable && <button className="quiet" onClick={() => setShowLightroomMigration(true)}>Migrate Lightroom…</button>}
       {catalog && <button className="quiet" onClick={() => void close()} disabled={!!busy || transitioning}>Close catalog</button>}
-    </header>
+      </header>
+      {measurement.enabled && <div className="measurement-banner" role="status"><span>S12 measurement · {measurement.samples} samples · scroll {measurement.scrollState}{measurement.scrollState !== 'idle' ? ` (${measurement.scrollFrames} frames)` : ''}</span><span>Current import UUID: {importStatus?.id ?? 'none observed'}{importStatus ? ` · ${importStatus.phase}` : ''}</span><button disabled={measurement.finalizing || measurement.finalized || (measurement.scrollState !== 'idle' && measurement.scrollState !== 'capturing')} onClick={() => measurement.scrollState === 'capturing' ? stopScrollMeasurement() : startScrollMeasurement()}>{measurement.scrollState === 'capturing' ? 'Stop scroll capture' : 'Capture 5s scroll cadence'}</button><button disabled={measurement.finalizing || measurement.finalized} onClick={() => void finalizeMeasurement()}>{measurement.finalized ? 'Receipt finalized' : measurement.finalizing ? 'Finalizing receipt…' : 'Finalize measurement receipt'}</button>{measurement.receiptPath && <span>{measurement.receiptPath}</span>}{measurement.error && <span>{measurement.error}</span>}</div>}
+    {catalog && <button disabled={transitioning} onClick={() => setShowPreviewSettings(true)}>Preview storage…</button>}
     {desktopAvailable && <LightroomActivity controller={inspection} onOpen={() => setShowLightroom(true)} />}
+    {desktopAvailable && <LightroomMigrationActivity controller={migration} onOpen={() => setShowLightroomMigration(true)} />}
     {error && <ErrorNotice message={error} dismiss={() => setError('')} />}
     {busy && <div className="activity" role="status">{busy}… {operationAbort.current && <button onClick={() => operationAbort.current?.abort()}>Cancel</button>}</div>}
     {!catalog ? <main className="welcome"><div className="welcome-mark" aria-hidden="true">▧</div><h1>Your photographs.<br />One library.</h1><p>Keep every year together. Browse your folders, preserve your originals, and edit without losing where you started.</p>
@@ -314,7 +392,7 @@ export function App() {
         <section className="central-panel" aria-label={`${mode} workspace`}>
           {status.phase !== 'ready' ? <CatalogActivity phase={status.phase} message={status.message} /> : mode === 'library' ? <>
             <div className="grid-toolbar"><span>{loading ? 'Loading photos…' : `${page.rows.length} photos on this page`}</span><label>Size<input aria-label="Thumbnail size" type="range" min="130" max="300" step="10" value={size} onChange={event => setSize(Number(event.target.value))} /></label></div>
-            {scope === undefined ? <div className="empty-state"><h2>Choose a folder</h2><p>Your library follows the folders on disk. Select a folder, or open All Photos to browse across every year.</p></div> : page.rows.length ? <PhotoGrid key={`grid:${previewEpoch}`} edited={editor?.variant} catalog={catalog} rows={page.rows} selected={selected?.image_id ?? null} onSelect={row => void select(row)} onDevelop={() => setMode('develop')} size={size} /> : <div className="empty-state"><h2>{loading ? 'Loading photos…' : page.has_more ? 'More photos to check' : 'No photos in this view'}</h2><p>{page.has_more ? 'Continue to the next page to search the remaining candidates.' : 'Select another folder or change your search.'}</p></div>}
+            {scope === undefined ? <div className="empty-state"><h2>Choose a folder</h2><p>Your library follows the folders on disk. Select a folder, or open All Photos to browse across every year.</p></div> : page.rows.length ? <PhotoGrid key={`grid:${previewEpoch}`} edited={editor?.variant} catalog={catalog} rows={page.rows} selected={selected?.image_id ?? null} onSelect={row => void select(row)} onDevelop={() => setMode('develop')} size={size} measurementOrdinal={browseMeasurement} /> : <div className="empty-state"><h2>{loading ? 'Loading photos…' : page.has_more ? 'More photos to check' : 'No photos in this view'}</h2><p>{page.has_more ? 'Continue to the next page to search the remaining candidates.' : 'Select another folder or change your search.'}</p></div>}
           </> : selected && editor ? <Viewport key={`viewport:${previewEpoch}`} catalog={catalog} image={selected} variant={editor.variant} interactive={mode === 'develop'} /> : <div className="empty-state"><h2>Select a photograph</h2><p>Choose a photo in Library to begin.</p><button onClick={() => setMode('library')}>Open Library</button></div>}
           {mode === 'cull' && selected && <div className="cull-bar"><button disabled={storageWriteHold} onClick={() => void cull({ operation: 'flag', value: 'pick' }, true)}>Pick <kbd>P</kbd></button><button disabled={storageWriteHold} onClick={() => void cull({ operation: 'flag', value: 'reject' }, true)}>Reject <kbd>X</kbd></button><button disabled={storageWriteHold} onClick={() => void cull({ operation: 'flag', value: 'unflagged' }, true)}>Unflag <kbd>U</kbd></button><span className="hint">0–5 rates · advances after saving</span></div>}
           {page.rows.length > 0 && <Filmstrip key={`filmstrip:${previewEpoch}`} edited={editor?.variant} catalog={catalog} rows={page.rows} selected={selected?.image_id ?? null} onSelect={row => void select(row)} onDevelop={() => setMode('develop')} />}
@@ -324,13 +402,14 @@ export function App() {
           <Section title="Selected photo"><div className="selected-filename">{selected.filename}</div><CompatibilityStatus image={selected} selectedKey={editor.variant.key} />{editor.variant.label && <p className="hint">{editor.variant.label}</p>}<div className="rating-buttons" aria-label="Rating">{[0, 1, 2, 3, 4, 5].map(value => <button key={value} disabled={storageWriteHold} aria-label={`${value} stars`} aria-pressed={selected.rating === String(value)} onClick={() => void cull({ operation: 'rating', value }, false)}>{value === 0 ? '—' : '★'}</button>)}</div>
           <div className="button-group"><button disabled={storageWriteHold} aria-pressed={selected.flag === 'pick'} onClick={() => void cull({ operation: 'flag', value: selected.flag === 'pick' ? 'unflagged' : 'pick' }, false)}>Pick</button><button disabled={storageWriteHold} aria-pressed={selected.flag === 'reject'} onClick={() => void cull({ operation: 'flag', value: selected.flag === 'reject' ? 'unflagged' : 'reject' }, false)}>Reject</button></div>
           {selected.conflicts.length > 0 && <p className="hint">Conflicting metadata: {selected.conflicts.join(', ')}</p>}{selected.metadata_pending && <p className="hint">Metadata indexing is pending.</p>}<button disabled={transitioning} onClick={() => void perform(async () => { await queueRef.current?.flush(); setShowMetadata(true); })}>Metadata & XMP…</button></Section>
-          {mode === 'develop' && <><div className="edit-status" role="status">{editor.state === 'saved' ? 'Changes saved' : editor.state === 'saving' ? 'Saving changes…' : editor.state === 'pending' ? 'Changes pending' : 'Changes could not be saved'}</div>{editor.error && <ErrorNotice message={editor.error} />}<RecipeControls disabled={transitioning || storageWriteHold || copyEditingHeld} recipe={editor.recipe} onChange={value => { if (!gate.current.locked && !storageWriteHold && !copyEditingHeld) queueRef.current?.change(value); }} />
+          {mode === 'develop' && <><div className="edit-status" role="status">{editor.state === 'saved' ? 'Changes saved' : editor.state === 'saving' ? 'Saving changes…' : editor.state === 'pending' ? 'Changes pending' : 'Changes could not be saved'}</div>{editor.error && <ErrorNotice message={editor.error} />}<RecipeControls disabled={recipeControlsWriteHeld} recipe={editor.recipe} onChange={value => { if (!gate.current.locked && !recipeControlsWriteHeld) queueRef.current?.change(value, beginMeasurement('edit', measurementContext())); }} />
           <div className="edit-actions"><button disabled={transitioning || storageWriteHold || copyEditingHeld || !editor.variant.can_undo} onClick={() => void undo(false)}>Undo</button><button disabled={transitioning || storageWriteHold || copyEditingHeld || !editor.variant.can_redo} onClick={() => void undo(true)}>Redo</button><button disabled={storageWriteHold || copyEditingHeld} onClick={() => setCopyName('Copy')}>Create variant…</button><button onClick={() => void inspectHistory()}>Edit history</button></div></>}
           {mode !== 'develop' && <Section title="Editing"><p className="hint">Changes apply to the selected photo or variant and leave the original untouched.</p><button onClick={() => setMode('develop')}>Open Develop</button></Section>}
         </> : <div className="empty-state"><p>Select a photo to inspect its metadata and edits.</p></div>}</aside>}
       </main><footer className="app-status"><span>{status.phase === 'ready' ? 'Catalog ready' : status.phase}</span><span>{importStatus && ['discovering', 'draining', 'cancel_requested'].includes(importStatus.phase) ? `Import ${importStatus.phase.replaceAll('_', ' ')} · ${importStatus.imported} added` : status.message}</span><span>{backupStatus && ['running', 'cancel_requested'].includes(backupStatus.state) ? `Backup ${backupStatus.state.replaceAll('_', ' ')}` : ''}</span><span>{status.active_previews > 0 ? `${status.active_previews} preview requests` : 'Local catalog'}</span></footer>
     </>}
-    {desktopAvailable && <LightroomPanel controller={inspection} open={showLightroom} onClose={() => setShowLightroom(false)} />}
+    {desktopAvailable && <LightroomPanel controller={inspection} preparedSupplements={preparedSupplements} open={showLightroom} onClose={() => setShowLightroom(false)} onSealed={location => { setSealedSelection(current => ({ generation: (current?.generation ?? 0) + 1, location })); setShowLightroom(false); setShowLightroomMigration(true); }} />}
+    {desktopAvailable && <Suspense fallback={null}><LightroomMigrationPanel controller={migration} catalog={catalog} catalogDisplay={catalogName} sealedSelection={sealedSelection} open={showLightroomMigration} onClose={() => setShowLightroomMigration(false)} onPreparedSupplements={value=>{setPreparedSupplements(value);setShowLightroomMigration(false);setShowLightroom(true);}} /></Suspense>}
     {catalog && <ExportPanel key={`export:${catalog}`} catalog={catalog} open={showExport} rows={page.rows} controller={outputs} gate={exportGate} blocked={exportBlocked} onDirectPending={pending => setExportPending(pending ? catalog : null)} onClose={() => setShowExport(false)} />}
     {catalog && <CopyPanel key={`copy:${catalog}`} catalog={catalog} open={showCopy} selected={selected} rows={page.rows} source={() => queueRef.current?.value.variant ?? null} controller={copies} mutate={organizationMutation} jobsHeld={status.jobs_held} writeHeld={storageWriteHold} onClose={() => setShowCopy(false)} />}
     {catalog && <RelinkPanel key={`relink:${catalog}`} catalog={catalog} selected={selected} open={showRelink} onClose={() => setShowRelink(false)} controller={storage} mutate={organizationMutation} changed={() => { setPreviewEpoch(v => v + 1); setFolderEpoch(v => v + 1); setCursor(null); setPrevious([]); setRefresh(v => v + 1); const selection = selectedRef.current; const generation = ++storageRefresh.current; const current = () => catalogRef.current === catalog && storageRefresh.current === generation && selectedRef.current === selection; if (selection) void command({ command: 'image', args: { catalog, key: selection.key } }, 'image').then(row => { if (current()) setSelected(row); }).catch(e => { if (current()) setError(errorText(e)); }); }} />}
@@ -338,6 +417,7 @@ export function App() {
     {desktopAvailable && <BackupPanel catalog={catalog} open={showBackup} onClose={() => setShowBackup(false)} onProgress={setBackupStatus} />}
     {catalog && selected && showMetadata && <MetadataPanel key={`${catalog}:${imageKey(selected.key)}`} catalog={catalog} variant={selected.key} filename={selected.filename} mutate={organizationMutation} onClose={() => setShowMetadata(false)} />}
     {catalog && <OrganizationPanel phase={status.phase} open={showOrganization} onOpen={() => setShowOrganization(true)} key={`organization:${catalog}`} catalog={catalog} selected={selected} selectedVariantLabel={editor?.variant.label ?? null} rows={page.rows} mutate={organizationMutation} onClose={() => setShowOrganization(false)} onSelect={async row => { await gate.current.afterCurrent(async () => { setTransitioning(true); try { await queueRef.current?.flush(); const variant = await command({ command: 'variant', args: { catalog, key: row.key } }, 'variant'); setSelected(row); attachVariant(variant); } finally { setTransitioning(false); } }); }} onFilter={(filter, name) => { setFilters(value => ({ ...value, ...filter })); setOrganizationScopeName(name); setScope(null); setCursor(null); setPrevious([]); setMode('library'); setShowOrganization(false); }} />}
+    {catalog && <PreviewSettingsPanel key={`preview-settings:${catalog}`} catalog={catalog} open={showPreviewSettings} onClose={() => setShowPreviewSettings(false)} />}
     {showFilters && <SearchFilters value={filters} onApply={value => { setFilters(value); setCursor(null); setPrevious([]); }} onClose={() => setShowFilters(false)} />}
     {copyName !== null && <Dialog title="Create independent variant" onClose={() => setCopyName(null)}><p>Start a new edit from the current saved settings. The original and existing variant remain unchanged.</p><label className="form-field">Variant name<input autoFocus value={copyName} maxLength={256} onChange={event => setCopyName(event.target.value)} /></label><button className="primary" disabled={transitioning || !copyName.trim()} onClick={() => void createCopy()}>Create variant</button></Dialog>}
     {history && <Dialog title="Edit history" onClose={() => setHistory(null)}>{history.length ? <ol>{history.map(entry => <li key={entry.revision}><strong>Revision {entry.revision}</strong> · {entry.kind}</li>)}</ol> : <p>No saved history for this variant.</p>}</Dialog>}

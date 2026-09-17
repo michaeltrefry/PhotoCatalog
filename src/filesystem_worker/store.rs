@@ -305,6 +305,15 @@ impl Default for StoreOwner {
     }
 }
 impl StoreOwner {
+    pub(super) fn protected_roots(&self) -> Result<Vec<PathBuf>> {
+        let mut roots = Vec::with_capacity(self.slots.iter().flatten().count());
+        for slot in self.slots.iter().flatten() {
+            slot.verify()?;
+            roots.push(slot.path.path()?);
+        }
+        Ok(roots)
+    }
+
     pub(super) fn reserved_path(&self, group: &LeaseId, token: &LeaseId) -> Result<PathBuf> {
         self.group(group)?;
         let slot = self.slot(id(token))?;

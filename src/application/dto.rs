@@ -35,6 +35,10 @@ decimal!(U64, u64);
     deny_unknown_fields
 )]
 pub enum Request {
+    PreviewSettings {
+        catalog: String,
+        request: Box<super::preview_settings::Request>,
+    },
     LightroomMigration {
         request: Box<super::lightroom_migration::Request>,
     },
@@ -104,6 +108,10 @@ pub enum Request {
     Metadata {
         catalog: String,
         request: Box<super::metadata::Request>,
+    },
+    MetadataWrite {
+        catalog: String,
+        request: Box<super::metadata_write::Request>,
     },
     Organization {
         catalog: String,
@@ -185,6 +193,8 @@ pub enum Request {
         viewport: String,
         generation: U64,
         foreground: bool,
+        #[serde(default)]
+        diagnostics: bool,
     },
     PreviewStatus {
         catalog: String,
@@ -317,6 +327,46 @@ pub enum PreviewState {
     Canceled,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviewRoute {
+    Pending,
+    Retained,
+    OriginalRender,
+    MemoryCache,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreviewReadDiagnostic {
+    pub outcome: String,
+    pub queue_ms: f64,
+    pub owner_read_ms: f64,
+    pub catalog_identity_ms: f64,
+    pub store_read_checksum_ms: f64,
+    pub header_decode_ms: f64,
+    pub total_ms: f64,
+    pub decoded_hits: u64,
+    pub decoded_misses: u64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreviewDeliveryDiagnostic {
+    /// Elapsed from delivery enqueue until its retained read completed and the
+    /// selected view was ready to enter encoded transfer admission.
+    pub ready_for_transfer_ms: f64,
+    pub retained_read: PreviewReadDiagnostic,
+    pub transfer_ms: f64,
+    pub total_ms: f64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreviewDiagnostic {
+    pub route: PreviewRoute,
+    pub expected_key_digest: Option<String>,
+    pub selected_key_digest: Option<String>,
+    pub current_key_matches_selected: Option<bool>,
+    pub retained_read: Option<PreviewReadDiagnostic>,
+    pub original_render_ms: Option<f64>,
+    pub ready_ms: Option<f64>,
+    pub delivery: Option<PreviewDeliveryDiagnostic>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreviewStatus {
     pub ticket: String,
     pub key: VariantKey,
@@ -326,14 +376,18 @@ pub struct PreviewStatus {
     pub generation: U64,
     pub state: PreviewState,
     pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<Box<PreviewDiagnostic>>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Response {
+    PreviewSettings(Box<super::preview_settings::Status>),
     LightroomMigration(Box<super::lightroom_migration::Response>),
     Lightroom(Box<super::lightroom_bridge::Response>),
     Export(Box<super::exports::Response>),
     Metadata(Box<super::metadata::Response>),
+    MetadataWrite(Box<super::metadata_write::Response>),
     Relink(Box<super::relink::Response>),
     EditCopy(Box<super::copy::Response>),
     Organization(Box<super::organization::Response>),

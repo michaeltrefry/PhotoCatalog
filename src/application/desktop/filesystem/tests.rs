@@ -53,6 +53,38 @@ fn bootstrap(r: &PrepareCatalog, b: &Binding) -> CatalogBootstrap {
         },
     }
 }
+
+#[test]
+fn storage_observation_reply_cannot_cross_root_or_action() -> Result<()> {
+    use crate::catalog_session::storage;
+    let binding = Binding {
+        nonce: LeaseId::new(),
+        epoch: LeaseId::new(),
+    };
+    let r = request();
+    let request = storage::Request {
+        root: bootstrap(&r, &binding).root_capability(),
+        action: storage::Action::Object(r.root),
+    };
+    let reply = storage::Reply {
+        request: request.clone(),
+        value: storage::Value::Object {
+            device: U64(u64::MAX),
+            object: U64(u64::MAX - 1),
+        },
+    };
+    reply.validate(&request)?;
+    let mut other = request.clone();
+    other.root.token = LeaseId::new();
+    assert!(reply.validate(&other).is_err());
+    other = request.clone();
+    other.action = storage::Action::Mounts;
+    assert!(reply.validate(&other).is_err());
+    let call = Call::Storage(Box::new(request.clone()));
+    let value = Value::Storage(reply);
+    validate_reply(&call, &value, &binding)?;
+    Ok(())
+}
 #[test]
 fn exact_encoding_and_epoch_bounds_precede_reply_adoption() -> Result<()> {
     let binding = Binding {
@@ -540,6 +572,151 @@ fn wrong_reply_is_not_acknowledged_and_cancel_does_not_erase_publication() -> Re
     assert_eq!(digest, blake3::hash(&correct).to_hex().as_str());
     Ok(())
 }
+
+#[test]
+fn managed_import_cleanup_waits_for_one_of_two_bounded_relay_slots() -> Result<()> {
+    use crate::catalog_session::import;
+
+    let binding = Binding {
+        nonce: LeaseId::new(),
+        epoch: LeaseId::new(),
+    };
+    let proxy = Proxy::new(binding.clone());
+    let root = bootstrap(&request(), &binding).root_capability();
+    let mut state = proxy.state.lock().unwrap();
+    for id in [u64::MAX - 1, u64::MAX] {
+        state.calls.push(ChildCall {
+            id,
+            call: Call::Prepare(request()),
+            outcome: None,
+            canceled: false,
+            queried: false,
+        });
+    }
+    drop(state);
+
+    let import_request = import::Request {
+        root: root.clone(),
+        transfer: LeaseId::new(),
+        step: U64(0),
+        action: import::Action::Abort,
+    };
+    let waiting_request = import_request.clone();
+    let waiting_proxy = proxy.clone();
+    let waiting = thread::spawn(move || {
+        waiting_proxy.call(Call::Import(waiting_request), &AtomicBool::new(false))
+    });
+    let held_until = Instant::now() + Duration::from_millis(50);
+    while Instant::now() < held_until && !waiting.is_finished() {
+        assert!(proxy.next(Lane::Data).is_none());
+        thread::sleep(Duration::from_millis(1));
+    }
+    let rejected = waiting.is_finished();
+    assert_eq!(
+        proxy.state.lock().unwrap().calls.len(),
+        2,
+        "waiting import must not enlarge the retained relay root"
+    );
+    let import_id = if rejected {
+        0
+    } else {
+        proxy.state.lock().unwrap().calls.pop();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (id, call) = loop {
+            if let Some(out) = proxy.next(Lane::Data) {
+                let Body::Call { id, call } = decode(&binding, &out.bytes, Lane::Data)? else {
+                    anyhow::bail!("expected relay call")
+                };
+                break (id.0, call);
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "waiting import admission timeout"
+            );
+            thread::sleep(Duration::from_millis(1));
+        };
+        assert!(matches!(call, Call::Import(_)));
+        assert_eq!(
+            proxy.state.lock().unwrap().calls.len(),
+            2,
+            "admitted import replaces the retired call within the same bound"
+        );
+        id
+    };
+    if import_id != 0 {
+        proxy.receive(
+            &encode(
+                &Packet {
+                    binding: binding.clone(),
+                    body: Body::Reply {
+                        id: U64(import_id),
+                        outcome: Ok(Value::Import(import::Reply {
+                            root,
+                            transfer: import_request.transfer.clone(),
+                            step: import_request.step,
+                            request_digest: import_request.digest()?,
+                            value: import::Value::Aborted,
+                        })),
+                    },
+                },
+                BYTES,
+            )?,
+            Lane::Data,
+        )?;
+        assert!(proxy.next(Lane::Control).is_some());
+    }
+    let waiting_result = waiting.join().unwrap();
+    proxy.state.lock().unwrap().calls.clear();
+    ensure!(
+        !rejected,
+        "managed import cleanup was rejected at transient relay capacity"
+    );
+    assert!(matches!(waiting_result?, Value::Import(_)));
+    Ok(())
+}
+
+#[test]
+fn relay_selection_orders_retirement_ack_before_replacement_call() -> Result<()> {
+    let binding = Binding {
+        nonce: LeaseId::new(),
+        epoch: LeaseId::new(),
+    };
+    let proxy = Proxy::new(binding.clone());
+    {
+        let mut state = proxy.state.lock().unwrap();
+        state.output.push(
+            &binding,
+            Body::Control(Control::Ack {
+                id: U64(1),
+                digest: "retired-result".into(),
+            }),
+        )?;
+        state.output.push(
+            &binding,
+            Body::Call {
+                id: U64(3),
+                call: Call::Prepare(request()),
+            },
+        )?;
+    }
+
+    let first = proxy
+        .next_relay(true)
+        .context("retirement acknowledgement")?;
+    assert_eq!(first.lane, Lane::Control);
+    assert!(matches!(
+        decode(&binding, &first.bytes, first.lane)?,
+        Body::Control(Control::Ack { id: U64(1), .. })
+    ));
+    let second = proxy.next_relay(true).context("replacement call")?;
+    assert_eq!(second.lane, Lane::Data);
+    assert!(matches!(
+        decode(&binding, &second.bytes, second.lane)?,
+        Body::Call { id: U64(3), .. }
+    ));
+    Ok(())
+}
+
 #[test]
 fn independent_control_capacity_survives_full_data_queue() -> Result<()> {
     let binding = Binding {

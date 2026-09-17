@@ -95,6 +95,8 @@ fn document(review: &SelectionReview, scope: ApprovalScope) -> Vec<u8> {
         destination: NativePath::from_path(
             &review
                 .guard
+                .as_ref()
+                .unwrap()
                 .path
                 .with_file_name("destination-never-opened.sqlite3"),
         ),
@@ -242,6 +244,31 @@ fn any_live_source_commit_invalidates_review_including_excluded_and_unrelated_ro
         assert!(seal(&mut review, &bytes, output.clone()).is_err(), "{sql}");
         assert!(!output.to_path().unwrap().exists());
     }
+}
+
+#[test]
+fn approval_factory_rejects_a_stale_selection_before_document_generation() {
+    let case = Case::new();
+    let review = case.review();
+    let output = case.output("never-created-stale-approval");
+    let draft = ApprovalDraft {
+        protocol: 1,
+        review_token: review.summary.token.clone(),
+        destination: output.clone(),
+        import_source: "synthetic source".into(),
+        overlap: OverlapPolicy::RequireDecision,
+        keyword_overlap: KeywordOverlap::RequireDecision,
+        artifacts: vec![],
+        supplements: vec![],
+        authorization: "Explicit synthetic TEST fixture authority".into(),
+    };
+    case.edit("UPDATE family_choices SET reason='changed after review'");
+    assert!(
+        review
+            .approval_documents(&serde_json::to_vec(&draft).unwrap(), flag())
+            .is_err()
+    );
+    assert!(!output.to_path().unwrap().exists());
 }
 
 #[test]
@@ -420,7 +447,7 @@ fn old_schema_limits_native_paths_and_sql_cancel_fail_without_source_mutation() 
         .is_err()
     );
     assert_eq!(hash(&case.fixture.path), before);
-    case.edit("PRAGMA user_version=3;");
+    case.edit("PRAGMA user_version=4;");
     let mut request = case.request.clone();
     request.inspection = NativePath::UnixBytes(vec![b'a'; 32769]);
     assert!(SelectionReview::open(request, SelectionLimits::default(), flag(), |_| {}).is_err());
@@ -559,3 +586,45 @@ fn sqlite_progress_hook_honors_atomic_cancel_during_vm_execution() {
 }
 
 mod preparation_tests;
+
+#[test]
+fn managed_backup_cancel_at_last_page_retains_source_snapshot() -> Result<()> {
+    let case = Case::new();
+    let mut review = case.review();
+    let destination = case
+        .fixture
+        .path
+        .parent()
+        .unwrap()
+        .join("managed-canceled.sqlite3");
+    let file = std::fs::File::create(&destination)?;
+    let physical = crate::lightroom_migration_worker::identity::FileKey::of(&file)?;
+    drop(file);
+    let cancel = flag();
+    let request_cancel = cancel.clone();
+    let token = review.summary().token.clone();
+    let result = review.backup_managed(
+        &token,
+        &NativePath::from_path(&destination),
+        &physical,
+        cancel,
+        |progress| {
+            if progress.total == Some(progress.completed) {
+                request_cancel.store(true, Ordering::Release);
+            }
+        },
+        || Ok(()),
+    );
+    ensure!(
+        request_cancel.load(Ordering::Acquire),
+        "final page was not reached"
+    );
+    ensure!(result.is_err(), "late cancellation was not reported");
+    ensure!(
+        !review.plan.db.is_autocommit(),
+        "failed backup released source snapshot"
+    );
+    review.close_managed_destination()?;
+    review.plan.db.execute_batch("ROLLBACK")?;
+    Ok(())
+}

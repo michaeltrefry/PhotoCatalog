@@ -764,7 +764,7 @@ fn path_clone(path: &NativePath) -> Result<usize> {
 /// lengths are added here, so no generated-Policy path/identity shortcut is used.
 /// Manifest and seal roots stay in their real stack owners, not invented Boxes.
 /// Compression/SQLite/runtime workspace is distinct from these payload graphs.
-pub(crate) fn artifact_constructor(request: &ArtifactRequest) -> Result<usize> {
+fn artifact_constructor_with_clone(clone: usize) -> Result<usize> {
     let record = capture_record()?;
     // selected_capture: raw seal R, compressed R+32768 and growing decoded raw
     // <=2*(R+1)+8 plus its old <=R+1 backing at realloc, seal graph/
@@ -789,19 +789,6 @@ pub(crate) fn artifact_constructor(request: &ArtifactRequest) -> Result<usize> {
     )?;
     // Artifact clone payload is a subset of Manifest's exact owned strings and
     // native units. Its upper M accounts the complete original encoded document.
-    let clone = add(
-        add(MANIFEST_BYTES, 1)?,
-        add(
-            add(
-                path_clone(&request.mapping.root)?,
-                path_clone(&request.mapping.relative)?,
-            )?,
-            add(
-                request.mapping.copy_identity.object.len(),
-                request.mapping.copy_identity.changed.len(),
-            )?,
-        )?,
-    )?;
     let manifest_validation = add(
         field_bytes,
         add(manifest_dynamic()?, mul(3, MANIFEST_BYTES)?)?,
@@ -827,6 +814,68 @@ pub(crate) fn artifact_constructor(request: &ArtifactRequest) -> Result<usize> {
             )?,
         )?,
     )?))
+}
+
+pub(crate) fn artifact_constructor(request: &ArtifactRequest) -> Result<usize> {
+    let clone = add(
+        add(MANIFEST_BYTES, 1)?,
+        add(
+            add(
+                path_clone(&request.mapping.root)?,
+                path_clone(&request.mapping.relative)?,
+            )?,
+            add(
+                request.mapping.copy_identity.object.len(),
+                request.mapping.copy_identity.changed.len(),
+            )?,
+        )?,
+    )?;
+    artifact_constructor_with_clone(clone)
+}
+
+/// The retained artifact request comes from the existing 64 KiB destination
+/// descriptor. Native units and identity strings are all encoded in that same
+/// descriptor; two bytes of retained native backing per encoded byte covers
+/// either platform without imposing a new path or descriptor limit.
+fn artifact_constructor_maximum() -> Result<usize> {
+    artifact_constructor_with_clone(add(add(MANIFEST_BYTES, 1)?, mul(2, DESCRIPTOR_BYTES)?)?)
+}
+
+/// Complete core phase accepted by the managed migration API. The Source relay
+/// retains only the largest core phase, so these independently admitted
+/// artifact, retention and file-metadata families are maxima rather than a sum.
+pub(crate) fn managed_migration_core_maximum(source_result_bytes: usize) -> Result<usize> {
+    let record = record_dynamic(RETAINED_BYTES, 1)?;
+    let preprojection = add(
+        saved_state_retained()?,
+        add(
+            record,
+            add(
+                file_metadata_projection_work(FILE_METADATA_PACKET_RECORDS)?,
+                add(4096, DESCRIPTOR_BYTES)?,
+            )?,
+        )?,
+    )?;
+    // The Requested ledger can retain the importer construction beside two
+    // historical/supplemental preparations and the supplemental request clone.
+    // Each source record and supplemental identity originates in one existing
+    // 8 MiB retained record; no format limit is introduced here.
+    let file_metadata = add(
+        preprojection,
+        add(
+            mul(2, file_metadata_selected(FILE_METADATA_PACKET_RECORDS)?)?,
+            add(
+                mul(
+                    2,
+                    file_metadata_projection_work(FILE_METADATA_PACKET_RECORDS)?,
+                )?,
+                add(record, RETAINED_BYTES)?,
+            )?,
+        )?,
+    )?;
+    Ok(artifact_constructor_maximum()?
+        .max(retention(source_result_bytes)?)
+        .max(file_metadata))
 }
 
 /// lookup::authority accepts direct public InputSeal serde, then only checks

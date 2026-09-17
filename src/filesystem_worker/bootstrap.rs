@@ -183,6 +183,7 @@ pub(super) struct PreparationProgress {
 
 struct RootRecord {
     bootstrap: CatalogBootstrap,
+    original_roots: Vec<NativePath>,
     root: File,
     catalog: Option<File>,
     manifest: Option<File>,
@@ -193,6 +194,8 @@ struct RootRecord {
     stages: super::preview_stage::Owner,
     export_executor: super::export_executor::Owner,
     export_stage: super::export_stage::Owner,
+    metadata_files: super::metadata_files::Owner,
+    import: super::import::Owner,
     export_profile: Option<ExportProfileTransfer>,
     export_profile_terminal: Option<ExportProfileTerminal>,
     export_original: Option<ExportOriginalTransfer>,
@@ -323,6 +326,22 @@ impl BootstrapOwner {
         }
     }
 
+    pub fn storage_call(
+        &self,
+        request: &crate::catalog_session::storage::Request,
+        cancel: &AtomicBool,
+    ) -> Result<crate::catalog_session::storage::Reply> {
+        request.validate()?;
+        self.with_root(&request.root, |_| {
+            let value = crate::catalog_session::storage::execute(&request.action, cancel)?;
+            let reply = crate::catalog_session::storage::Reply {
+                request: request.clone(),
+                value,
+            };
+            reply.validate(request)?;
+            Ok(reply)
+        })
+    }
     pub fn progress(&self) -> Option<&PreparationProgress> {
         self.progress.as_ref()
     }
@@ -481,6 +500,7 @@ impl BootstrapOwner {
         bootstrap.validate()?;
         let record = RootRecord {
             bootstrap: bootstrap.clone(),
+            original_roots: self.original_roots.clone(),
             root,
             catalog: Some(catalog),
             manifest: Some(manifest),
@@ -491,6 +511,8 @@ impl BootstrapOwner {
             stages: super::preview_stage::Owner::default(),
             export_executor: super::export_executor::Owner::default(),
             export_stage: super::export_stage::Owner::default(),
+            metadata_files: super::metadata_files::Owner::default(),
+            import: super::import::Owner::default(),
             export_profile: None,
             export_profile_terminal: None,
             export_original: None,
@@ -581,6 +603,10 @@ impl BootstrapOwner {
                 "export executor lock has not been released"
             );
             ensure!(
+                record.import.empty(),
+                "managed import custody has not drained"
+            );
+            ensure!(
                 record.export_profile.is_none(),
                 "export profile transfer has not drained"
             );
@@ -591,6 +617,10 @@ impl BootstrapOwner {
             ensure!(
                 record.export_publication.is_none(),
                 "export publication lease has not drained"
+            );
+            ensure!(
+                record.metadata_files.empty(),
+                "metadata file transfer has not drained"
             );
             record.objects.drain();
             record.store.release()?;
@@ -682,6 +712,31 @@ impl BootstrapOwner {
             )?));
         }
         let result = record.export_stage.call(manifest, request, cancel);
+        record.verify_root_binding()?;
+        result
+    }
+
+    pub fn metadata_files_call(
+        &mut self,
+        request: &crate::catalog_session::metadata_files::Request,
+        cancel: &AtomicBool,
+    ) -> Result<crate::catalog_session::metadata_files::Reply> {
+        ensure!(
+            self.progress
+                .as_ref()
+                .is_some_and(|p| p.state == PreparationState::Confirmed),
+            "metadata files require confirmed SQL admission"
+        );
+        let record = self
+            .record
+            .as_mut()
+            .context("metadata files catalog root is not retained")?;
+        ensure!(
+            request.root == record.bootstrap.root_capability(),
+            "metadata file session mismatch"
+        );
+        record.verify_root_binding()?;
+        let result = record.metadata_files.call(request, cancel);
         record.verify_root_binding()?;
         result
     }
@@ -779,7 +834,7 @@ impl BootstrapOwner {
         );
         let result = record.store.execute(
             &record.bootstrap,
-            &self.original_roots,
+            &record.original_roots,
             request,
             cancel,
             publish,
@@ -809,6 +864,128 @@ impl BootstrapOwner {
     }
     pub fn require_jobs_released(&self, root: &RootCapability) -> Result<()> {
         self.with_root(root, catalog_backup::require_jobs_released)
+    }
+    pub fn import_call(
+        &mut self,
+        request: &crate::catalog_session::import::Request,
+        cancel: &AtomicBool,
+    ) -> Result<crate::catalog_session::import::Reply> {
+        request.validate()?;
+        ensure!(
+            self.progress
+                .as_ref()
+                .is_some_and(|p| p.state == PreparationState::Confirmed),
+            "managed import requires confirmed SQL admission"
+        );
+        let record = self
+            .record
+            .as_mut()
+            .context("catalog filesystem root is not retained")?;
+        ensure!(
+            request.root == record.bootstrap.root_capability(),
+            "managed import belongs to another catalog session"
+        );
+        let root = record.verify_root_binding()?;
+        let cache_roots = if matches!(
+            &request.action,
+            crate::catalog_session::import::Action::Begin { .. }
+        ) {
+            let mut roots = record.store.protected_roots()?;
+            roots.push(
+                record
+                    .bootstrap
+                    .manifest
+                    .path
+                    .to_path()?
+                    .parent()
+                    .context("preview manifest parent")?
+                    .to_path_buf(),
+            );
+            roots
+        } else {
+            Vec::new()
+        };
+        let result = record.import.call_managed(
+            &root,
+            &cache_roots,
+            &mut record.original_roots,
+            request,
+            cancel,
+        );
+        record.verify_root_binding()?;
+        result
+    }
+
+    pub fn restore_original_root(
+        &mut self,
+        request: &crate::catalog_session::RestoreOriginalRootRequest,
+        cancel: &AtomicBool,
+    ) -> Result<crate::catalog_session::RestoreOriginalRootReply> {
+        request.validate()?;
+        check_cancel(cancel)?;
+        ensure!(
+            self.progress
+                .as_ref()
+                .is_some_and(|progress| progress.state == PreparationState::Confirmed),
+            "original-root restoration requires confirmed SQL admission"
+        );
+        let record = self
+            .record
+            .as_mut()
+            .context("catalog filesystem root is not retained")?;
+        ensure!(
+            request.root == record.bootstrap.root_capability()
+                && request.manifest_physical == record.bootstrap.manifest.physical,
+            "original-root restoration belongs to another catalog manifest"
+        );
+        let catalog = record.verify_root_binding()?;
+        let original = request.original.to_path()?;
+        ensure!(
+            !original.starts_with(&catalog) && !catalog.starts_with(&original),
+            "catalog and originals must be separate directories"
+        );
+        let mut cache_roots = record.store.protected_roots()?;
+        cache_roots.push(
+            record
+                .bootstrap
+                .manifest
+                .path
+                .to_path()?
+                .parent()
+                .context("preview manifest parent")?
+                .to_path_buf(),
+        );
+        for cache in cache_roots {
+            ensure!(
+                !original.starts_with(&cache) && !cache.starts_with(&original),
+                "original root overlaps preview storage"
+            );
+        }
+        // Convert one retained root at a time. Besides avoiding an unnecessary
+        // aggregate allocation, this keeps the active conversion backing at one
+        // bounded native path in the metadata-capacity formula.
+        let mut duplicate = false;
+        for existing in &record.original_roots {
+            if existing.to_path()? == original {
+                duplicate = true;
+                break;
+            }
+        }
+        let mut roots = record.original_roots.clone();
+        if !duplicate {
+            ensure!(
+                roots.len() < crate::catalog_session::import::ORIGINAL_ROOTS,
+                "admitted original root count exceeds bound"
+            );
+            roots.push(request.original.clone());
+        }
+        crate::catalog_session::import::validate_original_root_registry(&roots)?;
+        check_cancel(cancel)?;
+        record.original_roots = roots;
+        record.verify_root_binding()?;
+        Ok(crate::catalog_session::RestoreOriginalRootReply {
+            request: request.clone(),
+        })
     }
     pub fn prepare_export_directory(
         &self,
@@ -1007,7 +1184,10 @@ impl BootstrapOwner {
             Ok(reply)
         })
     }
-    fn export_original_path(&self, requested: &NativePath) -> Result<PathBuf> {
+    fn export_original_path(
+        original_roots: &[NativePath],
+        requested: &NativePath,
+    ) -> Result<PathBuf> {
         let path = requested.to_path()?;
         let parent = path
             .parent()
@@ -1015,7 +1195,7 @@ impl BootstrapOwner {
             .canonicalize()?;
         let normalized = parent.join(path.file_name().context("original filename required")?);
         let mut admitted = false;
-        for root in &self.original_roots {
+        for root in original_roots {
             if let Ok(root) = root.to_path()?.canonicalize()
                 && normalized.starts_with(root)
             {
@@ -1036,10 +1216,15 @@ impl BootstrapOwner {
     ) -> Result<InspectedExportOriginal> {
         request.validate()?;
         original_cancel(cancel)?;
+        let original_roots = &self
+            .record
+            .as_ref()
+            .context("catalog filesystem root is not retained")?
+            .original_roots;
         self.with_root(&request.root, |_| {
             // Authenticate and revalidate the retained catalog root before
             // resolving or opening any caller-supplied original path.
-            let path = self.export_original_path(&request.requested)?;
+            let path = Self::export_original_path(original_roots, &request.requested)?;
             let mut canceled_while_reading = false;
             let revision = crate::metadata_export::inspect_file_revision_with_checkpoint(
                 &path,
@@ -1119,7 +1304,13 @@ impl BootstrapOwner {
             }
         }
         let candidate = if matches!(request.action, ExportOriginalAction::Begin) {
-            let path = self.export_original_path(&request.requested)?;
+            let path = {
+                let record = self
+                    .record
+                    .as_ref()
+                    .context("export original catalog root is not retained")?;
+                Self::export_original_path(&record.original_roots, &request.requested)?
+            };
             original_cancel(cancel)?;
             let mut canceled_while_reading = false;
             let verified = crate::metadata_export::VerifiedFile::read_with_checkpoint(

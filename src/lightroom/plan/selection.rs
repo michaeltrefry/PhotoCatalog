@@ -62,31 +62,43 @@ impl Default for SelectionLimits {
     }
 }
 impl SelectionLimits {
+    pub(crate) fn metadata_maximum() -> Self {
+        Self {
+            review_bytes: 256 * 1024 * 1024,
+            row_bytes: MANIFEST_BYTES,
+            page_bytes: PAGE_BYTES,
+            native_path_units: 1024 * 1024,
+            snapshot_bytes: i64::MAX as u64,
+            vm_steps: 100_000_000_000,
+            deadline_ms: 3_600_000,
+        }
+    }
     fn validate(self) -> Result<()> {
+        let maximum = Self::metadata_maximum();
         ensure!(
-            (1024..=256 * 1024 * 1024).contains(&self.review_bytes),
+            (1024..=maximum.review_bytes).contains(&self.review_bytes),
             "selection review byte limit"
         );
         ensure!(
-            (1024..=MANIFEST_BYTES).contains(&self.row_bytes)
+            (1024..=maximum.row_bytes).contains(&self.row_bytes)
                 && self.row_bytes <= self.review_bytes,
             "selection row byte limit"
         );
         ensure!(
-            (1024..=PAGE_BYTES).contains(&self.page_bytes),
+            (1024..=maximum.page_bytes).contains(&self.page_bytes),
             "selection page byte limit"
         );
         ensure!(
-            (1..=1024 * 1024).contains(&self.native_path_units),
+            (1..=maximum.native_path_units).contains(&self.native_path_units),
             "selection native-path limit"
         );
         ensure!(
-            self.snapshot_bytes > 0 && self.snapshot_bytes <= i64::MAX as u64,
+            self.snapshot_bytes > 0 && self.snapshot_bytes <= maximum.snapshot_bytes,
             "selection snapshot byte limit"
         );
         ensure!(
-            (1000..=100_000_000_000).contains(&self.vm_steps)
-                && (1..=3_600_000).contains(&self.deadline_ms),
+            (1000..=maximum.vm_steps).contains(&self.vm_steps)
+                && (1..=maximum.deadline_ms).contains(&self.deadline_ms),
             "selection execution limits"
         );
         Ok(())
@@ -124,11 +136,68 @@ impl FamilyDecision {
         }
     }
 }
+
+fn validated_decisions<'a>(
+    report: &FamilyReport,
+    request: &'a SelectionRequest,
+) -> Result<(BTreeMap<&'a str, &'a FamilyDecision>, usize)> {
+    let decisions: BTreeMap<_, _> = request
+        .families
+        .iter()
+        .map(|decision| (decision.family(), decision))
+        .collect();
+    ensure!(
+        decisions.len() == request.families.len() && decisions.len() == report.families.len(),
+        "family decisions must partition every family exactly once"
+    );
+    let mut selected = 0;
+    for family in &report.families {
+        let decision = decisions
+            .get(family.id.as_str())
+            .context("family has no explicit selection or exclusion")?;
+        ensure!(
+            decision.evidence() == family.evidence_digest,
+            "family evidence changed; review again"
+        );
+        if let FamilyDecision::Select { revision, .. } = decision {
+            ensure!(
+                family.selected.as_ref() == Some(revision),
+                "selection differs from current explicit family choice"
+            );
+            selected += 1;
+        }
+    }
+    ensure!(
+        selected > 0,
+        "selection must include at least one explicitly chosen capture"
+    );
+    Ok((decisions, selected))
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SelectionRequest {
     pub inspection: NativePath,
     pub families: Vec<FamilyDecision>,
+}
+
+impl Plan {
+    /// Reject semantic selection mistakes while the writable inspection remains
+    /// available. The owned reader repeats every check after the writer closes.
+    pub(crate) fn preflight_selection(
+        &self,
+        request: &SelectionRequest,
+        limits: SelectionLimits,
+    ) -> Result<()> {
+        limits.validate()?;
+        ensure!(
+            !request.families.is_empty() && request.families.len() <= 256,
+            "explicit complete family decision roster required"
+        );
+        bounded_json(request, limits.review_bytes)?;
+        let report = self.families()?;
+        validated_decisions(&report, request)?;
+        Ok(())
+    }
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -156,6 +225,34 @@ pub struct ApprovalDocument {
     pub policy: Policy,
     pub supplements: Vec<SupplementPin>,
     pub authorization: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalDraft {
+    pub protocol: u32,
+    pub review_token: String,
+    pub destination: NativePath,
+    pub import_source: String,
+    pub overlap: crate::catalog_migration::importer::OverlapPolicy,
+    pub keyword_overlap: crate::catalog_migration::importer::KeywordOverlap,
+    pub artifacts: Vec<ExactDocument>,
+    pub supplements: Vec<ExactDocument>,
+    pub authorization: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExactDocument {
+    pub json: String,
+    pub blake3: String,
+}
+pub const APPROVAL_ROSTER_LIMIT: usize = 4_096;
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalDocuments {
+    pub approval_json: String,
+    pub approval_blake3: String,
+    pub policy_json: String,
+    pub policy_blake3: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CaptureEvidence {
@@ -230,6 +327,7 @@ struct ReviewEvidence {
     choices: Vec<(String, String, String, String)>,
     inventories: Vec<String>,
 }
+mod approval_factory;
 mod preparation;
 pub use preparation::{
     PREPARATION_CHUNK_BYTES, PREPARATION_PAGE_ROWS, PreparationChunk, PreparationDocument,
@@ -239,11 +337,29 @@ pub use preparation::{
 pub struct SelectionReview {
     // Close SQLite before the source descriptor. No writable Plan escapes.
     plan: Plan,
-    guard: Source,
+    guard: Option<Source>,
+    managed_identity: Option<crate::catalog_session::PhysicalObjectId>,
+    // A failed SQL12 operation retains its destination until checked close or W reap.
+    managed_destination: Option<Connection>,
     version: i64,
     companion_objects: Vec<String>,
     summary: ReviewSummary,
     evidence: ReviewEvidence,
+}
+
+pub(crate) fn metadata_layouts() -> (usize, usize, usize, usize, usize) {
+    (
+        std::mem::size_of::<SelectionReview>(),
+        std::mem::size_of::<SelectionRequest>(),
+        std::mem::size_of::<ApprovalDocument>(),
+        std::mem::size_of::<ApprovalDraft>(),
+        std::mem::size_of::<ApprovalDocuments>(),
+    )
+}
+
+pub(crate) struct ManagedReviewOpenError {
+    pub(crate) plan: Option<Box<Plan>>,
+    pub(crate) error: anyhow::Error,
 }
 
 struct Budget {
@@ -494,12 +610,47 @@ fn preadmit(db: &Connection, limits: SelectionLimits) -> Result<()> {
 }
 
 impl SelectionReview {
+    pub(crate) fn close_checked(mut self) -> std::result::Result<(), (Box<Self>, anyhow::Error)> {
+        if let Err(error) = self.close_managed_destination() {
+            return Err((Box::new(self), error));
+        }
+        let Self {
+            plan,
+            guard,
+            managed_identity,
+            managed_destination,
+            version,
+            companion_objects,
+            summary,
+            evidence,
+        } = self;
+        match plan.close_checked() {
+            Ok(()) => Ok(()),
+            Err((plan, error)) => Err((
+                Box::new(Self {
+                    plan: *plan,
+                    guard,
+                    managed_identity,
+                    managed_destination,
+                    version,
+                    companion_objects,
+                    summary,
+                    evidence,
+                }),
+                error,
+            )),
+        }
+    }
     /// Bind both this review's held source and SQLite's actually opened object
     /// to the workbench's existing descriptor. No incidental same-inode FD is
     /// opened/closed here (important for POSIX process-scoped SQLite locks).
     pub(crate) fn verify_inspection_owner(&self, expected: &Source) -> Result<()> {
+        let guard = self
+            .guard
+            .as_ref()
+            .context("managed selection has no local source guard")?;
         ensure!(
-            self.guard.before.object == expected.before.object,
+            guard.before.object == expected.before.object,
             "selection opened a different inspection object; reopen workbench explicitly"
         );
         crate::catalog_storage::verify_database_object(&self.plan.db, &expected.file)
@@ -510,170 +661,239 @@ impl SelectionReview {
         cancel: Arc<AtomicBool>,
         mut progress: impl FnMut(SelectionProgress),
     ) -> Result<Self> {
-        limits.validate()?;
+        Self::open_inner(request, limits, cancel, &mut progress, None)
+            .map_err(|failure| failure.error)
+    }
+    pub(crate) fn open_managed(
+        request: SelectionRequest,
+        limits: SelectionLimits,
+        cancel: Arc<AtomicBool>,
+        expected: &crate::lightroom_migration_worker::identity::FileKey,
+        mut progress: impl FnMut(SelectionProgress),
+    ) -> std::result::Result<Self, ManagedReviewOpenError> {
+        Self::open_inner(
+            request,
+            limits,
+            cancel,
+            &mut progress,
+            Some(super::physical(expected)),
+        )
+    }
+    fn open_inner(
+        request: SelectionRequest,
+        limits: SelectionLimits,
+        cancel: Arc<AtomicBool>,
+        progress: &mut impl FnMut(SelectionProgress),
+        managed_identity: Option<crate::catalog_session::PhysicalObjectId>,
+    ) -> std::result::Result<Self, ManagedReviewOpenError> {
+        macro_rules! before_plan {
+            ($value:expr) => {
+                match $value {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return Err(ManagedReviewOpenError {
+                            plan: None,
+                            error: error.into(),
+                        });
+                    }
+                }
+            };
+        }
+        before_plan!(limits.validate());
         let until = Instant::now() + Duration::from_millis(limits.deadline_ms);
-        check(&cancel, until)?;
-        ensure!(
-            !request.families.is_empty() && request.families.len() <= 256,
-            "explicit complete family decision roster required"
-        );
-        bounded_json(&request, limits.review_bytes)?;
-        let path = local(&request.inspection, limits.native_path_units)?;
-        let guard = Source::open(&path, limits.snapshot_bytes)?;
-        let read_mode = companions(&path)?;
-        let initial_companions = companion_objects(&path, read_mode)?;
+        before_plan!(check(&cancel, until));
+        if request.families.is_empty() || request.families.len() > 256 {
+            return Err(ManagedReviewOpenError {
+                plan: None,
+                error: anyhow::anyhow!("explicit complete family decision roster required"),
+            });
+        }
+        before_plan!(bounded_json(&request, limits.review_bytes));
+        let path = before_plan!(local(&request.inspection, limits.native_path_units));
+        let guard = if managed_identity.is_none() {
+            Some(before_plan!(Source::open(&path, limits.snapshot_bytes)))
+        } else {
+            None
+        };
+        let read_mode = if managed_identity.is_some() {
+            InspectionReadMode::ClosedMain
+        } else {
+            before_plan!(companions(&path))
+        };
+        let initial_companions = if managed_identity.is_some() {
+            vec![]
+        } else {
+            before_plan!(companion_objects(&path, read_mode))
+        };
         // immutable is safe only for fenced main-only custody, never live WAL.
         // Genuine RO SQLite may otherwise create companions for a closed file
         // whose header retains WAL mode, which review must not do.
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let db = match read_mode {
             InspectionReadMode::ClosedMain => {
-                Connection::open_with_flags(super::uri(&path)?, flags | OpenFlags::SQLITE_OPEN_URI)?
+                let uri = before_plan!(super::uri(&path));
+                before_plan!(Connection::open_with_flags(
+                    uri,
+                    flags | OpenFlags::SQLITE_OPEN_URI,
+                ))
             }
-            InspectionReadMode::LiveWal => Connection::open_with_flags(&path, flags)?,
+            InspectionReadMode::LiveWal => {
+                before_plan!(Connection::open_with_flags(&path, flags))
+            }
         };
-        crate::catalog_storage::verify_database_object(&db, &guard.file)?;
-        db.busy_timeout(Duration::ZERO)?;
-        db.execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF; PRAGMA mmap_size=0; PRAGMA cache_size=-8192; PRAGMA temp_store=FILE;")?;
-        let app: i64 = db.query_row("PRAGMA application_id", [], |r| r.get(0))?;
-        let schema: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        ensure!(
-            app == 0x50434c49 && schema == PLAN_SCHEMA_VERSION,
-            "selection requires existing schema3 inspection; old evidence was not migrated"
-        );
-        let baseline = version(&db)?;
         let plan = Plan {
             db,
             execution: None,
             root: path
                 .parent()
-                .context("inspection parent absent")?
+                .expect("admitted absolute inspection has a parent")
                 .to_path_buf(),
         };
-        let budget = SqlBudget::new(&plan.db, limits, cancel.clone());
-        let tx = plan.db.unchecked_transaction()?;
-        preadmit(&plan.db, limits)?;
-        progress(SelectionProgress {
-            phase: "reviewing".into(),
-            completed: 0,
-            total: None,
-        });
-        check(&cancel, until)?;
-        let report = plan.families_in_snapshot()?;
-        let decisions: BTreeMap<_, _> = request.families.iter().map(|d| (d.family(), d)).collect();
-        ensure!(
-            decisions.len() == request.families.len() && decisions.len() == report.families.len(),
-            "family decisions must partition every family exactly once"
-        );
-        let mut captures = Vec::new();
-        let mut selected = 0;
-        for family in &report.families {
-            check(&cancel, until)?;
-            let decision = decisions
-                .get(family.id.as_str())
-                .context("family has no explicit selection or exclusion")?;
-            ensure!(
-                decision.evidence() == family.evidence_digest,
-                "family evidence changed; review again"
-            );
-            let chosen = match decision {
-                FamilyDecision::Select { revision, .. } => {
-                    ensure!(
-                        family.selected.as_ref() == Some(revision),
-                        "selection differs from current explicit family choice"
-                    );
-                    selected += 1;
-                    Some(revision.as_str())
-                }
-                FamilyDecision::Exclude { .. } => None,
-            };
-            for member in &family.members {
-                native(&member.source, limits.native_path_units)?;
-                let manifest: String = plan.db.query_row(
-                    "SELECT manifest FROM captures WHERE revision=?",
-                    [&member.revision_id],
-                    |r| r.get(0),
+        let admitted = (|| -> Result<(i64, ReviewEvidence, ReviewSummary)> {
+            if let Some(guard) = &guard {
+                crate::catalog_storage::verify_database_object(&plan.db, &guard.file)?;
+            } else {
+                crate::catalog_storage::verify_database_identity(
+                    &plan.db,
+                    managed_identity
+                        .as_ref()
+                        .context("managed review identity")?,
                 )?;
-                captures.push(CaptureEvidence {
-                    revision: member.revision_id.clone(),
-                    family: family.id.clone(),
-                    selected: chosen == Some(member.revision_id.as_str()),
-                    manifest_blake3: controlled_digest(manifest.as_bytes(), &cancel, until)?,
-                    evidence_revision: member.inspection_evidence_revision,
-                    stage: member.row_stage.clone(),
-                });
             }
-        }
-        ensure!(
-            selected > 0,
-            "selection must include at least one explicitly chosen capture"
-        );
-        captures.sort_by(|a, b| a.revision.cmp(&b.revision));
-        let choices = plan
+            plan.db.busy_timeout(Duration::ZERO)?;
+            plan.db.execute_batch("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF; PRAGMA mmap_size=0; PRAGMA cache_size=-8192; PRAGMA temp_store=FILE;")?;
+            let app: i64 = plan
+                .db
+                .query_row("PRAGMA application_id", [], |r| r.get(0))?;
+            let schema: i64 = plan.db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            ensure!(
+                app == 0x50434c49 && schema == PLAN_SCHEMA_VERSION,
+                "selection requires the current inspection schema; old evidence was not migrated"
+            );
+            let baseline = version(&plan.db)?;
+            let budget = SqlBudget::new(&plan.db, limits, cancel.clone());
+            let tx = plan.db.unchecked_transaction()?;
+            preadmit(&plan.db, limits)?;
+            progress(SelectionProgress {
+                phase: "reviewing".into(),
+                completed: 0,
+                total: None,
+            });
+            check(&cancel, until)?;
+            let report = plan.families_in_snapshot()?;
+            let (decisions, selected) = validated_decisions(&report, &request)?;
+            let mut captures = Vec::new();
+            for family in &report.families {
+                check(&cancel, until)?;
+                let decision = decisions
+                    .get(family.id.as_str())
+                    .context("family has no explicit selection or exclusion")?;
+                let chosen = match decision {
+                    FamilyDecision::Select { revision, .. } => Some(revision.as_str()),
+                    FamilyDecision::Exclude { .. } => None,
+                };
+                for member in &family.members {
+                    native(&member.source, limits.native_path_units)?;
+                    let manifest: String = plan.db.query_row(
+                        "SELECT manifest FROM captures WHERE revision=?",
+                        [&member.revision_id],
+                        |r| r.get(0),
+                    )?;
+                    captures.push(CaptureEvidence {
+                        revision: member.revision_id.clone(),
+                        family: family.id.clone(),
+                        selected: chosen == Some(member.revision_id.as_str()),
+                        manifest_blake3: controlled_digest(manifest.as_bytes(), &cancel, until)?,
+                        evidence_revision: member.inspection_evidence_revision,
+                        stage: member.row_stage.clone(),
+                    });
+                }
+            }
+            captures.sort_by(|a, b| a.revision.cmp(&b.revision));
+            let choices = plan
             .db
             .prepare(
                 "SELECT family,revision,evidence_digest,reason FROM family_choices ORDER BY family",
             )?
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let inventories = plan
-            .db
-            .prepare("SELECT digest FROM inventories ORDER BY digest")?
-            .query_map([], |r| r.get(0))?
-            .collect::<rusqlite::Result<Vec<String>>>()?;
-        let evidence = ReviewEvidence {
-            request,
-            report,
-            captures,
-            choices,
-            inventories,
-        };
-        let bytes = bounded_json(&evidence, limits.review_bytes)?;
-        let token = digest(&bounded_json(
-            &(
-                uuid::Uuid::new_v4().to_string(),
-                controlled_digest(&bytes, &cancel, until)?,
-            ),
-            1024,
-        )?);
-        tx.commit()?;
-        budget.check()?;
-        drop(budget);
-        ensure!(
-            version(&plan.db)? == baseline,
-            "inspection committed changes during review; review again"
-        );
-        guard.verify()?;
-        ensure!(
-            companions(&path)? == read_mode,
-            "inspection companion mode changed during review"
-        );
-        ensure!(
-            companion_objects(&path, read_mode)? == initial_companions,
-            "inspection companion object changed during review"
-        );
-        let summary = ReviewSummary {
-            protocol: 1,
-            token,
-            inspection: evidence.request.inspection.clone(),
-            limits,
-            read_mode,
-            families: evidence.report.families.len(),
-            selected,
-            excluded: evidence.captures.len() - selected,
-            inventory_complete: evidence.report.inventory_complete,
-            uninspected_candidates: evidence.report.uninspected_candidates.len(),
-            conflicts: evidence.report.conflict_count,
-            path_collisions: evidence.report.possible_path_collision_count,
-        };
-        Ok(Self {
-            plan,
-            guard,
-            version: baseline,
-            companion_objects: initial_companions,
-            summary,
-            evidence,
-        })
+            let inventories = plan
+                .db
+                .prepare("SELECT digest FROM inventories ORDER BY digest")?
+                .query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<Vec<String>>>()?;
+            let evidence = ReviewEvidence {
+                request,
+                report,
+                captures,
+                choices,
+                inventories,
+            };
+            let bytes = bounded_json(&evidence, limits.review_bytes)?;
+            let token = digest(&bounded_json(
+                &(
+                    uuid::Uuid::new_v4().to_string(),
+                    controlled_digest(&bytes, &cancel, until)?,
+                ),
+                1024,
+            )?);
+            tx.commit()?;
+            budget.check()?;
+            drop(budget);
+            ensure!(
+                version(&plan.db)? == baseline,
+                "inspection committed changes during review; review again"
+            );
+            if let Some(guard) = &guard {
+                guard.verify()?;
+                ensure!(
+                    companions(&path)? == read_mode,
+                    "inspection companion mode changed during review"
+                );
+                ensure!(
+                    companion_objects(&path, read_mode)? == initial_companions,
+                    "inspection companion object changed during review"
+                );
+            } else {
+                crate::catalog_storage::verify_database_identity(
+                    &plan.db,
+                    managed_identity
+                        .as_ref()
+                        .context("managed review identity")?,
+                )?;
+            }
+            let summary = ReviewSummary {
+                protocol: 1,
+                token,
+                inspection: evidence.request.inspection.clone(),
+                limits,
+                read_mode,
+                families: evidence.report.families.len(),
+                selected,
+                excluded: evidence.captures.len() - selected,
+                inventory_complete: evidence.report.inventory_complete,
+                uninspected_candidates: evidence.report.uninspected_candidates.len(),
+                conflicts: evidence.report.conflict_count,
+                path_collisions: evidence.report.possible_path_collision_count,
+            };
+            Ok((baseline, evidence, summary))
+        })();
+        match admitted {
+            Ok((baseline, evidence, summary)) => Ok(Self {
+                plan,
+                guard,
+                managed_identity,
+                managed_destination: None,
+                version: baseline,
+                companion_objects: initial_companions,
+                summary,
+                evidence,
+            }),
+            Err(error) => Err(ManagedReviewOpenError {
+                plan: Some(Box::new(plan)),
+                error,
+            }),
+        }
     }
     pub fn summary(&self) -> &ReviewSummary {
         &self.summary
@@ -739,18 +959,27 @@ impl SelectionReview {
             expected == self.summary.token,
             "selection review token differs"
         );
-        self.guard
-            .verify()
-            .context("inspection identity changed; review again")?;
-        crate::catalog_storage::verify_database_object(&self.plan.db, &self.guard.file)?;
-        ensure!(
-            companions(&self.guard.path)? == self.summary.read_mode,
-            "inspection companion mode changed; review again"
-        );
-        ensure!(
-            companion_objects(&self.guard.path, self.summary.read_mode)? == self.companion_objects,
-            "inspection companion object changed; review again"
-        );
+        if let Some(guard) = &self.guard {
+            guard
+                .verify()
+                .context("inspection identity changed; review again")?;
+            crate::catalog_storage::verify_database_object(&self.plan.db, &guard.file)?;
+            ensure!(
+                companions(&guard.path)? == self.summary.read_mode,
+                "inspection companion mode changed; review again"
+            );
+            ensure!(
+                companion_objects(&guard.path, self.summary.read_mode)? == self.companion_objects,
+                "inspection companion object changed; review again"
+            );
+        } else {
+            crate::catalog_storage::verify_database_identity(
+                &self.plan.db,
+                self.managed_identity
+                    .as_ref()
+                    .context("managed review identity")?,
+            )?;
+        }
         ensure!(
             version(&self.plan.db)? == self.version,
             "inspection committed changes; review again"

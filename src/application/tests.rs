@@ -32,6 +32,26 @@ fn decimal_and_native_path_wire_are_lossless() {
     }
 }
 
+#[test]
+fn preview_diagnostics_are_opt_in_on_the_wire() {
+    let request = Request::Preview {
+        catalog: "catalog".into(),
+        key: VariantKey::master("asset"),
+        tier: PreviewTier::Thumbnail,
+        interactive: false,
+        viewport: "grid".into(),
+        generation: U64(1),
+        foreground: false,
+        diagnostics: true,
+    };
+    let mut wire = serde_json::to_value(request).unwrap();
+    wire["args"].as_object_mut().unwrap().remove("diagnostics");
+    let Request::Preview { diagnostics, .. } = serde_json::from_value(wire).unwrap() else {
+        panic!()
+    };
+    assert!(!diagnostics);
+}
+
 pub(super) fn disconnected() -> Bridge {
     let shared = Arc::new(Shared {
         managed_catalog: false,
@@ -77,6 +97,7 @@ fn preview_request(generation: u64, key: &str) -> Request {
         viewport: "grid".into(),
         generation: U64(generation),
         foreground: false,
+        diagnostics: false,
     }
 }
 #[test]
@@ -654,6 +675,7 @@ fn canceled_hydration_keeps_blocked_reader_owned_without_blocking_foreground() -
         viewport: "selected".into(),
         generation: U64(1),
         foreground: true,
+        diagnostics: false,
     })?
     else {
         anyhow::bail!("preview")
@@ -814,6 +836,319 @@ fn checked_shutdown_returns_failed_drain_and_retries_same_actor() -> Result<()> 
         &root.path().join("catalog/import.lock"),
     )?);
     bridge.try_shutdown()?;
+    Ok(())
+}
+
+fn publication_actor(
+    base: &std::path::Path,
+    event: crate::import_preparation::Event,
+    behavior: crate::import_preparation::TestPublication,
+    reference: Option<crate::import_preparation::Reference>,
+    source_registered: bool,
+) -> Result<(Bridge, Actor)> {
+    let bridge = disconnected();
+    let mut actor = Actor::new(
+        Config {
+            worker_executable: std::env::current_exe()?,
+            cache_root: None,
+            original_roots: vec![base.join("originals")],
+            preview_policy: Default::default(),
+            preview_limits: Default::default(),
+            limits: Default::default(),
+            import_checkpoint: None,
+        },
+        bridge.0.shared.clone(),
+    );
+    actor.command(
+        Request::OpenExisting {
+            path: NativePath::from_path(&base.join("catalog")),
+        },
+        &Cancellation::default(),
+    )?;
+    let open = actor.open.as_mut().unwrap();
+    let preparation =
+        crate::import_preparation::Preparation::publication_test(&open.catalog, event, behavior)?;
+    let id = uuid::Uuid::new_v4().to_string();
+    open.import = Some(ImportTask {
+        import_lock: None,
+        preparation: Some(preparation),
+        reference,
+        status: ImportStatus {
+            id: id.clone(),
+            source: NativePath::from_path(&base.join("originals")),
+            phase: ImportPhase::Discovering,
+            imported: U64(0),
+            unchanged: U64(0),
+            failed: U64(0),
+            skipped: U64(0),
+            metadata_updated: U64(0),
+            metadata_warnings: U64(0),
+            awaiting_resources: U64(0),
+            pending_previews: 0,
+            error: None,
+            error_source: None,
+        },
+        consumers: Vec::new(),
+        cancel: Cancellation::default(),
+        source_registered,
+        discovery_finished: false,
+        failure: false,
+    });
+    Ok((bridge, actor))
+}
+
+fn publication_fixture(
+    base: &std::path::Path,
+) -> Result<(crate::import_preparation::Reference, PathBuf, String)> {
+    let originals = base.join("originals");
+    std::fs::create_dir(&originals)?;
+    let originals = originals.canonicalize()?;
+    let path = originals.join("source.png");
+    image::RgbImage::from_pixel(16, 12, image::Rgb([20u8, 40, 70])).save(&path)?;
+    let mut catalog = Catalog::open(base.join("catalog"))?;
+    let mut volumes = crate::import_storage::ImportVolumes::new();
+    let observation = volumes.observe(&path)?;
+    let reference = crate::import_preparation::Reference::begin(
+        &mut catalog,
+        crate::import_preparation::Header {
+            path: path.clone(),
+            fingerprint: crate::fingerprint(&path)?,
+            observation,
+        },
+    )?;
+    let asset = catalog.db.query_row(
+        "SELECT id FROM assets WHERE location=?1",
+        [crate::location_bytes(&path)],
+        |row| row.get(0),
+    )?;
+    Ok((reference, path, asset))
+}
+
+fn publication_counts(catalog: &Catalog, asset: &str) -> Result<(i64, i64, i64, i64)> {
+    Ok((
+        catalog.db.query_row(
+            "SELECT count(*) FROM metadata_sources WHERE asset_id=?1",
+            [asset],
+            |row| row.get(0),
+        )?,
+        catalog.db.query_row(
+            "SELECT count(*) FROM metadata_image_observations WHERE image_id=?1",
+            [asset],
+            |row| row.get(0),
+        )?,
+        catalog.db.query_row(
+            "SELECT count(*) FROM edit_variants WHERE asset_id=?1",
+            [asset],
+            |row| row.get(0),
+        )?,
+        catalog.db.query_row(
+            "SELECT count(*) FROM metadata_history WHERE asset_id=?1",
+            [asset],
+            |row| row.get(0),
+        )?,
+    ))
+}
+
+#[test]
+fn actor_cancel_discards_pending_storage_binding_without_repeating_reservation() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let originals = root.path().join("originals");
+    std::fs::create_dir(&originals)?;
+    let base = root.path().canonicalize()?;
+    let path = base.join("originals/source.png");
+    image::RgbImage::from_pixel(16, 12, image::Rgb([20u8, 40, 70])).save(&path)?;
+    drop(Catalog::open(base.join("catalog"))?);
+    let mut volumes = crate::import_storage::ImportVolumes::new();
+    let header = crate::import_preparation::Header {
+        path: path.clone(),
+        fingerprint: crate::fingerprint(&path)?,
+        observation: volumes.observe(&path)?,
+    };
+    let (_bridge, mut actor) = publication_actor(
+        &base,
+        crate::import_preparation::Event::Header(Box::new(header)),
+        crate::import_preparation::TestPublication::RejectRoot,
+        None,
+        true,
+    )?;
+
+    actor.maintain();
+    let open = actor.open.as_ref().unwrap();
+    let import = open.import.as_ref().unwrap();
+    assert!(import.reference.is_some() && !import.failure);
+    let (asset, generation, volume, file): (
+        String,
+        i64,
+        Option<String>,
+        Option<String>,
+    ) = open.catalog.db.query_row(
+        "SELECT a.id,a.render_generation,b.volume_id,b.file_key FROM assets a JOIN storage_bindings b ON b.asset_id=a.id WHERE a.location=?1",
+        [crate::location_bytes(&path)],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    assert_eq!((volume, file), (None, None));
+
+    let open = actor.open.as_mut().unwrap();
+    open.import
+        .as_mut()
+        .unwrap()
+        .request_cancel_owned(&mut open.service);
+    actor.maintain();
+
+    let open = actor.open.as_ref().unwrap();
+    let import = open.import.as_ref().unwrap();
+    assert_eq!(import.status.phase, ImportPhase::Canceled);
+    assert!(import.reference.is_none() && !import.failure);
+    let (after_generation, volume, file): (i64, Option<String>, Option<String>) =
+        open.catalog.db.query_row(
+            "SELECT a.render_generation,b.volume_id,b.file_key FROM assets a JOIN storage_bindings b ON b.asset_id=a.id WHERE a.id=?1",
+            [&asset],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+    assert_eq!(after_generation, generation);
+    assert_eq!((volume, file), (None, None));
+    Ok(())
+}
+
+#[test]
+fn actor_commits_observed_root_before_acknowledging_managed_walk() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    drop(Catalog::open(root.path().join("catalog"))?);
+    let base = root.path().canonicalize()?;
+    let configured = base.join("originals");
+    let selected = base.join("selected-now-offline");
+    let (_bridge, mut actor) = publication_actor(
+        &base,
+        crate::import_preparation::Event::Begun {
+            source: NativePath::from_path(&selected),
+        },
+        crate::import_preparation::TestPublication::AcceptRoot,
+        None,
+        false,
+    )?;
+    actor
+        .open
+        .as_mut()
+        .unwrap()
+        .service
+        .replace_original_root_review(std::slice::from_ref(&configured), 17)?;
+
+    actor.maintain();
+
+    let open = actor.open.as_ref().unwrap();
+    let import = open.import.as_ref().unwrap();
+    assert!(import.source_registered && !import.failure);
+    assert_eq!(import.status.source, NativePath::from_path(&selected));
+    let review = open.service.original_root_review()?;
+    assert_eq!(review.roots, vec![configured, selected]);
+    assert_eq!(review.storage_epoch, None);
+    Ok(())
+}
+
+#[test]
+fn actor_rejects_cache_root_before_managed_walk_acknowledgement() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    drop(Catalog::open(root.path().join("catalog"))?);
+    let cache = root
+        .path()
+        .canonicalize()?
+        .join("catalog/application-previews/thumbnail/inside");
+    let (_bridge, mut actor) = publication_actor(
+        root.path(),
+        crate::import_preparation::Event::Begun {
+            source: NativePath::from_path(&cache),
+        },
+        crate::import_preparation::TestPublication::RejectRoot,
+        None,
+        false,
+    )?;
+
+    actor.maintain();
+
+    let import = actor.open.as_ref().unwrap().import.as_ref().unwrap();
+    assert!(import.failure && !import.source_registered);
+    assert!(import.preparation.is_none());
+    assert!(
+        import
+            .status
+            .error
+            .as_deref()
+            .is_some_and(|message| message.contains("overlaps preview storage"))
+    );
+    Ok(())
+}
+
+#[test]
+fn actor_rejects_stale_sidecar_and_original_before_publication() -> Result<()> {
+    for sidecar in [true, false] {
+        let root = tempfile::tempdir()?;
+        let (reference, path, asset) = publication_fixture(root.path())?;
+        let catalog = Catalog::open(root.path().join("catalog"))?;
+        let before = publication_counts(&catalog, &asset)?;
+        drop(catalog);
+        let (event, behavior) = if sidecar {
+            let sidecar_path = path.with_extension("xmp");
+            let prepared = crate::catalog_metadata::prepare_import_failure(
+                crate::catalog_metadata::Source {
+                    kind: "sidecar".into(),
+                    locator: crate::location_bytes(&sidecar_path),
+                    display: sidecar_path.to_string_lossy().into_owned(),
+                    ambiguous: false,
+                    provenance: serde_json::json!({"fixture":"stale-before-commit"}),
+                },
+                "unreadable fixture".into(),
+                &AtomicBool::new(false),
+            )?;
+            (
+                crate::import_preparation::Event::Source(Box::new(prepared)),
+                crate::import_preparation::TestPublication::RejectInspection,
+            )
+        } else {
+            (
+                crate::import_preparation::Event::End,
+                crate::import_preparation::TestPublication::RejectFile,
+            )
+        };
+        let (_bridge, mut actor) =
+            publication_actor(root.path(), event, behavior, Some(reference), true)?;
+        actor.maintain();
+        let open = actor.open.as_ref().unwrap();
+        let import = open.import.as_ref().unwrap();
+        assert!(import.failure && import.consumers.is_empty());
+        assert_eq!(publication_counts(&open.catalog, &asset)?, before);
+    }
+    Ok(())
+}
+
+#[test]
+fn actor_lost_postcommit_release_cancels_consumer_and_keeps_receipt() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let (reference, _path, asset) = publication_fixture(root.path())?;
+    let (_bridge, mut actor) = publication_actor(
+        root.path(),
+        crate::import_preparation::Event::End,
+        crate::import_preparation::TestPublication::LoseFileRelease,
+        Some(reference),
+        true,
+    )?;
+    actor.maintain();
+    let open = actor.open.as_ref().unwrap();
+    let import = open.import.as_ref().unwrap();
+    assert!(import.failure && import.consumers.is_empty());
+    let receipts: i64 = open.catalog.db.query_row(
+        "SELECT count(*) FROM metadata_history WHERE asset_id=?1 AND action='import_filesystem_receipt'",
+        [&asset],
+        |row| row.get(0),
+    )?;
+    assert_eq!(receipts, 1);
+    let state: String =
+        open.catalog
+            .db
+            .query_row("SELECT state FROM assets WHERE id=?1", [&asset], |row| {
+                row.get(0)
+            })?;
+    assert_eq!(state, "pending");
+    assert_eq!(open.service.scheduler_usage().reserved_bytes, 0);
     Ok(())
 }
 

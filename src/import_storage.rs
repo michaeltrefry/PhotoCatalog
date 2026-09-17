@@ -97,7 +97,7 @@ impl ImportVolumes {
 
 /// A mount instance is transient evidence for a cache observation, never a volume ID.
 #[cfg(target_os = "linux")]
-fn mount_instance(path: &Path) -> Option<u64> {
+pub(crate) fn mount_instance(path: &Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
     let mut stat = std::mem::MaybeUninit::<libc::statx>::zeroed();
@@ -119,7 +119,7 @@ fn mount_instance(path: &Path) -> Option<u64> {
     (stat.stx_mask & libc::STATX_MNT_ID != 0).then_some(stat.stx_mnt_id)
 }
 #[cfg(not(target_os = "linux"))]
-fn mount_instance(_: &Path) -> Option<u64> {
+pub(crate) fn mount_instance(_: &Path) -> Option<u64> {
     None
 }
 

@@ -22,6 +22,7 @@ use anyhow::{Context, Result, ensure};
 use std::{
     collections::{HashMap, VecDeque},
     mem::{align_of, size_of},
+    path::Path,
     sync::{Arc, Mutex, atomic::AtomicBool},
     time::Instant,
 };
@@ -39,6 +40,18 @@ const LEASE_ID_BYTES: u64 = 36;
 const SOURCE_REVISION_OBJECT_BYTES: u64 = 20 + 1 + 39;
 const SOURCE_REVISION_CHANGED_BYTES: u64 = 20 + 1 + 20;
 
+#[cfg(unix)]
+fn native_path_units(path: &Path) -> Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    Ok(u64::try_from(path.as_os_str().as_bytes().len())?)
+}
+
+#[cfg(windows)]
+fn native_path_units(path: &Path) -> Result<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    Ok(u64::try_from(path.as_os_str().encode_wide().count())?)
+}
+
 #[derive(Clone, Copy)]
 struct Layout {
     size: u64,
@@ -51,6 +64,13 @@ impl Layout {
             align: align_of::<T>() as u64,
         }
     }
+}
+
+fn source_layout((size, align): (usize, usize)) -> Result<Layout> {
+    Ok(Layout {
+        size: u64::try_from(size)?,
+        align: u64::try_from(align)?,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -668,6 +688,107 @@ pub(crate) fn report(config: &Config) -> Result<Report> {
         active_fs,
         c.mul(2, FAILURE_BYTES)?,
     )?;
+    // F retains the configured registry for subsequent catalog sessions and a
+    // separate registry in the active RootRecord. Begin/restore may clone that
+    // RootRecord registry while validating one new candidate. `vec_growth`
+    // bounds outer Vec capacity. The nested formula applies the allocator-growth
+    // bound to the aggregate admitted bytes and includes the per-path Vec growth
+    // constant at the wider Windows element size. NativePath::to_path is
+    // performed serially, so only one maximum conversion coexists with a clone.
+    let original_root_count = crate::catalog_session::import::ORIGINAL_ROOTS as u64;
+    let original_root_bytes = crate::catalog_session::import::ORIGINAL_ROOT_BYTES as u64;
+    let original_root_nested_backings = c.add(&[
+        c.mul(3, original_root_bytes)?,
+        c.mul(16, original_root_count)?,
+    ])?;
+    let original_root_registry = c.add(&[
+        c.vec_growth(Layout::of::<NativePath>().size, original_root_count)?,
+        original_root_nested_backings,
+    ])?;
+    a.push(
+        "retained.filesystem_original_root_registries",
+        Phase::Retained,
+        2,
+        original_root_registry,
+    )?;
+    a.push(
+        "active.filesystem_original_root_registry_clone_and_conversion",
+        Phase::Active,
+        1,
+        c.add(&[original_root_registry, c.vec(2, PATH_UNITS as u64)?])?,
+    )?;
+    let (import_owner_size, import_owner_align) = crate::filesystem_worker::import_owner_layout();
+    let import_path = c.vec(2, PATH_UNITS as u64)?;
+    let import_fact_chunk = c.add(&[
+        c.vec_growth(
+            Layout::of::<crate::catalog_session::import::DirectoryFact>().size,
+            crate::catalog_session::import::DIRECTORY_FACTS as u64,
+        )?,
+        c.vec(
+            2,
+            crate::catalog_session::import::DIRECTORY_FACT_PATH_UNITS as u64,
+        )?,
+    ])?;
+    // F retains one bounded inspection envelope until C has committed its exact
+    // observation. Directory identities are fixed-width; paths live only in the
+    // current source/directory and one bounded fact reply. Exact retry retains
+    // one request/reply envelope pair alongside those domain objects.
+    a.push(
+        "retained.import_f_source_custody_and_transfer",
+        Phase::Retained,
+        1,
+        c.add(&[
+            c.align(
+                u64::try_from(import_owner_size)?,
+                u64::try_from(import_owner_align)?,
+            )?,
+            c.mul(4, LEASE_ID_BYTES)?,
+            c.mul(8, import_path)?,
+            c.mul(2, RELAY_BYTES)?,
+            c.mul(crate::catalog_session::import::MAX_DIRECTORIES as u64, 128)?,
+            import_fact_chunk,
+            crate::catalog_session::import::MAX_INSPECTION_BYTES as u64,
+        ])?,
+    )?;
+    // Packet extraction, compact-envelope construction, and its metadata JSON
+    // can coexist in F before the source packet/input vectors are released.
+    a.push(
+        "active.import_f_inspection_parse_and_encoding",
+        Phase::Active,
+        1,
+        c.add(&[
+            c.mul(
+                2,
+                crate::catalog_session::import::MAX_INSPECTION_BYTES as u64,
+            )?,
+            crate::catalog_session::import::MAX_INSPECTION_METADATA_BYTES as u64,
+        ])?,
+    )?;
+    // At peak F's retained envelope coexists with C's exact assembly, decoded
+    // packet/input bytes, and Prepared's copied blob graph. While a Storage
+    // call waits for relay admission, Reference retains the preceding Header's
+    // decoded volume observation. Charge that typed graph independently from
+    // relay-owned envelopes and the maximum directory fact chunk.
+    a.push(
+        "active.import_c_transfer_decode_and_preparation",
+        Phase::Active,
+        1,
+        c.add(&[
+            c.mul(
+                3,
+                crate::catalog_session::import::MAX_INSPECTION_BYTES as u64,
+            )?,
+            c.parse(
+                crate::catalog_session::import::MAX_INSPECTION_METADATA_BYTES as u64,
+                6,
+                crate::catalog_session::import::MAX_INSPECTION_METADATA_BYTES as u64,
+            )?,
+            wire_typed_graph(c, RELAY_BYTES)?,
+            c.mul(4, RELAY_BYTES)?,
+            c.mul(4, import_fact_chunk)?,
+            c.mul(8, CHUNK_BYTES)?,
+        ])?,
+    )?;
     a.push(
         "active.ready_batch_metadata_graphs",
         Phase::Active,
@@ -737,7 +858,17 @@ pub(crate) fn report(config: &Config) -> Result<Report> {
         c.parse(SAVED_DESCRIPTOR_BYTES, 2, actor_partial)?,
     )?;
 
-    // Private migration uses the same process reservation/shared ByteBudget.
+    // G receives this exact portion of the aggregate process reservation once.
+    // Each operation retains a clone of the transferred token; Source and
+    // result payloads use separate caller-funded pools.
+    a.push(
+        "retained.migration_coordinator_metadata_subgrant",
+        Phase::Retained,
+        1,
+        super::migration::metadata_requirement(config)?,
+    )?;
+
+    // Private migration relay storage remains in the process reservation.
     // One authority request and sixteen recovery requests have independent
     // bounded custody in G/C. Include both encodings, both incoming parsers,
     // queues, complete pins and snapshots; CHUNK only bounds individual frames.
@@ -1915,6 +2046,499 @@ pub(crate) fn report(config: &Config) -> Result<Report> {
             std::mem::size_of::<Mutex<Option<super::preview_metadata_admission::ProcessReservation>>>() as u64,
         ])?,
     )?;
+    let backup_owner = crate::application::backup::metadata_owner_layout();
+    let backup_owner = Layout {
+        size: u64::try_from(backup_owner.0)?,
+        align: u64::try_from(backup_owner.1)?,
+    };
+    let worker_path_units = native_path_units(&config.worker_executable)?;
+    let worker_path_backing = c.vec(2, worker_path_units)?;
+    let uuid_backing = c.vec_growth(1, crate::application::backup::UUID_BYTES as u64)?;
+    let digest_backing = c.vec_growth(1, crate::application::backup::DIGEST_BYTES as u64)?;
+    let backup_receipt_backing = c.add(&[
+        uuid_backing,
+        c.vec_growth(1, crate::application::backup::DIGEST_BYTES as u64)?,
+    ])?;
+    let restore_receipt_backing = c.add(&[uuid_backing, backup_receipt_backing])?;
+    let backup_failure_backing = c.vec_growth(1, crate::application::backup::ERROR_BYTES as u64)?;
+    let terminal_backing = restore_receipt_backing.max(backup_failure_backing);
+    let snapshot_backing = c.add(&[uuid_backing, terminal_backing])?;
+    let backup_response_bytes = (config.limits.reply_bytes as u64).max(c.add(&[
+        crate::application::backup::ERROR_BYTES as u64,
+        c.mul(3, crate::application::backup::UUID_BYTES as u64)?,
+        crate::application::backup::DIGEST_BYTES as u64,
+        1024,
+    ])?);
+    a.push(
+        "fixed.backup_g_coordinator_arc_backing",
+        Phase::Retained,
+        1,
+        c.arc(backup_owner)?,
+    )?;
+    a.push(
+        "retained.backup_g_executable_and_terminal_backings",
+        Phase::Retained,
+        1,
+        c.add(&[worker_path_backing, snapshot_backing])?,
+    )?;
+    a.push(
+        "active.backup_g_worker_owner_backings",
+        Phase::Active,
+        1,
+        c.add(&[
+            c.arc(Layout::of::<AtomicBool>())?,
+            c.arc(Layout::of::<
+                Mutex<Option<crate::application::backup::Progress>>,
+            >())?,
+            // The worker closure owns an executable clone, Prepared's two
+            // PathBufs and the managed request's two NativePaths. Thread runtime
+            // storage is excluded, but these five heap backings are not.
+            worker_path_backing,
+            c.mul(
+                4,
+                c.vec_growth(2, crate::application::backup::PATH_UNITS as u64)?,
+            )?,
+            uuid_backing,
+        ])?,
+    )?;
+    a.push(
+        "active.backup_g_status_clone_and_serialization",
+        Phase::Active,
+        1,
+        c.add(&[
+            Layout::of::<crate::application::backup::Snapshot>().size,
+            snapshot_backing,
+            // backup_reply_shared serializes before applying reply_bytes. The
+            // larger source-bounded terminal form can therefore coexist with
+            // its clone even when the configured success allowance is smaller.
+            c.vec_growth(1, backup_response_bytes)?,
+        ])?,
+    )?;
+
+    // Create and Close have independent fixed control slots and may coexist.
+    // The public Create bundle has crossed the whole-request byte check but is
+    // not reduced to PATH_UNITS until C returns its source admission.
+    let public_native_path_backing = c
+        .vec_growth(1, config.limits.request_bytes as u64)?
+        .max(c.vec_growth(2, config.limits.request_bytes as u64 / 2)?);
+    a.push(
+        "active.backup_g_public_request_validation",
+        Phase::Active,
+        1,
+        c.add(&[
+            Layout::of::<crate::application::backup::Request>().size,
+            c.mul(2, public_native_path_backing)?,
+            c.vec_growth(1, config.limits.request_bytes as u64)?,
+        ])?,
+    )?;
+    a.push(
+        "active.backup_g_create_control_backings",
+        Phase::Active,
+        1,
+        // C's admitted source path transfers from the charged private reply
+        // graph into the worker; the public bundle is the additional capture.
+        public_native_path_backing,
+    )?;
+    let cancel_arc = c.arc(Layout::of::<AtomicBool>())?;
+    let shared_notify = c.arc(Layout::of::<std::sync::Weak<super::Shared>>())?;
+    let cancel_slot = Layout::of::<Mutex<Option<crate::application::Cancellation>>>();
+    let cancel_slot_notify = c.arc(Layout::of::<
+        std::sync::Weak<Mutex<Option<crate::application::Cancellation>>>,
+    >())?;
+    a.push(
+        "active.backup_g_close_control_backings",
+        Phase::Active,
+        1,
+        c.add(&[
+            // The private request clone is in the relay typed graph; this is
+            // the original token retained for the later real Close.
+            c.vec_growth(1, super::backup::CATALOG_BYTES as u64)?,
+            c.arc(cancel_slot)?,
+            // Public Close cancellation and the later inner C Close each own
+            // one flag and one bounded notification closure environment.
+            c.mul(2, cancel_arc)?,
+            cancel_slot_notify,
+            shared_notify,
+        ])?,
+    )?;
+
+    // The generic pending tables already use ChildPending's exact enlarged
+    // layout and their admission limits did not change. Charge only the two
+    // backup-specific message graphs, parsers, typed values and cancellation
+    // allocations that can occupy those tables concurrently.
+    let backup_slots = 2u64;
+    let backup_request = config.limits.request_bytes as u64;
+    let backup_reply = (config.limits.reply_bytes as u64).max(super::wire::ERROR_BYTES as u64);
+    a.push(
+        "relay.backup_admission_complete_message_backings",
+        Phase::Active,
+        1,
+        c.add(&[
+            // Per fixed slot, the sender's Message can coexist with the
+            // receiver's complete Assembly in each direction. Parser scratch
+            // below excludes that already charged Assembly raw buffer.
+            c.mul(2 * backup_slots, backup_request)?,
+            c.mul(2 * backup_slots, backup_reply)?,
+            c.mul(4, CHUNK_BYTES)?,
+        ])?,
+    )?;
+    let [backup_request_root, backup_reply_root] = super::backup::metadata_layouts();
+    let backup_request_root = Layout {
+        size: u64::try_from(backup_request_root.0)?,
+        align: u64::try_from(backup_request_root.1)?,
+    };
+    let backup_reply_root = Layout {
+        size: u64::try_from(backup_reply_root.0)?,
+        align: u64::try_from(backup_reply_root.1)?,
+    };
+    let backup_request_typed = c.add(&[
+        backup_request_root.size,
+        c.vec_growth(1, super::backup::CATALOG_BYTES as u64)?,
+    ])?;
+    let backup_reply_typed = c.add(&[
+        backup_reply_root.size,
+        c.vec_growth(2, crate::application::backup::PATH_UNITS as u64)?
+            .max(c.vec_growth(1, super::wire::ERROR_BYTES as u64)?),
+    ])?;
+    a.push(
+        "relay.backup_admission_retained_typed_graphs",
+        Phase::Active,
+        2 * backup_slots,
+        backup_request_typed.max(backup_reply_typed),
+    )?;
+    a.push(
+        "relay.backup_admission_request_parser",
+        Phase::Active,
+        1,
+        c.parse(
+            backup_request,
+            6,
+            c.add(&[backup_request_root.size, c.vec_growth(1, backup_request)?])?,
+        )?
+        .checked_sub(backup_request)
+        .context("backup request parser raw accounting")?,
+    )?;
+    a.push(
+        "relay.backup_admission_reply_parser",
+        Phase::Active,
+        1,
+        c.parse(
+            backup_reply,
+            6,
+            c.add(&[
+                backup_reply_root.size,
+                c.vec_growth(1, backup_reply)?
+                    .max(c.vec_growth(2, backup_reply / 2)?),
+            ])?,
+        )?
+        .checked_sub(backup_reply)
+        .context("backup reply parser raw accounting")?,
+    )?;
+    a.push(
+        "relay.backup_admission_cancellation_backings",
+        Phase::Active,
+        backup_slots,
+        c.add(&[
+            // G's queued Entry owns a flag and Shared notification. C's actor
+            // Pending owns a second flag; clones share these allocations.
+            c.mul(2, cancel_arc)?,
+            shared_notify,
+        ])?,
+    )?;
+
+    // A running managed backup owns a second, independent F client/process and
+    // one B process. The generic relay/F envelope above funds the primary
+    // catalog filesystem generation only; these owners have distinct pipes,
+    // parsers, retained results and bounded channels for the whole backup.
+    let [
+        backup_startup,
+        _backup_request_root,
+        _backup_receipt_root,
+        backup_parent_root,
+        backup_child_root,
+        backup_parent_envelope,
+        backup_child_envelope,
+        _backup_output_item,
+        backup_output_sender,
+        backup_output_receiver,
+        backup_control_sender,
+        _backup_control_receiver,
+        backup_remote_filesystem,
+        backup_join,
+        backup_child_process,
+        backup_child_input,
+    ] = crate::catalog_backup::managed::transport_metadata_layouts().map(source_layout);
+    let backup_startup = backup_startup?;
+    let backup_parent_root = backup_parent_root?;
+    let backup_child_root = backup_child_root?;
+    let backup_parent_envelope = backup_parent_envelope?;
+    let backup_child_envelope = backup_child_envelope?;
+    let backup_output_sender = backup_output_sender?;
+    let backup_output_receiver = backup_output_receiver?;
+    let backup_control_sender = backup_control_sender?;
+    let backup_remote_filesystem = backup_remote_filesystem?;
+    let backup_join = backup_join?;
+    let backup_child_process = backup_child_process?;
+    let backup_child_input = backup_child_input?;
+    let backup_frame = crate::catalog_backup::managed::FRAME_BYTES as u64;
+    let backup_error = crate::catalog_backup::managed::ERROR_BYTES as u64;
+    let backup_output_slots = crate::catalog_backup::managed::OUTPUT_CHANNEL_SLOTS as u64;
+    let backup_control_slots = crate::catalog_backup::managed::CONTROL_CHANNEL_SLOTS as u64;
+    let (backup_output_channel, backup_control_channel) =
+        crate::catalog_backup::managed::transport_channel_backings()?;
+    let backup_output_channel = u64::try_from(backup_output_channel)?;
+    let backup_control_channel = u64::try_from(backup_control_channel)?;
+    let backup_path = c.vec_growth(2, crate::application::backup::PATH_UNITS as u64)?;
+    let backup_request_backing = c.mul(2, backup_path)?;
+    let backup_filesystem_message = c
+        .add(&[uuid_backing, c.mul(2, backup_path)?, backup_receipt_backing])?
+        .max(backup_error);
+    let backup_child_typed = c.add(&[
+        backup_child_envelope.size,
+        backup_child_root.size,
+        uuid_backing,
+        backup_filesystem_message.max(restore_receipt_backing),
+    ])?;
+    let backup_child_nested = c.add(&[
+        uuid_backing,
+        backup_filesystem_message.max(restore_receipt_backing),
+    ])?;
+    let backup_parent_typed = c.add(&[
+        backup_parent_envelope.size,
+        backup_parent_root.size,
+        uuid_backing,
+        backup_filesystem_message,
+    ])?;
+    let backup_parent_nested = c.add(&[uuid_backing, backup_filesystem_message])?;
+    // Before semantic validation one legal frame can devote nearly all JSON
+    // nodes to strings or either of two NativePath numeric arrays.
+    let backup_frame_partial =
+        c.add(&[backup_frame, c.mul(2, c.vec_growth(2, backup_frame / 2)?)?])?;
+    let backup_child_parse = c.parse(
+        backup_frame,
+        6,
+        c.add(&[
+            backup_child_envelope.size,
+            backup_child_root.size,
+            backup_frame_partial,
+        ])?,
+    )?;
+    let backup_parent_parse = c.parse(
+        backup_frame,
+        6,
+        c.add(&[
+            backup_parent_envelope.size,
+            backup_parent_root.size,
+            backup_frame_partial,
+        ])?,
+    )?;
+    a.push(
+        "fixed.backup_process_parent_supervisor_roots",
+        Phase::Active,
+        1,
+        c.add(&[
+            backup_output_sender.size,
+            backup_output_receiver.size,
+            backup_join.size,
+            backup_child_process.size,
+            backup_child_input.size,
+        ])?,
+    )?;
+    a.push(
+        "active.backup_process_parent_output_channel_and_parser",
+        Phase::Active,
+        1,
+        c.add(&[
+            backup_output_channel,
+            // Four inline slot roots are in the exact channel backing. Add
+            // their nested graphs, the envelope in supervise, and the larger
+            // of a blocked reader envelope or its in-progress parser.
+            c.mul(backup_output_slots, backup_child_nested)?,
+            backup_child_typed,
+            backup_child_typed.max(backup_child_parse),
+        ])?,
+    )?;
+    let backup_startup_serialization = c.add(&[
+        backup_startup.size,
+        backup_frame,
+        backup_request_backing,
+        c.mul(2, uuid_backing)?, // nonce and operation
+        digest_backing,          // build identity
+    ])?;
+    let backup_parent_serialization = c.add(&[backup_frame, backup_parent_typed])?;
+    a.push(
+        "active.backup_process_parent_serialization_and_startup",
+        Phase::Active,
+        1,
+        backup_startup_serialization.max(backup_parent_serialization),
+    )?;
+
+    let [
+        filesystem_client,
+        filesystem_client_shared,
+        _filesystem_client_state,
+        _filesystem_client_owner,
+        filesystem_operation_root,
+        filesystem_response_root,
+        filesystem_message_root,
+        filesystem_assembly_root,
+        filesystem_startup_root,
+        filesystem_input_root,
+        filesystem_output_root,
+        filesystem_control_root,
+    ] = crate::filesystem_worker::client::metadata_layouts().map(source_layout);
+    let filesystem_client = filesystem_client?;
+    let filesystem_client_shared = filesystem_client_shared?;
+    let filesystem_operation_root = filesystem_operation_root?;
+    let filesystem_response_root = filesystem_response_root?;
+    let filesystem_message_root = filesystem_message_root?;
+    let filesystem_assembly_root = filesystem_assembly_root?;
+    let filesystem_startup_root = filesystem_startup_root?;
+    let filesystem_input_root = filesystem_input_root?;
+    let filesystem_output_root = filesystem_output_root?;
+    let filesystem_control_root = filesystem_control_root?;
+    let filesystem_message = crate::filesystem_worker::wire::MESSAGE_BYTES as u64;
+    let filesystem_config = crate::filesystem_worker::wire::CONFIG_BYTES as u64;
+    let filesystem_error = crate::filesystem_worker::wire::ERROR_BYTES as u64;
+    let filesystem_chunk = crate::filesystem_worker::wire::CHUNK_BYTES as u64;
+    let filesystem_reply_typed =
+        c.add(&[filesystem_response_root.size, backup_filesystem_message])?;
+    let filesystem_operation_typed =
+        c.add(&[filesystem_operation_root.size, backup_filesystem_message])?;
+    let filesystem_parse_partial = c.add(&[
+        filesystem_assembly_root.size,
+        filesystem_message_root.size,
+        filesystem_operation_root
+            .size
+            .max(filesystem_response_root.size),
+        filesystem_message,
+        c.mul(2, c.vec_growth(2, filesystem_message / 2)?)?,
+    ])?;
+    let filesystem_client_runtime = c.add(&[
+        filesystem_message, // outbound command retained in State/write loop
+        filesystem_operation_typed,
+        filesystem_reply_typed,
+        c.mul(2, filesystem_error)?, // sticky failure plus Status clone
+        c.mul(
+            2,
+            c.vec_growth(1, crate::application::backup::DIGEST_BYTES as u64)?,
+        )?,
+        c.mul(2, c.parse(filesystem_message, 6, filesystem_parse_partial)?)?,
+        c.mul(3, filesystem_chunk)?,
+    ])?;
+    let filesystem_client_startup = c.add(&[
+        filesystem_startup_root.size,
+        filesystem_config,
+        c.parse(
+            filesystem_config,
+            4,
+            c.add(&[
+                filesystem_startup_root.size,
+                filesystem_assembly_root.size,
+                filesystem_message_root.size,
+                filesystem_config,
+            ])?,
+        )?,
+    ])?;
+    a.push(
+        "fixed.backup_process_second_f_client_roots",
+        Phase::Active,
+        1,
+        c.add(&[
+            filesystem_client.size,
+            c.arc(filesystem_client_shared)?,
+            c.vec_growth(
+                Layout::of::<std::thread::JoinHandle<()>>().size,
+                crate::filesystem_worker::client::IO_THREAD_OWNERS as u64,
+            )?,
+            filesystem_input_root.size,
+            filesystem_output_root.size,
+            filesystem_control_root.size,
+        ])?,
+    )?;
+    a.push(
+        "active.backup_process_second_f_client_transport",
+        Phase::Active,
+        1,
+        filesystem_client_runtime.max(filesystem_client_startup),
+    )?;
+
+    let [
+        filesystem_child_shared,
+        _filesystem_child_state,
+        _filesystem_pending,
+        _filesystem_retained,
+        filesystem_context,
+    ] = crate::filesystem_worker::process::metadata_layouts().map(source_layout);
+    let filesystem_child_shared = filesystem_child_shared?;
+    let filesystem_context = filesystem_context?;
+    let filesystem_handler = source_layout(crate::filesystem_worker::handler_layout())?;
+    let filesystem_child_runtime = c.add(&[
+        c.arc(filesystem_child_shared)?,
+        filesystem_context.size,
+        filesystem_operation_typed,
+        filesystem_reply_typed,
+        c.arc(Layout::of::<AtomicBool>())?,
+        c.arc(Layout::of::<Vec<u8>>())?,
+        c.mul(3, filesystem_message)?, // input assembly + result/control encodings
+        c.parse(filesystem_message, 6, filesystem_parse_partial)?,
+        c.mul(3, filesystem_chunk)?,
+    ])?;
+    a.push(
+        "active.backup_process_second_f_child_transport",
+        Phase::Active,
+        1,
+        c.add(&[filesystem_handler.size, filesystem_child_runtime])?,
+    )?;
+
+    a.push(
+        "active.backup_process_second_f_custody_and_hashing",
+        Phase::Active,
+        1,
+        c.add(&[
+            // Owner/Active/Held/Hashing roots are inline in FilesystemHandler,
+            // which the child-transport contribution already charges.
+            c.mul(4, backup_path)?
+                .max(c.add(&[c.mul(3, backup_path)?, backup_receipt_backing])?),
+            uuid_backing,
+            u64::try_from(crate::catalog_backup::managed_filesystem::STEP_BYTES)?,
+        ])?,
+    )?;
+
+    let backup_b_runtime = c.add(&[
+        backup_startup.size,
+        backup_join.size,
+        c.mul(2, uuid_backing)?, // retained nonce and operation
+        digest_backing,          // retained build identity
+        backup_remote_filesystem.size,
+        backup_control_sender.size,
+        backup_control_channel,
+        c.arc(Layout::of::<Mutex<std::io::Stdout>>())?,
+        c.arc(Layout::of::<AtomicBool>())?,
+        // The channel owns one inline Parent root. Add that slot's nested
+        // graph and the larger of the blocked sender value or parser state.
+        c.mul(backup_control_slots, backup_parent_nested)?,
+        backup_parent_typed.max(backup_parent_parse),
+        backup_frame,
+        backup_child_typed,
+        backup_request_backing.max(c.add(&[restore_receipt_backing, c.mul(3, backup_path)?])?),
+    ])?;
+    a.push(
+        "active.backup_process_b_child_control_and_transport",
+        Phase::Active,
+        1,
+        backup_b_runtime,
+    )?;
+    let backup_control = super::backup_control_tasks_layout();
+    a.push(
+        "fixed.desktop_backup_control_task_slots",
+        Phase::Retained,
+        1,
+        // This is the exact incremental G Handle field. The two JoinHandles
+        // are fixed inline slots; allocator metadata, TLS, and thread stacks
+        // remain excluded by this ledger's documented boundary.
+        u64::try_from(backup_control.0)?,
+    )?;
     a.push(
         "fixed.preview_byte_budget_arc_backings",
         Phase::Retained,
@@ -1941,6 +2565,13 @@ pub(crate) fn report(config: &Config) -> Result<Report> {
         Phase::Retained,
         1,
         LEASE_ID_BYTES,
+    )?;
+    let workbench = crate::application::lightroom_capacity::report(config, super::CONTROL_SLOTS)?;
+    a.push(
+        "workbench.metadata_generation_subgrant",
+        Phase::Retained,
+        1,
+        workbench.required,
     )?;
     a.push(
         "fixed.proxy_packet_type_roots",
@@ -1991,6 +2622,206 @@ mod tests {
     }
 
     #[test]
+    fn migration_metadata_subgrant_is_named_and_fully_aggregated() -> Result<()> {
+        let config = config();
+        let report = report(&config)?;
+        let migration = report
+            .contributions
+            .iter()
+            .find(|entry| entry.name == "retained.migration_coordinator_metadata_subgrant")
+            .context("migration metadata subgrant contribution")?;
+        assert_eq!(migration.phase, Phase::Retained);
+        assert_eq!(migration.count, 1);
+        assert_eq!(
+            migration.each,
+            super::super::migration::metadata_requirement(&config)?
+        );
+        assert_eq!(migration.total, migration.each);
+        assert!(report.requested >= migration.total);
+        Ok(())
+    }
+
+    #[test]
+    fn desktop_backup_control_slots_are_fixed_and_reserved() -> Result<()> {
+        let report = report(&config())?;
+        let control = report
+            .contributions
+            .iter()
+            .find(|entry| entry.name == "fixed.desktop_backup_control_task_slots")
+            .context("desktop backup control task slot contribution")?;
+        assert_eq!(control.phase, Phase::Retained);
+        assert_eq!(control.count, 1);
+        assert_eq!(
+            control.each,
+            u64::try_from(super::super::backup_control_tasks_layout().0)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn managed_backup_owner_control_and_relay_backings_are_reserved() -> Result<()> {
+        let config = config();
+        let default_report = report(&config)?;
+        let contribution = |name| {
+            default_report
+                .contributions
+                .iter()
+                .find(|entry| entry.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+        };
+        let owner = contribution("fixed.backup_g_coordinator_arc_backing");
+        let owner_layout = crate::application::backup::metadata_owner_layout();
+        assert_eq!(owner.phase, Phase::Retained);
+        assert_eq!(owner.count, 1);
+        assert_eq!(
+            owner.each,
+            Checked.arc(Layout {
+                size: u64::try_from(owner_layout.0)?,
+                align: u64::try_from(owner_layout.1)?,
+            })?
+        );
+
+        for name in [
+            "retained.backup_g_executable_and_terminal_backings",
+            "active.backup_g_worker_owner_backings",
+            "active.backup_g_status_clone_and_serialization",
+            "active.backup_g_public_request_validation",
+            "active.backup_g_create_control_backings",
+            "active.backup_g_close_control_backings",
+            "relay.backup_admission_complete_message_backings",
+            "relay.backup_admission_retained_typed_graphs",
+            "relay.backup_admission_request_parser",
+            "relay.backup_admission_reply_parser",
+            "relay.backup_admission_cancellation_backings",
+        ] {
+            let entry = contribution(name);
+            assert!(entry.total > 0, "empty {name}");
+            assert_eq!(
+                entry.phase,
+                if name.starts_with("retained.") {
+                    Phase::Retained
+                } else {
+                    Phase::Active
+                }
+            );
+        }
+        assert_eq!(
+            contribution("relay.backup_admission_retained_typed_graphs").count,
+            4
+        );
+        assert_eq!(
+            contribution("relay.backup_admission_cancellation_backings").count,
+            2
+        );
+
+        let default_messages =
+            contribution("relay.backup_admission_complete_message_backings").each;
+        let mut maximum = config;
+        maximum.limits.request_bytes = 4 * 1024 * 1024;
+        maximum.limits.reply_bytes = 4 * 1024 * 1024;
+        let maximum_report = report(&maximum)?;
+        let maximum_messages = maximum_report
+            .contributions
+            .iter()
+            .find(|entry| entry.name == "relay.backup_admission_complete_message_backings")
+            .context("maximum backup admission message contribution")?;
+        assert!(maximum_messages.each > default_messages);
+        assert!(maximum_report.requested > default_report.requested);
+        Ok(())
+    }
+
+    #[test]
+    fn managed_backup_process_transport_graphs_are_source_derived() -> Result<()> {
+        let report = report(&config())?;
+        let contribution = |name| {
+            report
+                .contributions
+                .iter()
+                .find(|entry| entry.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+        };
+        for name in [
+            "fixed.backup_process_parent_supervisor_roots",
+            "active.backup_process_parent_output_channel_and_parser",
+            "active.backup_process_parent_serialization_and_startup",
+            "fixed.backup_process_second_f_client_roots",
+            "active.backup_process_second_f_client_transport",
+            "active.backup_process_second_f_child_transport",
+            "active.backup_process_second_f_custody_and_hashing",
+            "active.backup_process_b_child_control_and_transport",
+        ] {
+            let entry = contribution(name);
+            assert_eq!(entry.phase, Phase::Active);
+            assert_eq!(entry.count, 1);
+            assert!(entry.each > 0, "empty {name}");
+        }
+
+        let transport = crate::catalog_backup::managed::transport_metadata_layouts();
+        let layout = |index| source_layout(transport[index]);
+        let (output_channel, control_channel) =
+            crate::catalog_backup::managed::transport_channel_backings()?;
+        let parent_fixed = Checked.add(&[
+            layout(8)?.size,
+            layout(9)?.size,
+            layout(13)?.size,
+            layout(14)?.size,
+            layout(15)?.size,
+        ])?;
+        assert_eq!(
+            contribution("fixed.backup_process_parent_supervisor_roots").each,
+            parent_fixed
+        );
+        assert!(
+            contribution("active.backup_process_parent_output_channel_and_parser").each
+                > u64::try_from(output_channel)?
+        );
+        assert!(
+            contribution("active.backup_process_b_child_control_and_transport").each
+                > u64::try_from(control_channel)?
+        );
+
+        let client = crate::filesystem_worker::client::metadata_layouts();
+        let client_layout = |index| source_layout(client[index]);
+        let client_fixed = Checked.add(&[
+            client_layout(0)?.size,
+            Checked.arc(client_layout(1)?)?,
+            Checked.vec_growth(
+                Layout::of::<std::thread::JoinHandle<()>>().size,
+                crate::filesystem_worker::client::IO_THREAD_OWNERS as u64,
+            )?,
+            client_layout(9)?.size,
+            client_layout(10)?.size,
+            client_layout(11)?.size,
+        ])?;
+        assert_eq!(
+            contribution("fixed.backup_process_second_f_client_roots").each,
+            client_fixed
+        );
+        assert!(
+            client[0].0 >= client[3].0,
+            "client must inline its process owner"
+        );
+        assert!(
+            client[1].0 >= client[2].0,
+            "shared client state must be inline"
+        );
+
+        let handler = crate::filesystem_worker::handler_layout();
+        let custody = crate::catalog_backup::managed_filesystem::metadata_layouts();
+        assert!(
+            handler.0 >= custody[0].0,
+            "handler must inline backup F owner"
+        );
+        let child = crate::filesystem_worker::process::metadata_layouts();
+        assert!(child[0].0 >= child[1].0, "child state must be inline");
+        assert!(
+            contribution("active.backup_process_second_f_custody_and_hashing").each
+                >= u64::try_from(crate::catalog_backup::managed_filesystem::STEP_BYTES)?
+        );
+        Ok(())
+    }
+
+    #[test]
     fn default_and_supported_boundaries_have_complete_named_assemblies() -> Result<()> {
         let mut default = config();
         let default_report = report(&default)?;
@@ -2009,6 +2840,41 @@ mod tests {
                 .unwrap()
         );
         assert!(default_report.contributions.len() >= 40);
+        for name in [
+            "retained.filesystem_original_root_registries",
+            "active.filesystem_original_root_registry_clone_and_conversion",
+            "retained.import_f_source_custody_and_transfer",
+            "active.import_f_inspection_parse_and_encoding",
+            "active.import_c_transfer_decode_and_preparation",
+            "fixed.backup_g_coordinator_arc_backing",
+            "retained.backup_g_executable_and_terminal_backings",
+            "active.backup_g_worker_owner_backings",
+            "active.backup_g_status_clone_and_serialization",
+            "active.backup_g_public_request_validation",
+            "active.backup_g_create_control_backings",
+            "active.backup_g_close_control_backings",
+            "relay.backup_admission_complete_message_backings",
+            "relay.backup_admission_retained_typed_graphs",
+            "relay.backup_admission_request_parser",
+            "relay.backup_admission_reply_parser",
+            "relay.backup_admission_cancellation_backings",
+            "fixed.backup_process_parent_supervisor_roots",
+            "active.backup_process_parent_output_channel_and_parser",
+            "active.backup_process_parent_serialization_and_startup",
+            "fixed.backup_process_second_f_client_roots",
+            "active.backup_process_second_f_client_transport",
+            "active.backup_process_second_f_child_transport",
+            "active.backup_process_second_f_custody_and_hashing",
+            "active.backup_process_b_child_control_and_transport",
+        ] {
+            assert!(
+                default_report
+                    .contributions
+                    .iter()
+                    .any(|entry| entry.name == name && entry.total > 0),
+                "missing {name}"
+            );
+        }
         let mut names = std::collections::HashSet::new();
         assert!(
             default_report
@@ -2016,6 +2882,48 @@ mod tests {
                 .iter()
                 .all(|entry| names.insert(entry.name))
         );
+        let retained_roots = default_report
+            .contributions
+            .iter()
+            .find(|entry| entry.name == "retained.filesystem_original_root_registries")
+            .unwrap();
+        let registry = Checked.add(&[
+            Checked.vec_growth(
+                Layout::of::<NativePath>().size,
+                crate::catalog_session::import::ORIGINAL_ROOTS as u64,
+            )?,
+            Checked.mul(
+                3,
+                crate::catalog_session::import::ORIGINAL_ROOT_BYTES as u64,
+            )?,
+            Checked.mul(16, crate::catalog_session::import::ORIGINAL_ROOTS as u64)?,
+        ])?;
+        assert_eq!(retained_roots.phase, Phase::Retained);
+        assert_eq!(retained_roots.count, 2);
+        assert_eq!(retained_roots.each, registry);
+        let active_roots = default_report
+            .contributions
+            .iter()
+            .find(|entry| {
+                entry.name == "active.filesystem_original_root_registry_clone_and_conversion"
+            })
+            .unwrap();
+        assert_eq!(active_roots.phase, Phase::Active);
+        assert_eq!(active_roots.count, 1);
+        assert_eq!(
+            active_roots.each,
+            Checked.add(&[registry, Checked.vec(2, PATH_UNITS as u64)?])?
+        );
+        let workbench_generation = default_report
+            .contributions
+            .iter()
+            .find(|entry| entry.name == "workbench.metadata_generation_subgrant")
+            .unwrap();
+        let workbench =
+            crate::application::lightroom_capacity::report(&default, super::super::CONTROL_SLOTS)?;
+        assert_eq!(workbench_generation.phase, Phase::Retained);
+        assert_eq!(workbench_generation.each, workbench.required);
+        assert_eq!(workbench.required, workbench.retained + workbench.active);
         let export_caller = default_report
             .contributions
             .iter()

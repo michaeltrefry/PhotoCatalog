@@ -1,7 +1,7 @@
 //! G owns every actual Source handle. This state is driven only on the independent
 //! broker thread; the foreground actor and LM executor never join these children.
 use super::super::transport::{Epoch, Reply, Request};
-use super::{Assembly, Command, Event, Kind, Outgoing};
+use super::{Assembly, COUNT, Command, Event, Kind, Outgoing};
 use crate::{
     application::U64,
     lightroom_migration_worker::{
@@ -14,7 +14,7 @@ use anyhow::{Context, Result, ensure};
 use std::sync::{Arc, Mutex};
 
 pub(super) type Charge = Arc<Mutex<Reservation>>;
-pub(super) type Charges = Arc<Mutex<[Option<Charge>; 2]>>;
+pub(super) type Charges = Arc<Mutex<[Option<Charge>; COUNT]>>;
 pub(super) type Spawn<'a> =
     dyn FnMut(Kind, Arc<Stop>, &mut dyn FnMut()) -> Result<Process<Reply>> + 'a;
 
@@ -45,8 +45,8 @@ struct Retired {
 }
 pub(crate) struct Owner {
     guard: Guard,
-    slots: [Option<Slot>; 2],
-    retired: [Option<Retired>; 2],
+    slots: [Option<Slot>; COUNT],
+    retired: [Option<Retired>; COUNT],
     memory: MemoryBudget,
     charges: Charges,
     next_start: u64,
@@ -57,8 +57,8 @@ impl Owner {
         guard.validate()?;
         Ok(Self {
             guard,
-            slots: [None, None],
-            retired: [None, None],
+            slots: std::array::from_fn(|_| None),
+            retired: std::array::from_fn(|_| None),
             memory,
             charges,
             next_start: 1,
@@ -244,9 +244,9 @@ impl Owner {
     /// Poll fairly without waiting for any child. Returned events are retained
     /// by the broker until its bounded output queue accepts them.
     pub(crate) fn poll(&mut self) -> Result<Option<Event>> {
-        for _ in 0..2 {
+        for _ in 0..COUNT {
             let index = self.cursor;
-            self.cursor = (self.cursor + 1) % 2;
+            self.cursor = (self.cursor + 1) % COUNT;
             let Some(slot) = self.slots[index].as_mut() else {
                 continue;
             };
@@ -371,7 +371,7 @@ impl Owner {
     pub(crate) fn live(&self) -> usize {
         self.slots.iter().flatten().count() + self.retired.iter().flatten().count()
     }
-    pub(crate) fn failures(&self, detail: &str) -> [Option<Event>; 2] {
+    pub(crate) fn failures(&self, detail: &str) -> [Option<Event>; COUNT] {
         std::array::from_fn(|index| {
             self.slots[index]
                 .as_ref()
@@ -422,7 +422,7 @@ impl Owner {
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        self.slots = [None, None];
+        self.slots = std::array::from_fn(|_| None);
         if let Some(error) = first {
             return Err(error);
         }

@@ -3,6 +3,18 @@
 use super::tests::session_with_deadline;
 use super::*;
 use crate::lightroom::{Issue, MANIFEST_BYTES, PAGE_BYTES, migration_source::tests::Fixture};
+use std::sync::{Mutex, MutexGuard};
+
+// Each fixture below independently exercises the production maximum through an
+// actual Source child. Running all five maximum JSON graphs at once makes their
+// shared CI host scheduling part of the per-query production deadline.
+static MAXIMAL_SOURCE_FIXTURE: Mutex<()> = Mutex::new(());
+
+fn maximal_source_fixture() -> Result<MutexGuard<'static, ()>> {
+    MAXIMAL_SOURCE_FIXTURE
+        .lock()
+        .map_err(|_| anyhow::anyhow!("maximum source fixture lock poisoned"))
+}
 
 #[test]
 fn large_object_issue_manifest_now_has_exact_capacity_and_preserves_every_member() -> Result<()> {
@@ -40,6 +52,7 @@ fn maximal_issue_manifest(
     expected_source_id: Option<&str>,
     old_capacity_estimate: Option<usize>,
 ) -> Result<()> {
+    let _fixture = maximal_source_fixture()?;
     let mut fixture = Fixture::new();
     let manifest = fixture.open().capture_manifest(fixture.revision())?;
     let template = serde_json::to_vec(&manifest)?;
@@ -114,6 +127,7 @@ fn maximal_issue_manifest(
 
 #[test]
 fn maximal_stable_source_table_and_canonical_key_preserve_expanded_result() -> Result<()> {
+    let _fixture = maximal_source_fixture()?;
     let mut fixture = Fixture::new();
     let revision = fixture.revision().to_owned();
     let inline = PAGE_BYTES / 4;
@@ -230,6 +244,7 @@ fn source_serialization_capacity_is_exact_and_both_passes_are_cancellable() -> R
 
 #[test]
 fn maximal_units_first_manifest_preserves_foreign_evidence_and_rejects_tamper() -> Result<()> {
+    let _fixture = maximal_source_fixture()?;
     let mut fixture = Fixture::new();
     let manifest = fixture.open().capture_manifest(fixture.revision())?;
     let template = serde_json::to_string(&manifest)?;

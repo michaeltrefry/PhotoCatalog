@@ -6,6 +6,11 @@ pub(crate) use bootstrap::open_directory;
 pub mod client;
 mod export_executor;
 mod export_stage;
+mod import;
+mod lightroom_artifacts;
+mod lightroom_sealed;
+mod lightroom_workbench;
+mod metadata_files;
 mod preview_io;
 mod preview_stage;
 pub mod process;
@@ -28,6 +33,10 @@ use wire::{
 
 struct FilesystemHandler {
     owner: BootstrapOwner,
+    lightroom_sealed: lightroom_sealed::Owner,
+    lightroom_artifacts: lightroom_artifacts::Owner,
+    backup: catalog_backup::managed_filesystem::Owner,
+    lightroom_workbench: lightroom_workbench::Owner,
 }
 pub(crate) fn export_profile_transfer_layout() -> (usize, usize) {
     bootstrap::export_profile_transfer_layout()
@@ -44,11 +53,34 @@ pub(crate) fn export_stage_owner_layout() -> (usize, usize) {
 pub(crate) fn export_executor_owner_layout() -> (usize, usize) {
     export_executor::owner_layout()
 }
+pub(crate) fn import_owner_layout() -> (usize, usize) {
+    import::owner_layout()
+}
+pub(crate) fn lightroom_workbench_retained_metadata_layouts()
+-> lightroom_workbench::RetainedMetadataLayouts {
+    lightroom_workbench::retained_metadata_layouts()
+}
+pub(crate) fn lightroom_workbench_evidence_construction_layouts(
+    artifacts: usize,
+    manifest_bytes: usize,
+) -> Result<lightroom_workbench::EvidenceConstructionLayouts> {
+    lightroom_workbench::evidence_construction_layouts(artifacts, manifest_bytes)
+}
+pub(crate) fn handler_layout() -> (usize, usize) {
+    (
+        std::mem::size_of::<FilesystemHandler>(),
+        std::mem::align_of::<FilesystemHandler>(),
+    )
+}
 impl FilesystemHandler {
     fn new(startup: Startup) -> Result<Self> {
         startup.validate()?;
         Ok(Self {
             owner: BootstrapOwner::new(startup.epoch, startup.original_roots),
+            lightroom_sealed: Default::default(),
+            lightroom_artifacts: Default::default(),
+            backup: Default::default(),
+            lightroom_workbench: Default::default(),
         })
     }
     fn execute_inner(
@@ -59,6 +91,19 @@ impl FilesystemHandler {
         operation.validate()?;
         let cancel = context.cancellation();
         match operation {
+            Operation::Backup(request) => self.backup.call(&request, cancel).map(Response::Backup),
+            Operation::Storage(request) => self
+                .owner
+                .storage_call(&request, cancel)
+                .map(Response::Storage),
+            Operation::Import(request) => self
+                .owner
+                .import_call(&request, cancel)
+                .map(Response::Import),
+            Operation::RestoreOriginalRoot(request) => self
+                .owner
+                .restore_original_root(&request, cancel)
+                .map(Response::RestoredOriginalRoot),
             Operation::ExportExecutor(request) => self
                 .owner
                 .export_executor_call(&request, cancel)
@@ -85,6 +130,18 @@ impl FilesystemHandler {
             Operation::ReadPreviewConfiguration(path) => {
                 store::read_configuration(&path, cancel).map(Response::PreviewConfiguration)
             }
+            Operation::LightroomSealedRead(request) => self
+                .lightroom_sealed
+                .execute(request, cancel)
+                .map(Response::LightroomSealedDocument),
+            Operation::LightroomArtifactPreparation(request) => self
+                .lightroom_artifacts
+                .execute(request, cancel)
+                .map(Response::LightroomArtifactPreparation),
+            Operation::LightroomWorkbenchIo(request) => self
+                .lightroom_workbench
+                .execute(request, cancel)
+                .map(Response::LightroomWorkbenchIo),
             Operation::PrepareExportDirectory(request) => self
                 .owner
                 .prepare_export_directory(&request, cancel)
@@ -120,6 +177,11 @@ impl FilesystemHandler {
                 .export_publication_call(&request, cancel)
                 .map_err(export_directory_failure)
                 .map(Response::ExportPublication),
+            Operation::MetadataFiles(request) => self
+                .owner
+                .metadata_files_call(&request, cancel)
+                .map_err(export_directory_failure)
+                .map(Response::MetadataFiles),
             Operation::ExportProfile(request) => self
                 .owner
                 .export_profile_call(&request, cancel)
@@ -216,6 +278,12 @@ impl Handler for FilesystemHandler {
         })
     }
     fn shutdown(&mut self) -> std::result::Result<(), Failure> {
+        if !self.backup.is_idle() {
+            return Err(Failure::new(
+                FailureKind::Unknown,
+                "filesystem backup owner still retains an operation",
+            ));
+        }
         self.owner
             .shutdown()
             .map_err(|error| Failure::new(FailureKind::Unknown, error))
@@ -408,6 +476,28 @@ pub(crate) mod export_executor_test_support {
         ) -> Result<crate::catalog_session::export_executor::Reply> {
             self.0
                 .call(catalog, manifest, request, cancel, export_stage_empty)
+        }
+        pub fn empty(&self) -> bool {
+            self.0.empty()
+        }
+    }
+}
+
+/// In-process access to the real F import owner for exact replay/custody tests.
+#[cfg(test)]
+pub(crate) mod import_test_support {
+    use super::*;
+    #[derive(Default)]
+    pub struct Owner(super::import::Owner);
+    impl Owner {
+        pub fn call(
+            &mut self,
+            catalog: &Path,
+            original_roots: &[NativePath],
+            request: &crate::catalog_session::import::Request,
+            cancel: &AtomicBool,
+        ) -> Result<crate::catalog_session::import::Reply> {
+            self.0.call(catalog, original_roots, request, cancel)
         }
         pub fn empty(&self) -> bool {
             self.0.empty()

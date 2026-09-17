@@ -152,7 +152,7 @@ export function useLightroom(enabled: boolean) {
         ticket.backendRejected = e instanceof CatalogError;
         ticket.error = errorText(e);
         epoch.current += 1; known.current = false; setReady(false);
-        setCloseError(`${ticket.error} Closing remains pending until its status is confirmed. You can explicitly retry closing this inspection.`);
+        setCloseError(`${ticket.error} Closing remains pending until its status is confirmed. You can explicitly retry closing this inspection. If retry still cannot confirm closure, quit and reopen LensWorks before opening another Lightroom inspection.`);
       }
     }
   };

@@ -12,6 +12,7 @@ import os
 import math
 import re
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -25,6 +26,21 @@ from edit_verify import digest, read_json
 
 MIB=1024**2
 MAX_STDIO=4*MIB
+
+
+def storage_identity(path):
+    path=Path(path)
+    value=path.lstat()
+    if not stat.S_ISDIR(value.st_mode):
+        raise ValueError('ordinary storage directory required')
+    return dict(device=value.st_dev,inode=value.st_ino)
+
+
+def storage_descriptor(path,reserve_bytes):
+    path=Path(path)
+    return dict(root=str(path),**storage_identity(path),parent=str(path.parent),
+                **{('parent_'+key):value for key,value in storage_identity(path.parent).items()},
+                reserve_bytes=reserve_bytes)
 MAX_TELEMETRY=32*MIB
 MAX_ACTIVE=4
 MAX_SEEN=256
@@ -375,11 +391,29 @@ class ActiveIdentities:
         return records
 
 
-def invoke(command, folder, limits, disk_root, *, supervision=None):
+def invoke(command, folder, limits, disk_roots, *, supervision=None):
     settings=supervision_settings(supervision)
     timeout=limits.get('deadline_seconds')
     if type(timeout) not in (int,float) or not math.isfinite(timeout) or not 0<timeout<=86400:
         raise ValueError('positive finite at-most-24-hour owner deadline required')
+    storage=limits.get('storage')
+    if (not isinstance(disk_roots,dict) or not disk_roots or set(disk_roots)!=set(storage or {})
+        or any(not isinstance(value,dict) or set(value)!= {
+                   'root','device','inode','parent','parent_device','parent_inode','reserve_bytes'}
+               or type(value['device']) is not int or type(value['inode']) is not int
+               or type(value['parent_device']) is not int or type(value['parent_inode']) is not int
+               or type(value['reserve_bytes']) is not int
+               or value['reserve_bytes']<0 for value in (storage or {}).values())):
+        raise ValueError('exact named storage roots/reserves required')
+    disk_roots={name:Path(path) for name,path in disk_roots.items()}
+    if any(not disk_roots[name].is_absolute() or disk_roots[name].resolve(strict=True)!=disk_roots[name]
+           or str(disk_roots[name])!=value['root']
+           or str(disk_roots[name].parent)!=value['parent']
+           or storage_identity(disk_roots[name])!={key:value[key] for key in ('device','inode')}
+           or storage_identity(disk_roots[name].parent)!={
+               key.removeprefix('parent_'):value[key] for key in ('parent_device','parent_inode')}
+           for name,value in storage.items()):
+        raise ValueError('named storage root identity changed')
     folder=Path(folder)
     folder.mkdir()
     started=anchor()
@@ -425,8 +459,13 @@ def invoke(command, folder, limits, disk_root, *, supervision=None):
                 records=tracker.sample()
                 total=sum(p['rss'] for p in records)
                 peak=max(peak,total)
-                free=psutil.disk_usage(os.fspath(disk_root)).free
-                line=(json.dumps(dict(at=at,processes=records,total_rss=total,free_bytes=free),allow_nan=False)+'\n').encode()
+                if any(storage_identity(disk_roots[name])!={key:value[key] for key in ('device','inode')}
+                       or storage_identity(disk_roots[name].parent)!={
+                           key.removeprefix('parent_'):value[key] for key in ('parent_device','parent_inode')}
+                       for name,value in storage.items()):
+                    raise RuntimeError('live filesystem identity changed')
+                free={name:psutil.disk_usage(os.fspath(path)).free for name,path in disk_roots.items()}
+                line=(json.dumps(dict(at=at,processes=records,total_rss=total,free_bytes_by_volume=free),allow_nan=False)+'\n').encode()
                 if len(line)>settings['max_sample_bytes'] or telemetry_bytes+len(line)>settings['max_telemetry_bytes']:
                     raise RuntimeError('process telemetry byte cap exceeded')
                 telemetry.write(line)
@@ -437,7 +476,7 @@ def invoke(command, folder, limits, disk_root, *, supervision=None):
                     raise RuntimeError('owned process-count admission exceeded')
                 if total>limits['group_rss_bytes'] or any(p['rss']>limits['process_rss_bytes'] for p in records):
                     raise RuntimeError('sampled RSS admission exceeded')
-                if free<limits['free_reserve_bytes']:
+                if any(free[name]<value['reserve_bytes'] for name,value in storage.items()):
                     raise RuntimeError('live filesystem free-space reserve exhausted')
                 if any(capture.failed.is_set() for capture in captures.values()):
                     raise RuntimeError('bounded stdout/stderr capture failed or overflowed')
@@ -513,7 +552,7 @@ def invoke(command, folder, limits, disk_root, *, supervision=None):
 
 def validate_binding(binding):
     edit_admission.validate_execution(binding)
-    if binding.get('version')!=2 or binding.get('pending_execution_gates')!=[]:
+    if binding.get('version')!=3 or binding.get('pending_execution_gates')!=[]:
         raise ValueError('final reviewed protocol and resolved execution gates required')
     if binding.get('automatic_retries')!=0 or not binding.get('actions'):
         raise ValueError('explicit serial action set required')
@@ -523,8 +562,15 @@ def validate_binding(binding):
         item=binding[key]
         if not Path(item['path']).is_absolute() or digest(Path(item['path']).resolve(strict=True) if key=='python' else item['path'],'sha256',512*MIB)!=item['sha256']:
             raise ValueError('executable/script identity: '+key)
-    if binding['minimum_free_bytes']<binding['retained_bound_bytes']+binding['active_bound_bytes']+binding['copies_bound_bytes']+binding['free_reserve_bytes']:
-        raise ValueError('minimum free space does not fund bounded peak and reserve')
+    for name in ('service','artifact'):
+        volume=binding['volumes'][name]
+        if volume['minimum_free_bytes']<sum(volume[key] for key in (
+            'retained_bound_bytes','active_bound_bytes','copies_bound_bytes','free_reserve_bytes')):
+            raise ValueError(name+' minimum free space does not fund bounded peak and reserve')
+        if (volume['campaign_admission_bytes']!=volume['minimum_free_bytes']+volume['post_campaign_bytes']
+            or volume['full_sequence_initial_free_bytes']!=volume['campaign_admission_bytes']+
+                (volume['copies_bound_bytes'] if name=='artifact' else 0)):
+            raise ValueError(name+' phase storage admission does not reconcile')
     for action in binding['actions']:
         if action.get('kind') not in ('probe','verify','generate'):
             raise ValueError('unsupported action kind')
@@ -548,11 +594,26 @@ def validate_binding(binding):
 def execute(binding,root):
     validate_binding(binding)
     root=Path(root)
+    storage=binding['storage_roots']
+    if root!=Path(storage['artifact']['path']):
+        raise ValueError('campaign output differs from frozen artifact root')
+    service_root=Path(storage['service']['path'])
     root.mkdir()
     exclusive(root/'binding.json',binding)
-    if psutil.disk_usage(os.fspath(root)).free<binding['minimum_free_bytes']:
-        raise ValueError('insufficient fully funded campaign free space')
-    exclusive(root/'host-identity.json',host_identity(root,[a['path'] for a in binding.get('sources',[])]))
+    service_root.mkdir()
+    roots=dict(artifact=root,service=service_root)
+    identities={name:storage_identity(path) for name,path in roots.items()}
+    parents={name:storage_identity(roots[name].parent) for name in roots}
+    if any(identities[name]['device']!=storage[name]['parent_device']
+           or parents[name]['device']!=storage[name]['parent_device']
+           or parents[name]['inode']!=storage[name]['parent_inode'] for name in roots):
+        raise ValueError('campaign storage volume identity changed')
+    if identities['artifact']['device']==identities['service']['device']:
+        raise ValueError('service and artifact roots alias one filesystem')
+    if any(psutil.disk_usage(os.fspath(path)).free<binding['volumes'][name]['campaign_admission_bytes']
+           for name,path in roots.items()):
+        raise ValueError('insufficient fully funded split campaign free space')
+    exclusive(root/'host-identity.json',host_identity(root,[a['path'] for a in binding.get('sources',[])],roots))
     results=[]
     error=None
     try:
@@ -564,7 +625,9 @@ def execute(binding,root):
                 if kind=='probe':
                     request=action['request']
                     expected=root/(action['id']+'-output')
-                    if Path(request['output'])!=expected or request['worker']!=binding['worker']['path']:
+                    expected_service=service_root/(action['id']+'-service')
+                    if (Path(request['output'])!=expected or Path(request['service_root'])!=expected_service
+                        or request['worker']!=binding['worker']['path']):
                         raise ValueError('request ownership/binary binding')
                     request_path=root/(action['id']+'-request.json')
                     exclusive(request_path,request)
@@ -582,10 +645,12 @@ def execute(binding,root):
                     raise ValueError('unknown action')
                 limits=dict(deadline_seconds=action['deadline_seconds'],
                             process_rss_bytes=action['process_rss_bytes'],group_rss_bytes=action['group_rss_bytes'],
-                            free_reserve_bytes=binding['free_reserve_bytes'])
+                            storage={name:storage_descriptor(roots[name],
+                                binding['volumes'][name]['free_reserve_bytes']+
+                                    binding['volumes'][name]['post_campaign_bytes']) for name in roots})
                 if command!=action['command']:
                     raise ValueError('actual command differs from frozen argv')
-                observed=invoke(command,folder,limits,root)
+                observed=invoke(command,folder,limits,roots)
                 if host.error is not None:raise RuntimeError('bounded host evidence failed: '+host.error)
                 if kind=='probe':
                     proof=read_json(expected/'receipt.json')
@@ -603,10 +668,10 @@ def execute(binding,root):
                 if kind=='verify':
                     record=next(item for item in binding['case_records'] if item['id']==action['id'][7:])
                     if record['cleanup_path'] is not None:
-                        edit_cleanup.cleanup_export(root,record)
+                        edit_cleanup.cleanup_export(root,service_root,record)
     except BaseException as exc:
         error=f'{type(exc).__name__}: {exc}'
-    exclusive(root/'campaign.json',dict(version=2,complete=error is None,error=error,results=results,
+    exclusive(root/'campaign.json',dict(version=3,complete=error is None,error=error,results=results,
                                        qualification_complete=False,acceptance='independent aggregate audit required'))
     if error:
         raise RuntimeError(error)

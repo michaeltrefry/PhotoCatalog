@@ -272,6 +272,66 @@ pub(crate) struct PreparedEdit {
     updated: Projection,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PreparedEditSummary {
+    pub identity: crate::catalog_images::ImageMetadataIdentity,
+    pub base_model: Option<i64>,
+    pub edits: Vec<Edit>,
+    pub before: Projection,
+    pub after: Projection,
+    pub packet_bytes: u64,
+    pub packet_blake3: String,
+    pub issues: Vec<String>,
+}
+
+impl PreparedEdit {
+    pub(crate) fn summary(&self) -> Result<PreparedEditSummary> {
+        let model = self
+            .prepared
+            .models
+            .first()
+            .context("prepared edit has no model")?;
+        let (length, _) = self
+            .prepared
+            .blobs
+            .get(&model.hash)
+            .context("prepared edit packet missing")?;
+        Ok(PreparedEditSummary {
+            identity: self.image_identity.clone(),
+            base_model: self.base_model,
+            edits: self.edits.clone(),
+            before: self.original.clone(),
+            after: self.updated.clone(),
+            packet_bytes: u64::try_from(*length)?,
+            packet_blake3: model.hash.clone(),
+            issues: self.updated.issues.clone(),
+        })
+    }
+    pub(crate) fn packet(&self) -> Result<Vec<u8>> {
+        let model = self
+            .prepared
+            .models
+            .first()
+            .context("prepared edit has no model")?;
+        let (length, compressed) = self
+            .prepared
+            .blobs
+            .get(&model.hash)
+            .context("prepared edit packet missing")?;
+        let decoder = ZlibDecoder::new(compressed.as_slice());
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(*length)?;
+        decoder
+            .take(u64::try_from(*length)?.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() == *length && blake3::hash(&bytes).to_hex().as_str() == model.hash,
+            "prepared edit packet verification"
+        );
+        Ok(bytes)
+    }
+}
+
 struct PreparedModel {
     hash: String,
     semantics: BTreeMap<String, String>,
@@ -1083,7 +1143,7 @@ pub(crate) fn rebuild(db: &Connection, asset: &str) -> Result<()> {
     }
     Ok(())
 }
-fn read_blob(db: &Connection, hash: &str) -> Result<Vec<u8>> {
+pub(crate) fn read_blob(db: &Connection, hash: &str) -> Result<Vec<u8>> {
     // Admit both sizes in the same SQLite read before rusqlite allocates the
     // compressed bytes. This matches the inspection bridge's retained-blob bound.
     let (length, data): (i64, Option<Vec<u8>>) = db.query_row(
@@ -1415,6 +1475,57 @@ impl Catalog {
         )?;
         tx.commit()?;
         drop(_write);
+        Ok(next)
+    }
+    pub(crate) fn resolve_metadata_for_image_with_receipt(
+        &mut self,
+        identity: &crate::catalog_images::ImageMetadataIdentity,
+        field: &str,
+        model_id: i64,
+        attempt: &str,
+        request_digest: &str,
+    ) -> Result<i64> {
+        let _write = self
+            .writers
+            .enter(crate::catalog_writer::Priority::Foreground)?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        ensure!(
+            crate::catalog_metadata_write::existing(&tx, attempt, request_digest)?.is_none(),
+            "metadata attempt already committed"
+        );
+        crate::catalog_images::require_image_metadata_identity(&tx, identity)?;
+        let asset = identity.image_id.as_str();
+        ensure!(
+            revision(&tx, asset)? == identity.metadata_revision,
+            "metadata changed; refresh conflict review"
+        );
+        let valid: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM image_metadata_sources s JOIN metadata_models m ON m.observation_id=s.current_observation JOIN metadata_values v ON v.model_id=m.id WHERE s.asset_id=?1 AND m.id=?2 AND v.field=?3)", params![asset, model_id, field], |row| row.get(0))?;
+        ensure!(
+            valid,
+            "selection is not a current field candidate for this image"
+        );
+        tx.execute("INSERT INTO metadata_choices VALUES(?1,?2,?3) ON CONFLICT(asset_id,field) DO UPDATE SET model_id=excluded.model_id", params![asset, field, model_id])?;
+        rebuild(&tx, asset)?;
+        let next = advance(
+            &tx,
+            asset,
+            "resolve",
+            &serde_json::json!({"field":field,"model_id":model_id}),
+            true,
+        )?;
+        crate::catalog_metadata_write::insert(
+            &tx,
+            attempt,
+            request_digest,
+            "resolve",
+            &crate::catalog_metadata_write::Owner::Image {
+                identity: identity.clone(),
+            },
+            &serde_json::json!({"revision": next}),
+        )?;
+        tx.commit()?;
         Ok(next)
     }
     pub fn metadata_model(&self, asset: &str, model_id: i64) -> Result<Vec<u8>> {
@@ -1751,6 +1862,25 @@ impl Catalog {
             changed: true,
         })
     }
+
+    pub(crate) fn commit_prepared_metadata_edit_with_receipt(
+        &mut self,
+        edit: PreparedEdit,
+        attempt: &str,
+        request_digest: &str,
+    ) -> Result<Change> {
+        let identity = edit.image_identity.clone();
+        self.commit_prepared_metadata_edit(edit, |db, revision| {
+            crate::catalog_metadata_write::insert(
+                db,
+                attempt,
+                request_digest,
+                "edit",
+                &crate::catalog_metadata_write::Owner::Image { identity },
+                &serde_json::json!({"revision": revision}),
+            )
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1866,8 +1996,8 @@ fn index_directory(
         return Ok(());
     }
     // Enumeration only opens a directory; regular-file content remains the
-    // source reader's responsibility. The SQL seam also consumes bounded facts
-    // from an eventual F stream without moving this connection to that owner.
+    // source reader's responsibility. Managed callers use the same SQL seam for
+    // bounded F facts without moving this connection to that owner.
     index_directory_facts(
         db,
         directory,
@@ -1961,7 +2091,8 @@ pub(crate) fn initialize_discovery_connection(db: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Worker-owned directory facts; no catalog connection or authority is held.
+/// C-owned bounded directory-fact index. Managed callers insert only facts
+/// transferred from F; this owner retains the Discovery SQL role.
 pub(crate) struct ImportDiscovery {
     db: crate::catalog_session::SqlConnection,
     progress_registered: bool,
@@ -1995,9 +2126,67 @@ impl ImportDiscovery {
     ) -> Result<Vec<Source>> {
         let directory = path.parent().context("original has no parent")?;
         index_directory(&self.db, directory, Some(cancel))?;
+        self.sidecars_indexed(path, cancel)
+    }
+    pub(crate) fn begin_directory(&self, directory: &Path) -> Result<()> {
+        let key = location_bytes(directory);
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute("DELETE FROM metadata_scan_files WHERE directory=?1", [&key])?;
+        tx.execute("DELETE FROM metadata_scan_dirs WHERE directory=?1", [&key])?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub(crate) fn directory_facts(
+        &self,
+        directory: &Path,
+        facts: impl IntoIterator<Item = Result<DirectoryFact>>,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<()> {
+        index_directory_fact_chunk(&self.db, directory, facts, cancel)
+    }
+    pub(crate) fn finish_directory(&self, directory: &Path) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO metadata_scan_dirs VALUES(?1)",
+            [location_bytes(directory)],
+        )?;
+        Ok(())
+    }
+    pub(crate) fn sidecars_indexed(
+        &self,
+        path: &Path,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Vec<Source>> {
+        ensure!(
+            !cancel.load(std::sync::atomic::Ordering::Acquire),
+            "metadata discovery canceled"
+        );
+        let directory = path.parent().context("original has no parent")?;
+        let indexed: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM metadata_scan_dirs WHERE directory=?1)",
+            [location_bytes(directory)],
+            |r| r.get(0),
+        )?;
+        ensure!(indexed, "metadata directory facts are incomplete");
         let stem = name_key(path.file_stem().context("original has no stem")?);
         let name = name_key(path.file_name().context("original has no filename")?);
-        let rows=self.db.prepare("SELECT path,display,stem FROM metadata_scan_files WHERE directory=?1 AND sidecar=1 AND (stem=?2 OR stem=?3) ORDER BY name LIMIT 1025")?.query_map(params![location_bytes(directory),stem,name],|r|Ok((r.get::<_,Vec<u8>>(0)?,r.get::<_,String>(1)?,r.get::<_,Vec<u8>>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = self
+            .db
+            .prepare(concat!(
+                "SELECT CASE WHEN length(path)<=32768 THEN path END, ",
+                "CASE WHEN length(CAST(display AS BLOB))<=131072 THEN display END, ",
+                "CASE WHEN length(stem)<=32768 THEN stem END ",
+                "FROM metadata_scan_files ",
+                "WHERE directory=?1 AND sidecar=1 AND (stem=?2 OR stem=?3) ",
+                "ORDER BY name LIMIT 1025",
+            ))?
+            .query_map(params![location_bytes(directory), stem, name], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         ensure!(
             rows.len() <= 1024,
             "sidecar association limit exceeded; no associations silently discarded"
@@ -2009,6 +2198,64 @@ impl ImportDiscovery {
                 provenance:serde_json::json!({"discovery":"case-insensitive stem or full filename plus .xmp","matching_photos":matches,"matching_sidecars":if multiple {"multiple"} else {"one"}})})
         }).collect()
     }
+}
+
+fn index_directory_fact_chunk(
+    db: &Connection,
+    directory: &Path,
+    facts: impl IntoIterator<Item = Result<DirectoryFact>>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
+    let key = location_bytes(directory);
+    let tx = db.unchecked_transaction()?;
+    for fact in facts {
+        ensure!(
+            !cancel.load(std::sync::atomic::Ordering::Acquire),
+            "metadata discovery canceled"
+        );
+        let fact = fact?;
+        ensure!(
+            fact.path.parent() == Some(directory),
+            "directory fact belongs to another parent"
+        );
+        let native = crate::storage_volume::NativePath::from_path(&fact.path);
+        let units = match &native {
+            crate::storage_volume::NativePath::UnixBytes(v) => v.len(),
+            crate::storage_volume::NativePath::WindowsWide(v) => v.len(),
+        };
+        ensure!(
+            units <= crate::catalog_session::PATH_UNITS,
+            "directory fact path exceeds byte admission"
+        );
+        if !fact.regular {
+            continue;
+        }
+        let path = fact.path;
+        let ext = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if ext != "xmp" && !crate::media::supported_extension(&ext) {
+            continue;
+        }
+        let name = path.file_name().context("source has no filename")?;
+        let stem = path.file_stem().context("source has no stem")?;
+        tx.execute(
+            "INSERT INTO metadata_scan_files VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                key,
+                location_bytes(Path::new(name)),
+                name_key(stem),
+                name_key(name),
+                location_bytes(&path),
+                path.to_string_lossy(),
+                ext == "xmp"
+            ],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
 }
 impl Drop for ImportDiscovery {
     fn drop(&mut self) {
@@ -2025,6 +2272,48 @@ impl Drop for ImportDiscovery {
         }
     }
 }
+
+#[cfg(test)]
+mod managed_import_discovery_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn transferred_directory_facts_drive_c_sql_without_local_enumeration() -> Result<()> {
+        let directory = std::env::temp_dir().join(format!(
+            "photocatalog-nonexistent-managed-import-{}",
+            uuid::Uuid::new_v4()
+        ));
+        assert!(!directory.exists());
+        let original = directory.join("IMG_0001.JPG");
+        let sidecar = directory.join("img_0001.xMp");
+        let cancel = AtomicBool::new(false);
+        let discovery = ImportDiscovery::new()?;
+        discovery.begin_directory(&directory)?;
+        discovery.directory_facts(
+            &directory,
+            [
+                Ok(DirectoryFact {
+                    path: original.clone(),
+                    regular: true,
+                }),
+                Ok(DirectoryFact {
+                    path: sidecar.clone(),
+                    regular: true,
+                }),
+            ],
+            &cancel,
+        )?;
+        discovery.finish_directory(&directory)?;
+        let sources = discovery.sidecars_indexed(&original, &cancel)?;
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].locator, location_bytes(&sidecar));
+        assert_eq!(sources[0].kind, "sidecar");
+        assert_eq!(sources[0].provenance["matching_photos"], 1);
+        Ok(())
+    }
+}
+
 pub(crate) struct PreparedImportSource {
     pub(crate) source: Source,
     pub(crate) prepared: std::result::Result<Prepared, String>,
@@ -2065,6 +2354,52 @@ pub(crate) fn prepare_import_source(
         source,
         prepared,
         warning,
+    })
+}
+
+pub(crate) fn prepare_import_inspection(
+    source: Source,
+    inspection: xmp_packets::Inspection,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<PreparedImportSource> {
+    ensure!(
+        !cancel.load(std::sync::atomic::Ordering::Acquire),
+        "metadata preparation canceled"
+    );
+    let prepared = Prepared::new(&inspection, &source)?;
+    let warning = !matches!(inspection.status, Status::Complete | Status::Absent)
+        || prepared
+            .models
+            .iter()
+            .any(|m| m.error.is_some() || !m.projection.issues.is_empty());
+    ensure!(
+        !cancel.load(std::sync::atomic::Ordering::Acquire),
+        "metadata preparation canceled"
+    );
+    Ok(PreparedImportSource {
+        source,
+        prepared: Ok(prepared),
+        warning,
+    })
+}
+
+pub(crate) fn prepare_import_failure(
+    source: Source,
+    message: String,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<PreparedImportSource> {
+    ensure!(
+        !cancel.load(std::sync::atomic::Ordering::Acquire),
+        "metadata preparation canceled"
+    );
+    ensure!(
+        !message.is_empty() && message.len() <= 2048,
+        "metadata inspection failure detail limit"
+    );
+    Ok(PreparedImportSource {
+        source,
+        prepared: Err(message),
+        warning: true,
     })
 }
 
@@ -2244,13 +2579,37 @@ impl Catalog {
         base_model: i64,
         destination: &Path,
     ) -> Result<MetadataExportPlan> {
+        self.plan_metadata_export_with_cancel(
+            asset,
+            expected_revision,
+            base_model,
+            destination,
+            &std::sync::atomic::AtomicBool::new(false),
+            crate::catalog_session::metadata_files::EVIDENCE_BYTES,
+            Default::default(),
+        )
+    }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Preserve the explicit reviewed authority, limits and cancellation contract at this boundary."
+    )]
+    pub(crate) fn plan_metadata_export_with_cancel(
+        &mut self,
+        asset: &str,
+        expected_revision: i64,
+        base_model: i64,
+        destination: &Path,
+        cancel: &std::sync::atomic::AtomicBool,
+        max_existing_bytes: u64,
+        alias_limits: crate::catalog_export_alias::AliasLimits,
+    ) -> Result<MetadataExportPlan> {
+        self.require_jobs_released()?;
+        self.reconcile_export_paths(512)?;
+        ensure!(max_existing_bytes > 0, "existing file byte limit");
+        alias_limits.validate()?;
         let (payload, projected) =
             self.resolved_export_xmp(asset, expected_revision, base_model)?;
-        let plan = crate::metadata_export::plan_export(destination, &payload)?;
-        let hash = blake3::hash(&payload).to_hex().to_string();
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
-        encoder.write_all(&payload)?;
-        let compressed = encoder.finish()?;
+        let native = crate::storage_volume::NativePath::from_path(destination);
         let _write = self
             .writers
             .enter(crate::catalog_writer::Priority::Foreground)?;
@@ -2261,6 +2620,46 @@ impl Catalog {
             revision(&tx, asset)? == expected_revision,
             "metadata changed during export planning"
         );
+        let mut control = crate::catalog_exports::ExportControl::new(cancel);
+        crate::catalog_exports::protect_catalog_original_destination_controlled(
+            &tx,
+            &self.session,
+            destination,
+            alias_limits,
+            &mut control,
+        )?;
+        let plan = match self.session.plan_metadata_file(
+            &native,
+            &payload,
+            max_existing_bytes,
+            alias_limits,
+            cancel,
+        )? {
+            Some(plan) => plan,
+            None => {
+                let mut checkpoint = |_| {
+                    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "metadata planning canceled",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                };
+                crate::metadata_export::plan_export_controlled(
+                    destination,
+                    &payload,
+                    max_existing_bytes,
+                    alias_limits,
+                    &mut checkpoint,
+                )?
+            }
+        };
+        let hash = blake3::hash(&payload).to_hex().to_string();
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&payload)?;
+        let compressed = encoder.finish()?;
         tx.execute(
             "INSERT OR IGNORE INTO metadata_blobs VALUES(?1,?2,?3)",
             params![hash, payload.len() as i64, compressed],
@@ -2346,7 +2745,40 @@ impl Catalog {
         &mut self,
         operation: &str,
     ) -> Result<crate::metadata_export::ExportReceipt> {
+        self.apply_metadata_export_with_cancel(
+            operation,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+    }
+    pub(crate) fn apply_metadata_export_with_cancel(
+        &mut self,
+        operation: &str,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<crate::metadata_export::ExportReceipt> {
+        self.apply_metadata_export_controlled(operation, cancel, None)
+    }
+    pub(crate) fn apply_metadata_export_with_receipt(
+        &mut self,
+        operation: &str,
+        cancel: &std::sync::atomic::AtomicBool,
+        attempt: &str,
+        request_digest: &str,
+        kind: &str,
+    ) -> Result<crate::metadata_export::ExportReceipt> {
+        self.apply_metadata_export_controlled(
+            operation,
+            cancel,
+            Some((attempt, request_digest, kind)),
+        )
+    }
+    fn apply_metadata_export_controlled(
+        &mut self,
+        operation: &str,
+        cancel: &std::sync::atomic::AtomicBool,
+        durable: Option<(&str, &str, &str)>,
+    ) -> Result<crate::metadata_export::ExportReceipt> {
         self.require_jobs_released()?;
+        self.reconcile_export_paths(512)?;
         // IMMEDIATE prevents a concurrent catalog writer from changing metadata between the
         // revision check and external publication. Filesystem recovery evidence remains durable
         // even if the catalog transaction itself fails after publication.
@@ -2356,18 +2788,51 @@ impl Catalog {
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let (asset,expected,plan,hash):(String,i64,String,String)=tx.query_row("SELECT asset_id,revision,plan,payload_hash FROM metadata_export_plans WHERE operation=?1",[operation],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+        if let Some((attempt, digest, _)) = durable {
+            ensure!(
+                crate::catalog_metadata_write::existing(&tx, attempt, digest)?.is_none(),
+                "metadata attempt already committed"
+            );
+        }
+        let stored = crate::catalog_metadata_write::export_plan_row(&tx, operation)?;
+        let asset = stored.asset_id;
+        let expected = stored.revision;
         ensure!(
             crate::catalog_image_exports::current(&tx, operation, &asset, expected)?,
             "catalog metadata changed since export plan; prepare a new plan"
         );
-        let plan: crate::metadata_export::ExportPlan = serde_json::from_str(&plan)?;
-        let payload = read_blob(&tx, &hash)?;
-        let receipt = crate::metadata_export::apply_export(&plan, &payload)?;
+        let plan: crate::metadata_export::ExportPlan = serde_json::from_str(&stored.plan_json)?;
+        let payload = read_blob(&tx, &stored.payload_hash)?;
+        if let Some(limits) = plan.alias_limits {
+            let mut control = crate::catalog_exports::ExportControl::new(cancel);
+            crate::catalog_exports::protect_catalog_original_destination_controlled(
+                &tx,
+                &self.session,
+                &plan.destination,
+                limits,
+                &mut control,
+            )?;
+        }
+        let receipt = match self.session.apply_metadata_file(&plan, &payload, cancel)? {
+            Some(receipt) => receipt,
+            None => crate::metadata_export::apply_export(&plan, &payload)?,
+        };
+        crate::metadata_export::validate_metadata_export_receipt_wire(&receipt, &plan)?;
         tx.execute(
             "UPDATE metadata_export_plans SET receipt=?1 WHERE operation=?2",
             params![serde_json::to_string(&receipt)?, operation],
         )?;
+        if let Some((attempt, digest, kind)) = durable {
+            let owner = crate::catalog_image_exports::owner(&tx, operation, &asset, expected)?;
+            crate::catalog_metadata_write::insert(
+                &tx,
+                attempt,
+                digest,
+                kind,
+                &owner,
+                &serde_json::json!({"operation": operation, "receipt": receipt}),
+            )?;
+        }
         tx.commit()?;
         drop(_write);
         Ok(receipt)
@@ -2396,8 +2861,37 @@ impl Catalog {
         &mut self,
         directory: &Path,
     ) -> Result<crate::metadata_export::ExportReceipt> {
+        self.recover_metadata_export_controlled(
+            directory,
+            false,
+            &std::sync::atomic::AtomicBool::new(false),
+            None,
+        )
+    }
+    pub(crate) fn recover_metadata_export_with_receipt(
+        &mut self,
+        directory: &Path,
+        restore_only: bool,
+        cancel: &std::sync::atomic::AtomicBool,
+        attempt: &str,
+        request_digest: &str,
+    ) -> Result<crate::metadata_export::ExportReceipt> {
+        self.recover_metadata_export_controlled(
+            directory,
+            restore_only,
+            cancel,
+            Some((attempt, request_digest)),
+        )
+    }
+    fn recover_metadata_export_controlled(
+        &mut self,
+        directory: &Path,
+        restore_only: bool,
+        cancel: &std::sync::atomic::AtomicBool,
+        durable: Option<(&str, &str)>,
+    ) -> Result<crate::metadata_export::ExportReceipt> {
         self.require_jobs_released()?;
-        let directory = directory.canonicalize()?;
+        self.reconcile_export_paths(512)?;
         let name = directory
             .file_name()
             .and_then(|s| s.to_str())
@@ -2405,32 +2899,73 @@ impl Catalog {
         let operation = name
             .strip_prefix(".photocatalog-xmp-export-")
             .context("not a LensWorks export operation")?;
-        let (asset, expected, plan): (String, i64, String) = self.db.query_row(
-            "SELECT asset_id,revision,plan FROM metadata_export_plans WHERE operation=?1",
-            [operation],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )?;
-        let plan: crate::metadata_export::ExportPlan = serde_json::from_str(&plan)?;
-        ensure!(
-            plan.destination
-                .parent()
-                .context("export destination has no parent")?
-                .join(format!(".photocatalog-xmp-export-{}", plan.operation))
-                .canonicalize()?
-                == directory,
-            "recovery operation path differs from catalog plan"
-        );
-        if crate::catalog_image_exports::current(&self.db, operation, &asset, expected)? {
-            return self.apply_metadata_export(operation);
-        }
-        let receipt = crate::metadata_export::restore_planned_export(&plan)?;
         let _write = self
             .writers
             .enter(crate::catalog_writer::Priority::Foreground)?;
-        self.db.execute(
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some((attempt, digest)) = durable {
+            ensure!(
+                crate::catalog_metadata_write::existing(&tx, attempt, digest)?.is_none(),
+                "metadata attempt already committed"
+            );
+        }
+        let stored = crate::catalog_metadata_write::export_plan_row(&tx, operation)?;
+        let asset = stored.asset_id;
+        let expected = stored.revision;
+        let plan: crate::metadata_export::ExportPlan = serde_json::from_str(&stored.plan_json)?;
+        let expected_directory = plan
+            .destination
+            .parent()
+            .context("export destination has no parent")?
+            .join(format!(".photocatalog-xmp-export-{}", plan.operation));
+        ensure!(
+            crate::storage_volume::NativePath::from_path(&expected_directory)
+                == crate::storage_volume::NativePath::from_path(directory),
+            "recovery operation path differs from catalog plan"
+        );
+        let current = crate::catalog_image_exports::current(&tx, operation, &asset, expected)?;
+        let restore = restore_only || !current;
+        if !restore && let Some(limits) = plan.alias_limits {
+            let mut control = crate::catalog_exports::ExportControl::new(cancel);
+            crate::catalog_exports::protect_catalog_original_destination_controlled(
+                &tx,
+                &self.session,
+                &plan.destination,
+                limits,
+                &mut control,
+            )?;
+        }
+        let receipt = match if restore {
+            self.session.restore_metadata_file(&plan, cancel)?
+        } else {
+            self.session.recover_metadata_file(&plan, cancel)?
+        } {
+            Some(receipt) => receipt,
+            None if restore => crate::metadata_export::restore_planned_export(&plan)?,
+            None => crate::metadata_export::recover_export(&expected_directory)?,
+        };
+        crate::metadata_export::validate_metadata_export_receipt_wire(&receipt, &plan)?;
+        tx.execute(
             "UPDATE metadata_export_plans SET receipt=?1 WHERE operation=?2",
             params![serde_json::to_string(&receipt)?, operation],
         )?;
+        if let Some((attempt, digest)) = durable {
+            crate::catalog_metadata_write::insert(
+                &tx,
+                attempt,
+                digest,
+                if restore_only {
+                    "sidecar_restore"
+                } else {
+                    "sidecar_recover"
+                },
+                &crate::catalog_image_exports::owner(&tx, operation, &asset, expected)?,
+                &serde_json::json!({"operation": operation, "receipt": receipt}),
+            )?;
+        }
+        tx.commit()?;
         Ok(receipt)
     }
 }

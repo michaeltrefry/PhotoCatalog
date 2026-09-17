@@ -27,7 +27,7 @@ def exclusive(path,value):
         stream.flush();os.fsync(stream.fileno())
 
 
-def source_copy(original,target,limit,expected_sha,free_reserve,deadline):
+def source_copy(original,target,limit,expected_sha,free_reserve,deadline,storage_root,storage_identity):
     from blake3 import blake3
     original=Path(original);target=Path(target)
     flags=os.O_RDONLY|getattr(os,'O_NONBLOCK',0)|getattr(os,'O_NOFOLLOW',0)
@@ -37,8 +37,12 @@ def source_copy(original,target,limit,expected_sha,free_reserve,deadline):
         if not stat.S_ISREG(before.st_mode) or before.st_size>limit:
             raise ValueError('source copy requires admitted ordinary file')
         source_sha=hashlib.sha256();source_b3=blake3();remaining=before.st_size
+        if edit_campaign.storage_identity(storage_root)!=storage_identity:
+            raise ValueError('preparation storage identity changed')
         with target.open('xb') as outgoing:
             while remaining:
+                if edit_campaign.storage_identity(storage_root)!=storage_identity:
+                    raise ValueError('preparation storage identity changed')
                 if time.monotonic()>deadline or psutil.disk_usage(os.fspath(target.parent)).free<free_reserve:
                     raise ValueError('copy deadline/free-space admission exhausted')
                 data=incoming.read(min(65536,remaining))
@@ -52,8 +56,12 @@ def source_copy(original,target,limit,expected_sha,free_reserve,deadline):
         current=original.stat(follow_symlinks=False)
         if any(getattr(after,name)!=getattr(current,name) for name in fields):raise ValueError('original path changed during copy')
     if source_sha.hexdigest()!=expected_sha:raise ValueError('source differs from frozen original manifest')
+    if edit_campaign.storage_identity(storage_root)!=storage_identity:
+        raise ValueError('preparation storage identity changed')
     if digest(target,'sha256',limit)!=source_sha.hexdigest() or digest(target,'blake3',limit)!=source_b3.hexdigest():
         raise ValueError('new copy differs from held original bytes')
+    if edit_campaign.storage_identity(storage_root)!=storage_identity:
+        raise ValueError('preparation storage identity changed')
     return dict(original_path=str(original),path=str(target.resolve()),bytes=before.st_size,
                 sha256=source_sha.hexdigest(),blake3=source_b3.hexdigest(),
                 original_before={name:getattr(before,name) for name in fields},
@@ -67,6 +75,9 @@ def require_host_evidence(host):
 
 def prepare(manifest_descriptor,build,root):
     root=Path(root)
+    if (not root.is_absolute() or root.exists() or root.is_symlink()
+        or root.parent.resolve(strict=True)/root.name!=root):
+        raise ValueError('absolute absent preparation root with physical parent required')
     edit_binding.admit_imports(build['helper_package'])
     edit_binding.validate_runtime(build['python_runtime'])
     if digest(manifest_descriptor['path'],'sha256',qualification.MIB)!=manifest_descriptor['sha256']:
@@ -74,22 +85,25 @@ def prepare(manifest_descriptor,build,root):
     manifest=read_json(manifest_descriptor['path'],qualification.MIB)
     qualification.validate_manifest(manifest)
     funding=edit_disk_budget.budget(manifest)
+    artifact=funding['volumes']['artifact']
     root.mkdir() # no resume/overwrite of a partial preparation
+    artifact_identity=edit_campaign.storage_identity(root)
     exclusive(root/'start.json',dict(manifest=manifest_descriptor,build=build,funding=funding,
                                     deadline_seconds=3600,preparation_owner=funding['preparation_owner'],started=edit_campaign.anchor()))
     sources=[];copies=[];records=[];background=None;error=None
     deadline=time.monotonic()+3600
     try:
-        if psutil.disk_usage(os.fspath(root)).free<funding['minimum_free_bytes']:
+        if psutil.disk_usage(os.fspath(root)).free<artifact['full_sequence_initial_free_bytes']:
             raise ValueError('preparation lacks the full final-campaign funding')
         (root/'sources').mkdir()
-        exclusive(root/'host-identity.json',host_identity(root,[item['path'] for item in manifest['inputs']]))
+        exclusive(root/'host-identity.json',host_identity(root,[item['path'] for item in manifest['inputs']],dict(artifact=root)))
         with HostObservation(root,**funding['preparation_owner']['host_logs']) as host:
             for item in manifest['inputs']:
                 require_host_evidence(host)
                 directory=root/'sources'/item['id'];directory.mkdir()
                 target=directory/('source'+Path(item['path']).suffix)
-                copied=source_copy(item['path'],target,512*qualification.MIB,item['sha256'],funding['free_reserve_bytes'],deadline)
+                copied=source_copy(item['path'],target,512*qualification.MIB,item['sha256'],artifact['free_reserve_bytes'],
+                                   deadline,root,artifact_identity)
                 copies.append(dict(id=item['id'],**copied))
                 sources.append(dict(id=item['id'],width=item['width'],height=item['height'],**copied))
                 require_host_evidence(host)
@@ -98,7 +112,7 @@ def prepare(manifest_descriptor,build,root):
             item=next(item for item in manifest['inputs'] if item['id']=='private-X-T3-RAW')
             directory=root/'background-import';directory.mkdir()
             copied=source_copy(item['path'],directory/('source'+Path(item['path']).suffix),512*qualification.MIB,
-                               item['sha256'],funding['free_reserve_bytes'],deadline)
+                               item['sha256'],artifact['free_reserve_bytes'],deadline,root,artifact_identity)
             background=dict(fixture_id=item['id'],**copied)
             require_host_evidence(host)
             for fixture,(width,height) in edit_fixtures.FIXTURES.items():
@@ -109,10 +123,14 @@ def prepare(manifest_descriptor,build,root):
                 receipt=root/(fixture+'-fixture.json')
                 command=edit_build_plan.python_command(build,'edit_fixtures',[
                     '--admitted','--fixture',fixture,'--output',target,'--receipt',receipt])
+                if edit_campaign.storage_identity(root)!=artifact_identity:
+                    raise ValueError('preparation storage identity changed')
                 limits=dict(deadline_seconds=600,process_rss_bytes=qualification.GIB,
-                            group_rss_bytes=qualification.GIB,free_reserve_bytes=funding['free_reserve_bytes'])
+                            group_rss_bytes=qualification.GIB,
+                            storage=dict(artifact=edit_campaign.storage_descriptor(
+                                root,artifact['free_reserve_bytes'])))
                 supervisor=root/('generate-'+fixture)
-                edit_campaign.invoke(command,supervisor,limits,root)
+                edit_campaign.invoke(command,supervisor,limits,dict(artifact=root))
                 require_host_evidence(host)
                 value=read_json(receipt)
                 if value['id']!=fixture or value['path']!=str(target.resolve()) or (value['width'],value['height'])!=(width,height):

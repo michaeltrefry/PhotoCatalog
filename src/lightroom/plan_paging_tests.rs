@@ -311,7 +311,7 @@ fn current_reopen_preserves_logical_state_and_schema_without_migration() {
         plan.db
             .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        3
+        PLAN_SCHEMA_VERSION
     );
     assert_eq!(
         plan.db

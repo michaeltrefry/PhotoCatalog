@@ -599,7 +599,7 @@ fn export_alias_fact(
         crate::catalog_export_alias::local_alias_fact(path, kind)
     }
 }
-fn protect_alias_controlled(
+pub(crate) fn protect_alias_controlled(
     db: &Connection,
     session: &crate::catalog_session::CatalogSessionAuthority,
     destination: &Path,
@@ -617,6 +617,49 @@ fn protect_alias_controlled(
             export_alias_fact(session, path, kind, &control)
         },
     )?;
+    Ok(())
+}
+
+pub(crate) fn protect_catalog_original_destination_controlled(
+    db: &Connection,
+    session: &crate::catalog_session::CatalogSessionAuthority,
+    destination: &Path,
+    limits: crate::catalog_export_alias::AliasLimits,
+    control: &mut ExportControl<'_>,
+) -> Result<()> {
+    protect_alias_controlled(db, session, destination, limits, control)?;
+    control.check(ExportCheckpoint::Alias)?;
+    let destination = NativePath::from_path(destination);
+    let encoded = serde_json::to_string(&destination)?;
+    let known: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM storage_bindings WHERE native_path=?1)",
+        [encoded],
+        |row| row.get(0),
+    )?;
+    ensure!(!known, "export destination is a catalog original");
+    if let crate::catalog_session::ExportAliasFactValue::File { object, .. } = export_alias_fact(
+        session,
+        &destination,
+        crate::catalog_session::ExportAliasFactKind::Destination,
+        control,
+    )? {
+        let key = object.native()?;
+        let unresolved: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM storage_bindings WHERE file_key IS NULL)",
+            [],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            !unresolved,
+            "catalog original file identities are unresolved; refresh or relink them before overwrite"
+        );
+        let known: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM storage_bindings WHERE file_key=?1)",
+            [format!("{}:{}", key.0, key.1)],
+            |row| row.get(0),
+        )?;
+        ensure!(!known, "export destination aliases a catalog original");
+    }
     Ok(())
 }
 fn metadata_current(db: &Connection, plan: &PhotoExportPlan) -> Result<()> {

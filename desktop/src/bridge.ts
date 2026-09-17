@@ -1,11 +1,14 @@
+import type { PreviewSettingsRequest, PreviewSettingsStatus } from './previewSettings';
 import type {Request as LightroomRequest,Response as LightroomResponse} from './lightroom';
 import type { Request as ExportRequest, Response as ExportResponse } from './photoExport';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import type { Recipe } from './recipe';
 import type { OrganizationRequest, OrganizationResponse } from './organization';
 import type { MetadataRequest, MetadataResponse } from './metadata';
+import type { Request as MetadataWriteRequest, Response as MetadataWriteResponse } from './metadataWrite';
 import type { RelinkRequest, RelinkResponse } from './relink';
 import type { CopyRequest, CopyResponse } from './editCopy';
+import type { Request as LightroomMigrationRequest, Response as LightroomMigrationResponse } from './lightroomMigration';
 
 export type Decimal = string;
 export type NativePath = { encoding: 'UnixBytes' | 'WindowsWide'; units: number[] };
@@ -16,7 +19,10 @@ export type Folder = { id: Decimal; parent: Decimal | null; locator: NativePath;
 export type GridImage = { image_id: string; origin: string; translation_state: string; key: VariantKey; sequence: Decimal; metadata_revision: Decimal; metadata_pending: boolean; state: string; filename: string; rating: Decimal | null; flag: string; label: string; conflicts: string[] };
 export type Variant = { key: VariantKey; label: string; revision: Decimal; recipe: Recipe; recipe_digest: string; can_undo: boolean; can_redo: boolean };
 export type HistoryEntry = { revision: Decimal; kind: string; recipe: Recipe; recipe_digest: string };
-export type PreviewStatus = { ticket: string; key: VariantKey; revision: Decimal; recipe_digest: string; viewport: string; generation: Decimal; state: 'queued' | 'ready' | 'stale' | 'needs_resources' | 'unavailable' | 'failed' | 'cancel_requested' | 'canceled'; message: string | null };
+export type PreviewReadDiagnostic = { outcome: 'ready' | 'missing' | 'stale' | 'failed'; queue_ms: number; owner_read_ms: number; catalog_identity_ms: number; store_read_checksum_ms: number; header_decode_ms: number; total_ms: number; decoded_hits: number; decoded_misses: number };
+export type PreviewDiagnostic = { route: 'pending' | 'retained' | 'original_render' | 'memory_cache'; expected_key_digest: string | null; selected_key_digest: string | null; current_key_matches_selected: boolean | null; retained_read: PreviewReadDiagnostic | null; original_render_ms: number | null; ready_ms: number | null; delivery: { ready_for_transfer_ms: number; retained_read: PreviewReadDiagnostic; transfer_ms: number; total_ms: number } | null };
+export type PreviewStatus = { ticket: string; key: VariantKey; revision: Decimal; recipe_digest: string; viewport: string; generation: Decimal; state: 'queued' | 'ready' | 'stale' | 'needs_resources' | 'unavailable' | 'failed' | 'cancel_requested' | 'canceled'; message: string | null; diagnostic?: PreviewDiagnostic };
+export type FrontendPreviewDiagnostic = { ticket: string; admission_command_ms: number; ready_observed_ms: number; blob_invoke_ms: number; object_url_ms: number; polls: number; native: PreviewDiagnostic };
 export type CullOperation = { operation: 'rating'; value: number } | { operation: 'flag'; value: 'pick' | 'reject' | 'unflagged' } | { operation: 'label'; value: string };
 export type BackupReceipt = { protocol: Decimal; backup_id: string; application_id: Decimal; schema_version: Decimal; database_bytes: Decimal; database_blake3: string };
 export type RestoreReceipt = { protocol: Decimal; restore_id: string; backup: BackupReceipt; schema_version: Decimal };
@@ -27,12 +33,15 @@ type AtCatalog = { catalog: string };
 type AtVariant = AtCatalog & { key: VariantKey };
 type AtRevision = AtVariant & { expected_revision: Decimal };
 export type Request =
+  | {command: 'lightroom_migration';args:{request:LightroomMigrationRequest}}
   | {command: 'lightroom';args:{request:LightroomRequest}}
   | { command: 'export'; args: AtCatalog & { request: ExportRequest } }
   | { command: 'edit_copy'; args: AtCatalog & { request: CopyRequest } }
   | { command: 'relink'; args: AtCatalog & { request: RelinkRequest } }
   | { command: 'metadata'; args: AtCatalog & { request: MetadataRequest } }
+  | { command: 'metadata_write'; args: AtCatalog & { request: MetadataWriteRequest } }
   | { command: 'organization'; args: AtCatalog & { request: OrganizationRequest } }
+  | { command: 'preview_settings'; args: AtCatalog & { request: PreviewSettingsRequest } }
   | { command: 'status' | 'backup_status' }
   | { command: 'backup_create'; args: AtCatalog & { bundle: NativePath } }
   | { command: 'backup_inspect'; args: { bundle: NativePath } }
@@ -54,15 +63,18 @@ export type Request =
   | { command: 'undo' | 'redo'; args: AtRevision }
   | { command: 'history'; args: AtVariant & { after: Decimal; limit: number } }
   | { command: 'cull'; args: AtRevision & { operation: CullOperation } }
-  | { command: 'preview'; args: AtVariant & { tier: 'thumbnail' | 'large'; interactive: boolean; viewport: string; generation: Decimal; foreground: boolean } }
+  | { command: 'preview'; args: AtVariant & { tier: 'thumbnail' | 'large'; interactive: boolean; viewport: string; generation: Decimal; foreground: boolean; diagnostics?: boolean } }
   | { command: 'release_viewport'; args: AtCatalog & { viewport: string; generation: Decimal } }
   | { command: 'preview_status' | 'cancel_preview'; args: AtCatalog & { ticket: string } };
 export interface Data {
+  preview_settings: PreviewSettingsStatus;
+  lightroom_migration: LightroomMigrationResponse;
   lightroom: LightroomResponse;
   export: ExportResponse;
   edit_copy: CopyResponse;
   relink: RelinkResponse;
   metadata: MetadataResponse;
+  metadata_write: MetadataWriteResponse;
   organization: OrganizationResponse;
   backup: BackupStatus | null;
   restore: { receipt: RestoreReceipt; jobs_held: boolean } | null;
@@ -86,21 +98,31 @@ export class CatalogError extends Error {
 }
 
 export const desktopAvailable = isTauri();
+export const isBusyError = (error: unknown): boolean => error instanceof CatalogError && error.code === 'busy';
 export const imageKey = (key: VariantKey) => JSON.stringify([key.asset_id, key.variant_id]);
 
 export async function command<K extends keyof Data>(request: Request, kind: K, signal?: AbortSignal): Promise<Data[K]> {
   if (!desktopAvailable) throw new CatalogError('desktop_required', 'Open the LensWorks desktop app to access your catalog.');
   if (signal?.aborted) throw new DOMException('Canceled', 'AbortError');
   const operation = crypto.randomUUID();
-  const cancel = () => { void invoke('catalog_cancel_operation', { operation }).catch(() => {}); };
+  let cancellation: Promise<void> | undefined;
+  let requestReturned = false;
+  const cancel = () => { cancellation ??= invoke<void>('catalog_cancel_operation', { operation }).catch(() => {}); };
   signal?.addEventListener('abort', cancel, { once: true });
   try {
     const reply = await invoke<Reply>('catalog_command', { operation, request });
+    requestReturned = true;
     if (signal?.aborted) throw new DOMException('Canceled', 'AbortError');
     if (reply.status === 'error') throw new CatalogError(reply.error.code, reply.error.message);
     if (reply.value.kind !== kind) throw new CatalogError('protocol', `Unexpected ${reply.value.kind} response to ${request.command}.`);
     return reply.value.data as Data[K];
-  } finally { signal?.removeEventListener('abort', cancel); }
+  } finally {
+    signal?.removeEventListener('abort', cancel);
+    if (cancellation) {
+      await cancellation;
+      if (requestReturned) await invoke<void>('catalog_settle_cancellation', { operation }).catch(() => {});
+    }
+  }
 }
 
 export async function chooseFolder(createCatalog = false): Promise<{ path: NativePath; display: string } | null> {
@@ -109,7 +131,7 @@ export async function chooseFolder(createCatalog = false): Promise<{ path: Nativ
 
 export async function chooseSource(): Promise<{ path: NativePath; display: string } | null> { return chooseLocation('originals'); }
 
-export async function chooseLocation(purpose: 'originals' | 'backup_bundle' | 'new_backup' | 'new_restore' | 'export_directory' | 'export_profile' | 'lightroom_new_workbench' | 'lightroom_workbench' | 'lightroom_capture_staging' | 'lightroom_discovery_root' | 'lightroom_source_catalog' | 'lightroom_capture_evidence' | 'lightroom_new_capture' | 'lightroom_new_seal' | 'lightroom_approval_destination' | 'lightroom_new_approval_destination'): Promise<{ path: NativePath; display: string } | null> { return invoke('catalog_choose_location', { purpose }); }
+export async function chooseLocation(purpose: 'preview_destination' | 'original_root' | 'originals' | 'backup_bundle' | 'new_backup' | 'new_restore' | 'export_directory' | 'export_profile' | 'metadata_sidecar' | 'metadata_evidence' | 'metadata_recovery' | 'lightroom_new_workbench' | 'lightroom_workbench' | 'lightroom_capture_staging' | 'lightroom_discovery_root' | 'lightroom_source_catalog' | 'lightroom_capture_evidence' | 'lightroom_new_capture' | 'lightroom_new_seal' | 'lightroom_seal' | 'lightroom_approval_destination' | 'lightroom_new_approval_destination'): Promise<{ path: NativePath; display: string } | null> { return invoke('catalog_choose_location', { purpose }); }
 
 export async function previewBlob(catalog: string, ticket: string): Promise<Blob> {
   const handoff = crypto.randomUUID();
@@ -117,6 +139,10 @@ export async function previewBlob(catalog: string, ticket: string): Promise<Blob
     const bytes = await invoke<ArrayBuffer>('catalog_preview_bytes', { catalog, ticket, handoff });
     return new Blob([bytes], { type: 'image/jpeg' });
   } finally { await invoke('catalog_preview_release', { handoff }); }
+}
+
+export async function logPreviewDiagnostic(diagnostic: FrontendPreviewDiagnostic): Promise<boolean> {
+  return invoke<boolean>('catalog_measurement_preview_diagnostic', { diagnostic });
 }
 
 // Display only: never reconstruct filesystem authority from this text.

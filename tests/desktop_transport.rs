@@ -1,4 +1,4 @@
-//! Actual owned child proof is deliberately Status/Close only. No catalog/native worker is opened.
+//! Public managed startup, catalog/Workbench routing and checked shutdown without decoding originals.
 use photocatalog::{
     application::{
         Config, Limits, Reply, Request, Response,
@@ -19,6 +19,17 @@ fn installed_dispatch_protocol_status_close_and_wait_without_catalog_or_decoder(
         preview_limits: preview::ServiceLimits::default(),
         limits: Limits::default(),
     })?;
+    let workbench = bridge
+        .submit(Request::Lightroom {
+            request: Box::new(photocatalog::application::lightroom_bridge::Request::Options {}),
+        })?
+        .recv();
+    assert!(matches!(
+        workbench,
+        Reply::Ok {
+            value: Response::Lightroom(_)
+        }
+    ));
     let pid = bridge.status().pid;
     assert!(pid > 0);
     assert_eq!(bridge.status().phase, TransportPhase::Ready);

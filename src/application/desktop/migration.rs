@@ -14,7 +14,7 @@ use crate::{
         supervisor::{self, Admission, Drained, FailureCause},
         worker,
     },
-    preview::{ByteBudget, ByteReservation},
+    preview::ByteBudget,
 };
 use anyhow::{Context, Result, ensure};
 use std::{
@@ -139,10 +139,135 @@ fn failure(value: &supervisor::Failure) -> api::Failure {
 pub(super) struct Coordinator {
     shared: Weak<Shared>,
     executable: PathBuf,
-    pool: Option<ByteBudget>,
+    funding: Option<Funding>,
     slot: Mutex<Option<Entry>>,
     #[cfg(test)]
     faults: Arc<Mutex<Faults>>,
+}
+#[derive(Clone)]
+pub(super) struct Funding {
+    metadata: Arc<MetadataAdmission>,
+    source: ByteBudget,
+    result: ByteBudget,
+}
+struct MetadataAdmission {
+    bytes: u64,
+    _held: super::preview_metadata_admission::ProcessSubgrant,
+}
+
+fn upload_channel_backing() -> Result<usize> {
+    use crate::lightroom_migration_worker::memory::{channels, layout::add};
+    // The new owner blocks once until the admitted Upload is transferred.
+    add(
+        add(
+            channels::bounded(1, std::alloc::Layout::new::<Upload>())?,
+            channels::pthread_mutexes(2)?,
+        )?,
+        channels::blocking_waiter()?,
+    )
+}
+
+fn bookkeeping_bytes(executable: &std::path::Path, operation: usize, reply: usize) -> Result<u64> {
+    use crate::lightroom_migration_worker::memory::{
+        channels,
+        layout::{add, mul},
+    };
+    use std::{alloc::Layout, mem::size_of};
+    let arc = |layout| channels::arc(layout);
+    let executable_backing = executable.as_os_str().len();
+    let values = [
+        size_of::<Coordinator>(),
+        arc(Layout::new::<MetadataAdmission>())?,
+        // Coordinator retains the configured path while the operation thread
+        // owns its clone through checked LM/Source drain.
+        mul(2, executable_backing)?,
+        size_of::<Entry>(),
+        upload_channel_backing()?,
+        arc(Layout::new::<Job>())?,
+        arc(Layout::new::<Stop>())?,
+        size_of::<Report>(),
+        arc(Layout::new::<Proxy>())?,
+        2 * size_of::<Waiting>(),
+        size_of::<WriteAttempt>(),
+        mul(2, arc(Layout::new::<Mutex<Acquisition>>())?)?,
+        arc(Layout::new::<WriterProxy>())?,
+        arc(Layout::new::<Writers>())?,
+        crate::lightroom_migration_worker::memory::managed_adapter_metadata_backing()?,
+        size_of::<api::Snapshot>(),
+        2 * size_of::<Guard>(),
+        // Session/generation strings plus their digest spellings.
+        mul(2, 36 + 64)?,
+        operation,
+        operation,
+        // Catalog token, progress phase and result digest retained together.
+        128 + 256 + 64,
+        reply,
+        reply,
+        // Independently retained bounded failure strings on the owner and
+        // terminal snapshots.
+        32 * 1024,
+        32 * 1024,
+    ];
+    let bytes = values.into_iter().try_fold(0usize, add)?;
+    Ok(u64::try_from(bytes)?)
+}
+
+pub(super) fn metadata_requirement(config: &application::Config) -> Result<u64> {
+    bookkeeping_bytes(
+        &config.worker_executable,
+        config.limits.request_bytes,
+        config.limits.reply_bytes,
+    )
+}
+
+/// Distinct production payload pools for the complete seven-operation API.
+/// Smaller caller-supplied pools remain valid construction choices and fail at
+/// the exact attempted allocation with the existing typed ResourceLimit.
+pub(super) fn operation_requirements(config: &application::Config) -> Result<(u64, u64)> {
+    let source = worker::managed_source_requirement(
+        &config.worker_executable,
+        config.limits.request_bytes,
+        config.limits.reply_bytes,
+    )?;
+    let result = worker::managed_result_requirement()?;
+    Ok((u64::try_from(source)?, u64::try_from(result)?))
+}
+
+impl Funding {
+    pub(super) fn from_subgrant(
+        config: &application::Config,
+        metadata: super::preview_metadata_admission::ProcessSubgrant,
+        source: ByteBudget,
+        result: ByteBudget,
+    ) -> Result<Self> {
+        let required = metadata_requirement(config)?;
+        ensure!(
+            metadata.bytes() == required,
+            "migration metadata subgrant differs from checked requirement"
+        );
+        ensure!(
+            !metadata.same_pool(&source) && !metadata.same_pool(&result),
+            "migration metadata and operation pools must be distinct"
+        );
+        ensure!(
+            !source.same_pool(&result),
+            "migration Source and result pools must be distinct"
+        );
+        for (name, pool) in [("Source", &source), ("result", &result)] {
+            let (limit, _) = pool.snapshot();
+            ensure!(limit != 0, "migration {name} allowance must be positive");
+            usize::try_from(limit)
+                .with_context(|| format!("migration {name} allowance exceeds target usize"))?;
+        }
+        Ok(Self {
+            metadata: Arc::new(MetadataAdmission {
+                bytes: required,
+                _held: metadata,
+            }),
+            source,
+            result,
+        })
+    }
 }
 struct Entry {
     guard: Guard,
@@ -151,7 +276,7 @@ struct Entry {
     uploaded: u64,
     state: EntryState,
     // Retained API bookkeeping is distinct from operation and result custody.
-    _bookkeeping: Arc<ByteReservation>,
+    _bookkeeping: Arc<MetadataAdmission>,
 }
 #[expect(
     clippy::large_enum_variant,
@@ -246,14 +371,13 @@ impl Job {
     }
 }
 impl Coordinator {
-    pub(super) fn new(shared: &Arc<Shared>, executable: PathBuf, pool: Option<ByteBudget>) -> Self {
-        // Move the caller's existing Config path; idle production state adds no
-        // separate Arc/Vec/String backing. Begin funds operation bookkeeping
-        // before any worker-path copy or operation owner is constructed.
+    pub(super) fn new(shared: &Arc<Shared>, executable: PathBuf, funding: Option<Funding>) -> Self {
+        // Move the caller's existing Config path. Managed construction supplies
+        // the exact once-funded metadata token and distinct operation pools.
         Self {
             shared: Arc::downgrade(shared),
             executable,
-            pool,
+            funding,
             slot: Mutex::new(None),
             #[cfg(test)]
             faults: Default::default(),
@@ -262,34 +386,7 @@ impl Coordinator {
     fn bookkeeping_bytes(&self, operation: &str, reply: usize) -> Result<u64> {
         // Borrowed lengths and fixed layouts only: the token precedes every new
         // owned Guard, preflight Snapshot and operation graph.
-        use std::mem::size_of;
-        let values = [
-            size_of::<Self>(),
-            self.executable.as_os_str().len(),
-            size_of::<Entry>(),
-            size_of::<Job>(),
-            size_of::<Report>(),
-            size_of::<Proxy>(),
-            2 * size_of::<Waiting>(),
-            size_of::<WriteAttempt>(),
-            2 * size_of::<Mutex<Acquisition>>(),
-            size_of::<[usize; 8]>(),
-            size_of::<api::Snapshot>(),
-            2 * size_of::<Guard>(),
-            2 * (36 + 64),
-            operation.len(),
-            operation.len(),
-            128 + 256 + 64,
-            reply,
-            reply,
-            32 * 1024,
-            32 * 1024,
-        ];
-        let bytes = values
-            .into_iter()
-            .try_fold(0usize, |sum, n| sum.checked_add(n))
-            .context("migration bookkeeping overflow")?;
-        Ok(u64::try_from(bytes)?)
+        bookkeeping_bytes(&self.executable, operation.len(), reply)
     }
     fn reap(entry: &mut Entry) -> Result<()> {
         let EntryState::Active { job, thread } = &mut entry.state else {
@@ -412,18 +509,22 @@ impl Coordinator {
                 ));
             }
             drop(state);
-            let pool = self.pool.as_ref().ok_or_else(|| {
+            let funding = self.funding.as_ref().ok_or_else(|| {
                 application::error(
                     ErrorCode::InvalidRequest,
-                    "migration requires managed desktop shared admission",
+                    "migration requires managed desktop funding",
                 )
             })?;
             let bytes = self
                 .bookkeeping_bytes(&operation, shared.limits.reply_bytes)
                 .map_err(bridge)?;
-            let bookkeeping = pool
-                .reserve_exact(bytes)
-                .map_err(|e| application::error(ErrorCode::ResourceLimit, e.to_string()))?;
+            if bytes > funding.metadata.bytes {
+                return Err(application::error(
+                    ErrorCode::ResourceLimit,
+                    "migration bookkeeping exceeds its checked subgrant",
+                ));
+            }
+            let bookkeeping = funding.metadata.clone();
             #[cfg(test)]
             {
                 self.faults.lock().unwrap().graphs_built += 1;
@@ -489,7 +590,7 @@ impl Coordinator {
             }
             let header_bytes = measured(&header, shared.limits.request_bytes).map_err(bridge)?;
             let budget = MemoryBudget::from_parent(
-                SharedAllocationGrant::new(pool.clone()).map_err(bridge)?,
+                SharedAllocationGrant::new(funding.source.clone()).map_err(bridge)?,
             );
             let mut memory = budget.reservation();
             let backing =
@@ -561,7 +662,7 @@ impl Coordinator {
                     budget,
                     _memory: memory,
                 }),
-                _bookkeeping: Arc::new(bookkeeping),
+                _bookkeeping: bookkeeping,
             });
             return self
                 .snapshot(slot.as_ref().unwrap(), shared.limits.reply_bytes)
@@ -677,13 +778,18 @@ impl Coordinator {
                 let executable = self.executable.clone();
                 let guard = entry.guard.clone();
                 let weak = self.shared.clone();
-                let pool = self.pool.as_ref().unwrap().clone();
+                let result = self
+                    .funding
+                    .as_ref()
+                    .expect("admitted migration retains funding")
+                    .result
+                    .clone();
                 let thread = thread::Builder::new()
                     .name("lightroom-migration-owner".into())
                     .spawn(move || {
                         let upload = rx.recv().expect("admitted migration upload owner");
                         let _bookkeeping = bookkeeping;
-                        run(upload, worker_job, weak, executable, guard, pool)
+                        run(upload, worker_job, weak, executable, guard, result)
                     })
                     .map_err(|e| application::error(ErrorCode::Native, e.to_string()))?;
                 let old = std::mem::replace(
@@ -1518,9 +1624,9 @@ fn run(
     shared: Weak<Shared>,
     executable: PathBuf,
     guard: Guard,
-    pool: ByteBudget,
+    result_pool: ByteBudget,
 ) -> Drained {
-    let result_budget = MemoryBudget::from_shared(pool);
+    let result_budget = MemoryBudget::from_shared(result_pool);
     let proxy = Arc::new(Proxy {
         client: relay::Client::new(&shared.upgrade().expect("live desktop migration owner")),
         shared,

@@ -1013,6 +1013,7 @@ fn rendering_allows_sibling_edit_and_foreground_preview_reaps_export_first() -> 
             viewport: "foreground".into(),
             generation: U64(1),
             foreground: true,
+            diagnostics: false,
         },
     )?
     else {

@@ -1,6 +1,7 @@
 //! Actual outer G owns both sibling processes. This is a private fixture, not
 //! production State selection or an alternate filesystem authority protocol.
 use super::*;
+use crate::catalog_session::{ConfirmSqlAdmission, SQL_ROLES, SqlRole, SqlRoleObservation};
 use crate::{
     catalog_session::{BootstrapMode, CatalogFilesystem, LeaseId, PrepareCatalog},
     filesystem_worker::{client::Client, wire::AdmissionState},
@@ -362,6 +363,12 @@ fn actual(lost_confirm: bool, alias: bool, lost_prepare: bool) -> anyhow::Result
                     anyhow::bail!("injected loss of actual F confirmation reply")
                 }
             }
+            Call::Storage(_) => {
+                ensure!(
+                    !contender(&database)?,
+                    "writer lock escaped F storage observation"
+                );
+            }
             Call::RestoreStatus(_) | Call::Resume { .. } => {
                 ensure!(
                     !contender(&database)?,
@@ -505,6 +512,265 @@ fn actual_confirm_loss_reaps_c74_before_f_retirement() -> anyhow::Result<()> {
 #[ignore = "requires the exact built CLI; scripts/test_catalog_filesystem_processes.py runs this"]
 fn actual_f_binary_shm_alias_read_does_not_release_c_posix_lock() -> anyhow::Result<()> {
     actual(false, true, false)
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires the exact built CLI; scripts/test_catalog_filesystem_processes.py runs this"]
+fn actual_f_import_alias_read_and_lock_custody_preserve_c_posix_sql_lock() -> anyhow::Result<()> {
+    use crate::catalog_session::import::{Action, Request as ImportRequest, Value};
+
+    let executable = PathBuf::from(
+        std::env::var_os("PHOTOCATALOG_TEST_EXECUTABLE")
+            .context("qualified built photocatalog executable required for actual F fixture")?,
+    );
+    ensure!(
+        executable.is_absolute(),
+        "actual F executable must be absolute"
+    );
+    let temp = tempfile::tempdir()?;
+    let base = temp.path().canonicalize()?;
+    let originals = base.join("originals");
+    std::fs::create_dir(&originals)?;
+    let client = Client::spawn(&executable, vec![NativePath::from_path(&originals)])?;
+    let prepare = PrepareCatalog {
+        operation: crate::application::U64(u64::MAX - 3),
+        session: LeaseId::new(),
+        mode: BootstrapMode::DesktopCreate,
+        root: NativePath::from_path(&base.join("catalog")),
+        manifest_root: NativePath::from_path(&base.join("manifest")),
+        import_source: None,
+    };
+    let bootstrap = client.prepare_catalog(&prepare, &AtomicBool::new(false))?;
+    let root = bootstrap.root_capability();
+    let database = bootstrap.catalog.path.to_path()?;
+    let db = rusqlite::Connection::open(&database)?;
+    db.execute_batch(
+        "CREATE TABLE import_alias_lock_fixture(n INTEGER NOT NULL); \
+         INSERT INTO import_alias_lock_fixture VALUES(1); \
+         BEGIN IMMEDIATE; UPDATE import_alias_lock_fixture SET n=2;",
+    )?;
+    let alias = originals.join("catalog-alias.jpg");
+    std::fs::hard_link(&database, &alias)?;
+    client.confirm_sql_admission(
+        &ConfirmSqlAdmission {
+            operation: bootstrap.operation,
+            root: root.clone(),
+            roles: SQL_ROLES.map(|role| SqlRoleObservation {
+                role,
+                physical: if role == SqlRole::Manifest {
+                    bootstrap.manifest.physical
+                } else {
+                    bootstrap.catalog.physical
+                },
+            }),
+        },
+        &AtomicBool::new(false),
+    )?;
+    ensure!(!contender(&database)?, "C write lock was not established");
+
+    let transfer = LeaseId::new();
+    let mut step = 0u64;
+    let mut import = |action| -> anyhow::Result<Value> {
+        let request = ImportRequest {
+            root: root.clone(),
+            transfer: transfer.clone(),
+            step: crate::application::U64(step),
+            action,
+        };
+        let reply = client.import_call(&request, &AtomicBool::new(false))?;
+        step += 1;
+        Ok(reply.value)
+    };
+    ensure!(matches!(
+        import(Action::Begin {
+            source: NativePath::from_path(&originals)
+        })?,
+        Value::Begun { .. }
+    ));
+    loop {
+        match import(Action::Next)? {
+            Value::Header { path, .. } => {
+                ensure!(path == NativePath::from_path(&alias), "wrong import alias");
+                break;
+            }
+            Value::DirectoryStart { .. }
+            | Value::DirectoryFacts { .. }
+            | Value::DirectoryEnd { .. }
+            | Value::Skipped => {}
+            value => anyhow::bail!("unexpected import alias walk reply: {value:?}"),
+        }
+    }
+    ensure!(
+        !contender(&database)?,
+        "F import alias read released C's SQLite write lock"
+    );
+    ensure!(matches!(import(Action::Abort)?, Value::Aborted));
+    db.execute_batch("ROLLBACK")?;
+    ensure!(contender(&database)?, "C write lock did not retire");
+    drop(db);
+    client.release_root(&root)?;
+    client.try_shutdown()?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the exact built CLI; scripts/test_catalog_filesystem_processes.py runs this"]
+fn actual_f_protocol_restores_offline_import_root_for_export() -> anyhow::Result<()> {
+    use crate::catalog_session::{
+        InspectExportOriginal, RestoreOriginalRootRequest,
+        import::{Action, Request as ImportRequest, Value},
+    };
+
+    fn confirm(
+        client: &Client,
+        bootstrap: &crate::catalog_session::CatalogBootstrap,
+    ) -> anyhow::Result<()> {
+        client.confirm_sql_admission(
+            &ConfirmSqlAdmission {
+                operation: bootstrap.operation,
+                root: bootstrap.root_capability(),
+                roles: SQL_ROLES.map(|role| SqlRoleObservation {
+                    role,
+                    physical: if role == SqlRole::Manifest {
+                        bootstrap.manifest.physical
+                    } else {
+                        bootstrap.catalog.physical
+                    },
+                }),
+            },
+            &AtomicBool::new(false),
+        )?;
+        Ok(())
+    }
+
+    let executable = PathBuf::from(
+        std::env::var_os("PHOTOCATALOG_TEST_EXECUTABLE")
+            .context("qualified built photocatalog executable required for actual F fixture")?,
+    );
+    let temp = tempfile::tempdir()?;
+    let base = temp.path().canonicalize()?;
+    let originals = base.join("selected-originals");
+    std::fs::create_dir(&originals)?;
+    let photo = originals.join("asset.raw");
+    std::fs::write(&photo, b"offline-capable-original")?;
+    let catalog = base.join("catalog");
+    let manifest = base.join("manifest");
+
+    let first = Client::spawn(&executable, vec![])?;
+    let first_bootstrap = first.prepare_catalog(
+        &PrepareCatalog {
+            operation: crate::application::U64(u64::MAX - 8),
+            session: LeaseId::new(),
+            mode: BootstrapMode::DesktopCreate,
+            root: NativePath::from_path(&catalog),
+            manifest_root: NativePath::from_path(&manifest),
+            import_source: None,
+        },
+        &AtomicBool::new(false),
+    )?;
+    confirm(&first, &first_bootstrap)?;
+    let first_root = first_bootstrap.root_capability();
+    let transfer = LeaseId::new();
+    let begin = ImportRequest {
+        root: first_root.clone(),
+        transfer: transfer.clone(),
+        step: crate::application::U64(0),
+        action: Action::Begin {
+            source: NativePath::from_path(&originals),
+        },
+    };
+    ensure!(matches!(
+        first.import_call(&begin, &AtomicBool::new(false))?.value,
+        Value::Begun { source } if source == NativePath::from_path(&originals)
+    ));
+    let abort = ImportRequest {
+        root: first_root.clone(),
+        transfer,
+        step: crate::application::U64(1),
+        action: Action::Abort,
+    };
+    ensure!(matches!(
+        first.import_call(&abort, &AtomicBool::new(false))?.value,
+        Value::Aborted
+    ));
+    let inspect = InspectExportOriginal {
+        root: first_root.clone(),
+        requested: NativePath::from_path(&photo),
+        allowance: crate::application::U64(std::fs::metadata(&photo)?.len()),
+    };
+    first.inspect_export_original(&inspect, &AtomicBool::new(false))?;
+    first.release_root(&first_root)?;
+    first.try_shutdown()?;
+
+    let mut preview = crate::preview::PreviewStore::open(
+        crate::preview::StoreConfig {
+            manifest_root: manifest.clone(),
+            layout: crate::preview::Layout::HashPrefix,
+            thumbnail_root: base.join("thumbnail"),
+            large_root: base.join("large"),
+            thumbnail_bytes: 1024 * 1024,
+            large_bytes: 1024 * 1024,
+        },
+        &[],
+    )?;
+    preview.register_original_root(&originals)?;
+    drop(preview);
+
+    let second = Client::spawn(&executable, vec![])?;
+    let second_bootstrap = second.prepare_catalog(
+        &PrepareCatalog {
+            operation: crate::application::U64(u64::MAX - 7),
+            session: LeaseId::new(),
+            mode: BootstrapMode::DesktopExisting,
+            root: NativePath::from_path(&catalog),
+            manifest_root: NativePath::from_path(&manifest),
+            import_source: None,
+        },
+        &AtomicBool::new(false),
+    )?;
+    confirm(&second, &second_bootstrap)?;
+    let second_root = second_bootstrap.root_capability();
+    let mut reopened_inspect = inspect.clone();
+    reopened_inspect.root = second_root.clone();
+    ensure!(
+        second
+            .inspect_export_original(&reopened_inspect, &AtomicBool::new(false))
+            .is_err(),
+        "reopened F unexpectedly inherited process-local root authority"
+    );
+    let parked = base.join("temporarily-offline-originals");
+    std::fs::rename(&originals, &parked)?;
+    let restore = RestoreOriginalRootRequest {
+        root: second_root.clone(),
+        manifest_physical: second_bootstrap.manifest.physical,
+        original: NativePath::from_path(&originals),
+    };
+    second.restore_original_root(&restore, &AtomicBool::new(false))?;
+    std::fs::rename(&parked, &originals)?;
+    second.inspect_export_original(&reopened_inspect, &AtomicBool::new(false))?;
+
+    let overlap = RestoreOriginalRootRequest {
+        root: second_root.clone(),
+        manifest_physical: second_bootstrap.manifest.physical,
+        original: NativePath::from_path(&manifest),
+    };
+    ensure!(
+        second
+            .restore_original_root(&overlap, &AtomicBool::new(false))
+            .is_err(),
+        "preview cache overlap was restored as original authority"
+    );
+    let relative = RestoreOriginalRootRequest {
+        root: second_root.clone(),
+        manifest_physical: second_bootstrap.manifest.physical,
+        original: NativePath::from_path(Path::new("relative")),
+    };
+    ensure!(relative.validate().is_err(), "relative root was accepted");
+    second.inspect_export_original(&reopened_inspect, &AtomicBool::new(false))?;
+    second.release_root(&second_root)?;
+    second.try_shutdown()?;
+    Ok(())
 }
 
 #[test]

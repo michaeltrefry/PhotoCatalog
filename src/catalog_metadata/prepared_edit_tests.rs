@@ -244,3 +244,51 @@ fn callback_sees_new_revision_and_failure_rolls_back_entire_commit() -> Result<(
     );
     Ok(())
 }
+
+#[test]
+fn durable_attempt_replays_exact_result_and_failed_cas_writes_no_receipt() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut catalog = fixture(&temp.path().join("catalog"))?;
+    let attempt = uuid::Uuid::new_v4().to_string();
+    let digest = blake3::hash(b"prepared edit request").to_hex().to_string();
+    let edit = prepare(&catalog, "a")?;
+    let change = catalog.commit_prepared_metadata_edit_with_receipt(edit, &attempt, &digest)?;
+    let receipt = catalog
+        .metadata_write_receipt(&attempt)?
+        .context("durable metadata receipt")?;
+    assert_eq!(receipt.request_digest, digest);
+    assert_eq!(receipt.kind, "edit");
+    assert_eq!(receipt.result["revision"], change.revision);
+    assert!(
+        crate::catalog_metadata_write::existing(
+            &catalog.db,
+            &attempt,
+            blake3::hash(b"different request").to_hex().as_ref(),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("different request")
+    );
+
+    let stale = prepare(&catalog, "a")?;
+    let view = catalog.metadata("a")?;
+    catalog.edit_metadata(
+        "a",
+        view.revision,
+        None,
+        &[Edit::Set {
+            namespace: xmp::XMP.into(),
+            path: "Rating".into(),
+            value: "4".into(),
+        }],
+    )?;
+    let failed_attempt = uuid::Uuid::new_v4().to_string();
+    let failed_digest = blake3::hash(b"stale prepared edit").to_hex().to_string();
+    assert!(
+        catalog
+            .commit_prepared_metadata_edit_with_receipt(stale, &failed_attempt, &failed_digest,)
+            .is_err()
+    );
+    assert!(catalog.metadata_write_receipt(&failed_attempt)?.is_none());
+    Ok(())
+}

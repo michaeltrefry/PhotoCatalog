@@ -1926,6 +1926,29 @@ impl PreviewService {
     pub fn cache_configuration(&self) -> &StoreConfig {
         self.store.configuration()
     }
+    pub fn cache_relocation_pending(&self) -> Result<bool> {
+        self.store.relocation_pending()
+    }
+    pub fn cache_relocation_snapshot(&self) -> Result<Option<super::store::RelocationSnapshot>> {
+        self.store.relocation_snapshot()
+    }
+    pub(crate) fn original_root_review(&self) -> Result<super::OriginalRootReview> {
+        self.store.original_root_review()
+    }
+    pub(crate) fn replace_original_root_review(
+        &mut self,
+        roots: &[PathBuf],
+        storage_epoch: u64,
+    ) -> Result<()> {
+        self.store
+            .replace_original_root_review(roots, storage_epoch)
+    }
+    pub(crate) fn register_original_root(&mut self, root: &Path) -> Result<()> {
+        self.store.register_original_root(root)
+    }
+    pub(crate) fn register_observed_original_root(&mut self, root: &Path) -> Result<()> {
+        self.store.register_observed_original_root(root)
+    }
     pub fn begin_relocation(
         &mut self,
         tier: Tier,

@@ -1454,20 +1454,13 @@ fn lm_executor_batch3_unpinned_live_schema_eleven_upgrades_with_existing_lock() 
     let fixture = crate::catalog_migration::supplements::tests::Fixture::new()?;
     let destination = root.path().canonicalize()?.join("legacy");
     let catalog = Catalog::open(&destination)?;
-    // Reverse exactly migration 12 on an empty catalog. This is the actual
+    // Reverse migrations after schema 11 on an empty catalog. This is the actual
     // schema-11 shape, so Bootstrap must execute the real migration successfully.
-    catalog.db.execute_batch(
-        "DROP TRIGGER storage_review_plan;
-        DROP TRIGGER storage_review_item_insert; DROP TRIGGER storage_review_item_update;
-        DROP TRIGGER storage_review_source_insert; DROP TRIGGER storage_review_source_update;
-        DROP TRIGGER storage_reviewed_fingerprint;
-        DROP TABLE storage_review_summary; DROP TABLE storage_source_fences;
-        DROP TABLE storage_hydration_transitions;
-        ALTER TABLE storage_plans DROP COLUMN revision;
-        ALTER TABLE storage_plans DROP COLUMN review_token;
-        ALTER TABLE storage_plans DROP COLUMN rules;
-        PRAGMA user_version=11;",
-    )?;
+    catalog.db.execute_batch(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/relink-v12-downgrade.sql"
+    )))?;
+    catalog.db.pragma_update(None, "user_version", 11)?;
     assert_eq!(
         catalog
             .db

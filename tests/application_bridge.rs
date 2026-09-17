@@ -69,6 +69,7 @@ fn preview(b: &Bridge, token: &str, key: &VariantKey, generation: u64) -> Result
             viewport: "selected".into(),
             generation: U64(generation),
             foreground: true,
+            diagnostics: false,
         },
     )?
     else {
@@ -448,6 +449,7 @@ fn close_reaps_an_observed_active_native_preview_before_cache_reopen() -> Result
             viewport: "selected".into(),
             generation: U64(1),
             foreground: true,
+            diagnostics: false,
         },
     )?
     else {
@@ -838,6 +840,7 @@ fn incremental_import_interleaves_edits_cancels_rewalks_and_preserves_originals(
             viewport: "current".into(),
             generation: U64(1),
             foreground: true,
+            diagnostics: false,
         },
     )?
     else {
@@ -1379,6 +1382,7 @@ fn request_initial_preview(
             viewport: viewport.into(),
             generation: U64(1),
             foreground: true,
+            diagnostics: false,
         },
     )?
     else {

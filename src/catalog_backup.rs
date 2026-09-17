@@ -18,6 +18,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[doc(hidden)]
+pub mod managed;
+#[doc(hidden)]
+pub mod managed_filesystem;
+
 const DB: &str = "catalog.sqlite3";
 const PENDING: &str = ".photocatalog-pending.json";
 const COMPLETED: &str = ".photocatalog-completed-intent.json";

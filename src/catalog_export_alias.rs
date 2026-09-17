@@ -50,7 +50,7 @@ CREATE TRIGGER export_alias_path_added AFTER INSERT ON export_alias_paths BEGIN 
 CREATE TRIGGER export_alias_path_deleted AFTER DELETE ON export_alias_paths BEGIN UPDATE export_alias_directories SET members=members-1 WHERE id=old.parent; END;
 CREATE TRIGGER export_alias_path_parent AFTER UPDATE OF parent ON export_alias_paths WHEN old.parent!=new.parent BEGIN UPDATE export_alias_directories SET members=members-1 WHERE id=old.parent; UPDATE export_alias_directories SET members=members+1 WHERE id=new.parent; END;
 ";
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AliasLimits {
     /// Current distinct parent-directory resolutions per overwrite, not images.
     pub directories: usize,
@@ -63,6 +63,15 @@ impl Default for AliasLimits {
             directories: 4096,
             candidates: 256,
         }
+    }
+}
+impl AliasLimits {
+    pub(crate) fn validate(self) -> Result<()> {
+        ensure!(
+            self.directories <= 65536 && (1..=4096).contains(&self.candidates),
+            "export alias validation budget"
+        );
+        Ok(())
     }
 }
 #[derive(Debug, Serialize)]
@@ -396,10 +405,7 @@ pub(crate) fn protect_destination_with_facts(
         !db.is_autocommit(),
         "alias validation requires an authoritative catalog transaction"
     );
-    ensure!(
-        limits.directories <= 65536 && (1..=4096).contains(&limits.candidates),
-        "export alias validation budget"
-    );
+    limits.validate()?;
     let unbound: i64 = db.query_row(
         "SELECT unbound FROM export_alias_state WHERE id=1",
         [],

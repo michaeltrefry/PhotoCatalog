@@ -42,7 +42,8 @@ def budget(manifest):
     retained_proxy_reference=0
     namespace_count=0
     active_extra=0
-    files=0
+    service_files=0
+    artifact_files=0
     normal_extent=512*q.MIB
     per_namespace_payload=(64+256+256)*q.MIB  # retained, large, prepared
     per_namespace_sql_allowance=64*q.MIB
@@ -56,37 +57,37 @@ def budget(manifest):
             raw_needed=(case['operation']=='combined' or w*h<=512*512)
             if raw_needed:
                 retained_raw+=w*h*16*count
-                files+=count
+                artifact_files+=count
             retained_encoded+=extent*len(case['outputs'])*count
-            files+=len(case['outputs'])*count
+            artifact_files+=len(case['outputs'])*count
         elif phase=='proxy_reference':
             scale=min(1,1600/max(w,h))
             pw=max(1,math.floor(w*scale+.5))
             ph=max(1,math.floor(h*scale+.5))
             retained_raw+=pw*ph*16*count
             retained_proxy_reference+=8*q.MIB*count
-            files+=2*count
+            artifact_files+=2*count
         if phase in ('warm_service','first_raw','export','export_correctness','overlap_import','overlap_export'):
             namespace_count+=1
-            files+=per_namespace_entries
+            service_files+=per_namespace_entries
             if phase=='export':
                 # Keep first measured complete output; additional21 successful
                 # destinations plus an additional sealed copy can coexist with current staging;
                 # all are funded until independent verification and cleanup.
                 retained_encoded+=extent
                 active_extra=max(active_extra,(case['warmups']+case['repetitions'])*extent)
-                files+=1
+                artifact_files+=1
             elif phase=='export_correctness':
                 retained_encoded+=extent
-                files+=1
+                artifact_files+=1
             elif phase=='overlap_export':
                 retained_encoded+=extent
-                files+=1
+                artifact_files+=1
             elif phase in ('warm_service','first_raw'):
                 retained_encoded+=len(case['recipes'])*8*q.MIB
                 retained_raw+=len(case['recipes'])*1600*1600*3
-                files+=len(case['recipes'])
-                files+=len(case['recipes'])
+                artifact_files+=len(case['recipes'])
+                artifact_files+=len(case['recipes'])
     # Two children per probe (probe+independent verification), seven generators,
     # then one aggregate. This must be revised if actual actions change.
     children=2*len(cases)+len(edit_fixtures.FIXTURES)+1
@@ -99,20 +100,77 @@ def budget(manifest):
                            +preparation['host_logs']['max_bytes']+preparation['stdout_bytes']+preparation['stderr_bytes']+q.MIB)
     request_receipt_allowance=len(cases)*20*q.MIB
     namespace_allowance=namespace_count*(per_namespace_payload+per_namespace_sql_allowance)
-    allocation_overhead=(files+children*9+32)*4096
+    # Service entries are catalog/preview/cache metadata. Child supervision,
+    # requests and evidence are retained with the external artifact namespace.
+    service_allocation_overhead=service_files*4096
+    artifact_allocation_overhead=(artifact_files+children*9+32)*4096
+    allocation_overhead=service_allocation_overhead+artifact_allocation_overhead
     retained=retained_raw+retained_encoded+retained_proxy_reference+namespace_allowance+stream_allowance+request_receipt_allowance+allocation_overhead+outer_allowance+preparation_allowance
     # Owned originals use declared encoded ceilings, never expected compression.
     copies=len(manifest['inputs'])*normal_extent+4*q.GIB+16*q.MIB+normal_extent
-    active=active_extra+32*q.MIB # native staging reservation, beyond retained basis
+    # One full encoded output is live in catalog-rooted export-worker staging.
+    # The remainder of the timing-export coexistence bound is destination-side.
+    staging_extent=max(
+        case.get('limits',{}).get('encoded_extent',case.get('encoded_extent',normal_extent))
+        for case in cases if case['phase'] in ('export','export_correctness','overlap_export'))
+    service_active=staging_extent+32*q.MIB
+    if active_extra<staging_extent:raise ValueError('export coexistence bound does not fund staging')
+    artifact_active=active_extra-staging_extent
+    active=service_active+artifact_active
     reserve=16*q.GIB
-    funded=retained+active+copies+reserve
-    minimum=math.ceil(funded/q.GIB)*q.GIB
-    return dict(version=2,outer_owner=outer,preparation_owner=preparation,proposed_probe_count=len(cases),proposed_total_children=children,
+    service_retained=namespace_allowance+service_allocation_overhead
+    artifact_retained=retained-service_retained
+    aggregate_evidence=64*q.MIB+64*1024 # fixed report plus outer-owner receipt
+    def volume(components,retained_bytes,active_bytes,copies_bytes,post_campaign_bytes=0):
+        if (sum(components['retained'].values())!=retained_bytes
+            or sum(components['active'].values())!=active_bytes
+            or sum(components['copies'].values())!=copies_bytes
+            or sum(components['post_campaign'].values())!=post_campaign_bytes):
+            raise ValueError('volume component ledger does not reconcile')
+        funded=retained_bytes+active_bytes+copies_bytes+reserve
+        return dict(components=components,retained_bound_bytes=retained_bytes,
+            active_bound_bytes=active_bytes,copies_bound_bytes=copies_bytes,
+            free_reserve_bytes=reserve,minimum_free_bytes=math.ceil(funded/q.GIB)*q.GIB,
+            post_campaign_bytes=post_campaign_bytes,
+            output_stop_bytes=retained_bytes+active_bytes)
+    service=volume(dict(
+                        retained=dict(service_namespaces=namespace_allowance,
+                                      allocation_overhead=service_allocation_overhead),
+                        active=dict(export_staging_extent=staging_extent,
+                                    native_staging_overhead=32*q.MIB),
+                        copies={},post_campaign={}),
+                   service_retained,service_active,0)
+    artifact=volume(dict(
+                        retained=dict(raw=retained_raw,encoded=retained_encoded,
+                                      proxy_jpeg=retained_proxy_reference,evidence_streams=stream_allowance,
+                                      outer_and_host=outer_allowance,
+                                      preparation_outer_and_host=preparation_allowance,
+                                      requests_receipts=request_receipt_allowance,
+                                      allocation_overhead=artifact_allocation_overhead),
+                        active=dict(export_coexistence=artifact_active),
+                        copies=dict(source_copies=copies),
+                        post_campaign=dict(aggregate_report_and_owner_receipt=aggregate_evidence)),
+                    artifact_retained,artifact_active,copies,aggregate_evidence)
+    service['campaign_admission_bytes']=service['minimum_free_bytes']
+    service['full_sequence_initial_free_bytes']=service['campaign_admission_bytes']
+    artifact['campaign_admission_bytes']=artifact['minimum_free_bytes']+artifact['post_campaign_bytes']
+    artifact['full_sequence_initial_free_bytes']=artifact['campaign_admission_bytes']+copies
+    if (service_retained+artifact_retained!=retained
+        or service_active+artifact_active!=active
+        or service['output_stop_bytes']+artifact['output_stop_bytes']!=retained+active
+        or service_files!=namespace_count*per_namespace_entries):
+        raise ValueError('split storage accounting does not reconcile')
+    return dict(version=3,outer_owner=outer,preparation_owner=preparation,proposed_probe_count=len(cases),proposed_total_children=children,
         components=dict(raw=retained_raw,encoded=retained_encoded,proxy_jpeg=retained_proxy_reference,
                         service_namespaces=namespace_allowance,evidence_streams=stream_allowance,outer_and_host=outer_allowance,preparation_outer_and_host=preparation_allowance,
                         requests_receipts=request_receipt_allowance,allocation_overhead=allocation_overhead),
         retained_bound_bytes=retained,active_bound_bytes=active,copies_bound_bytes=copies,
-        free_reserve_bytes=reserve,minimum_free_bytes=minimum,
+        free_reserve_bytes_per_volume=reserve,
+        minimum_free_bytes_by_volume=dict(service=service['minimum_free_bytes'],artifact=artifact['minimum_free_bytes']),
+        campaign_admission_bytes_by_volume=dict(service=service['campaign_admission_bytes'],artifact=artifact['campaign_admission_bytes']),
+        full_sequence_initial_free_bytes_by_volume=dict(service=service['full_sequence_initial_free_bytes'],artifact=artifact['full_sequence_initial_free_bytes']),
+        combined_campaign_admission_bytes=service['campaign_admission_bytes']+artifact['campaign_admission_bytes'],
+        volumes=dict(service=service,artifact=artifact),
         output_stop_bytes=retained+active,
         accounting_scope='content extents plus explicit sampled metadata/filesystem allowances; live free-space guard remains required',
         retention='all failures and camera correctness outputs; each successful export timing child keeps its first measured output after all22 independent readbacks',

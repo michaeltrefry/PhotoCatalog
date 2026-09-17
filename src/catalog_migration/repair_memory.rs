@@ -32,6 +32,22 @@ pub(crate) struct Operation {
 pub(crate) struct Phase {
     state: Option<Rc<RefCell<State>>>,
 }
+
+/// One managed Run/repair keeps the fixed execution graph for its lifetime and
+/// may additionally materialize one bounded SQL/Adobe phase. The execution
+/// graph already enumerates every accepted 8 MiB document family, four
+/// simultaneous item owners and the larger retained hierarchy/archive family;
+/// it is therefore also a conservative upper bound for one phase's live copies.
+pub(crate) fn operation_requirement() -> Result<usize> {
+    let floor = core::worker_repair_execution()?;
+    add(
+        floor,
+        floor.max(core::repair_adobe_catalog(
+            crate::catalog_migration::saved::DOCUMENT_BYTES,
+        )?),
+    )
+}
+
 impl Operation {
     /// Declared before all prepared owners and retained until Output publication.
     pub(crate) fn install(budget: &MemoryBudget) -> Result<Self> {

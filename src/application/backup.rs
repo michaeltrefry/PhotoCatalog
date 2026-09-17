@@ -11,8 +11,11 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-const PATH_UNITS: usize = 32 * 1024;
-const ERROR_BYTES: usize = 16 * 1024;
+pub(crate) const PATH_UNITS: usize = 32 * 1024;
+pub(crate) const ERROR_BYTES: usize = 16 * 1024;
+// Inspected manifests accept all Uuid::parse_str formats, including URNs.
+pub(crate) const UUID_BYTES: usize = uuid::fmt::Urn::LENGTH;
+pub(crate) const DIGEST_BYTES: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(
@@ -25,6 +28,8 @@ pub enum Request {
     Create {
         source: NativePath,
         bundle: NativePath,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_source: Option<crate::catalog_session::PhysicalObjectId>,
     },
     Inspect {
         bundle: NativePath,
@@ -138,16 +143,50 @@ struct Active {
 /// IDs are minted here, not supplied/replayed by callers; stale cancel IDs fail.
 pub struct Coordinator {
     limits: core::Limits,
+    backend: Backend,
     latest: Option<Snapshot>,
     active: Option<Active>,
+    #[cfg(test)]
+    process_probe: Option<Arc<dyn Fn(core::managed::ProcessEvent) + Send + Sync>>,
+}
+enum Backend {
+    Legacy,
+    Managed(PathBuf),
+}
+/// Exact inline root for the additional managed coordinator retained by G.
+/// `Active` is inline in this root; only its independently allocated Arc/path/
+/// result backings are assembled beside the other managed process metadata.
+pub(crate) fn metadata_owner_layout() -> (usize, usize) {
+    (
+        std::mem::size_of::<Mutex<Coordinator>>(),
+        std::mem::align_of::<Mutex<Coordinator>>(),
+    )
 }
 impl Coordinator {
     pub fn new(limits: core::Limits) -> Result<Self> {
         limits.validate()?;
         Ok(Self {
             limits,
+            backend: Backend::Legacy,
             latest: None,
             active: None,
+            #[cfg(test)]
+            process_probe: None,
+        })
+    }
+    pub(crate) fn new_managed(limits: core::Limits, executable: PathBuf) -> Result<Self> {
+        limits.validate()?;
+        ensure!(
+            executable.is_absolute(),
+            "managed backup executable must be absolute"
+        );
+        Ok(Self {
+            limits,
+            backend: Backend::Managed(executable),
+            latest: None,
+            active: None,
+            #[cfg(test)]
+            process_probe: None,
         })
     }
     pub fn start(&mut self, request: Request) -> Result<Snapshot> {
@@ -171,10 +210,17 @@ impl Coordinator {
         let progress = Arc::new(Mutex::new(None));
         let worker_progress = Arc::clone(&progress);
         let limits = self.limits.clone();
+        let worker_operation = operation.clone();
+        let managed = match &self.backend {
+            Backend::Legacy => None,
+            Backend::Managed(executable) => Some((executable.clone(), prepared.managed()?)),
+        };
+        #[cfg(test)]
+        let process_probe = self.process_probe.clone();
         let worker = thread::Builder::new()
             .name("catalog-backup".into())
             .spawn(move || {
-                let callback = move |p: core::Progress| -> Result<()> {
+                let mut callback = move |p: core::Progress| -> Result<()> {
                     let p = Progress::from(p);
                     *worker_progress
                         .lock()
@@ -183,9 +229,53 @@ impl Coordinator {
                     observer(&p);
                     Ok(())
                 };
-                prepared
-                    .run(&limits, &worker_cancel, callback)
-                    .map_err(failure)
+                match managed {
+                    Some((executable, request)) => {
+                        #[cfg(test)]
+                        let result = match process_probe {
+                            Some(probe) => core::managed::run_process_with_probe(
+                                &executable,
+                                worker_operation,
+                                request,
+                                limits,
+                                &worker_cancel,
+                                &mut callback,
+                                core::managed::ProcessTestFault::None,
+                                move |event| probe(event),
+                            ),
+                            None => core::managed::run_process(
+                                &executable,
+                                worker_operation,
+                                request,
+                                limits,
+                                &worker_cancel,
+                                &mut callback,
+                            ),
+                        };
+                        #[cfg(not(test))]
+                        let result = core::managed::run_process(
+                            &executable,
+                            worker_operation,
+                            request,
+                            limits,
+                            &worker_cancel,
+                            &mut callback,
+                        );
+                        result
+                            .map(|receipt| match receipt {
+                                core::managed::Receipt::Backup(value) => {
+                                    Receipt::Backup(value.into())
+                                }
+                                core::managed::Receipt::Restore(value) => {
+                                    Receipt::Restore(value.into())
+                                }
+                            })
+                            .map_err(failure)
+                    }
+                    None => prepared
+                        .run(&limits, &worker_cancel, callback)
+                        .map_err(failure),
+                }
             })
             .context("start owned backup worker")?;
         let snapshot = Snapshot {
@@ -241,6 +331,12 @@ impl Coordinator {
         Ok(self.latest.clone())
     }
     pub fn shutdown(&mut self) -> Result<Option<Snapshot>> {
+        self.signal_shutdown();
+        self.join()
+    }
+    /// Signal without joining so an outer owner can cancel all independent
+    /// descendants before it begins any potentially blocking checked drain.
+    pub(crate) fn signal_shutdown(&mut self) {
         if let Some(active) = &self.active {
             active.cancel.cancel();
             if let Some(snapshot) = &mut self.latest {
@@ -248,7 +344,13 @@ impl Coordinator {
                 snapshot.state = State::CancelRequested;
             }
         }
-        self.join()
+    }
+    #[cfg(all(test, unix))]
+    pub(crate) fn set_process_probe(
+        &mut self,
+        probe: Arc<dyn Fn(core::managed::ProcessEvent) + Send + Sync>,
+    ) {
+        self.process_probe = Some(probe);
     }
     fn read_progress(&mut self) -> Result<()> {
         if let (Some(active), Some(snapshot)) = (&self.active, &mut self.latest) {
@@ -302,8 +404,13 @@ impl Drop for Coordinator {
     }
 }
 
+#[derive(Clone)]
 enum Prepared {
-    Create(PathBuf, PathBuf),
+    Create(
+        PathBuf,
+        PathBuf,
+        Option<crate::catalog_session::PhysicalObjectId>,
+    ),
     Inspect(PathBuf),
     Restore(PathBuf, PathBuf),
 }
@@ -326,7 +433,11 @@ impl Prepared {
             Ok(p)
         }
         Ok(match request {
-            Request::Create { source, bundle } => Self::Create(path(source)?, path(bundle)?),
+            Request::Create {
+                source,
+                bundle,
+                expected_source,
+            } => Self::Create(path(source)?, path(bundle)?, expected_source),
             Request::Inspect { bundle } => Self::Inspect(path(bundle)?),
             Request::Restore {
                 bundle,
@@ -348,7 +459,7 @@ impl Prepared {
         callback: F,
     ) -> Result<Receipt> {
         match self {
-            Self::Create(source, bundle) => {
+            Self::Create(source, bundle, _) => {
                 core::backup_catalog_with_control(source, bundle, limits, cancel, callback)
                     .map(|r| Receipt::Backup(r.into()))
             }
@@ -361,6 +472,23 @@ impl Prepared {
                     .map(|r| Receipt::Restore(r.into()))
             }
         }
+    }
+    fn managed(&self) -> Result<core::managed::Request> {
+        Ok(match self {
+            Self::Create(source, bundle, expected) => core::managed::Request::Create {
+                source: NativePath::from_path(source),
+                bundle: NativePath::from_path(bundle),
+                expected_source: expected
+                    .context("managed backup requires the active catalog identity")?,
+            },
+            Self::Inspect(bundle) => core::managed::Request::Inspect {
+                bundle: NativePath::from_path(bundle),
+            },
+            Self::Restore(bundle, destination) => core::managed::Request::Restore {
+                bundle: NativePath::from_path(bundle),
+                destination: NativePath::from_path(destination),
+            },
+        })
     }
 }
 fn failure(error: anyhow::Error) -> Failure {
@@ -417,6 +545,7 @@ mod tests {
         let started = c.start(Request::Create {
             source: native(&source),
             bundle: native(&bundle),
+            expected_source: None,
         })?;
         let done = c.join()?.unwrap();
         assert_eq!(done.state, State::Complete);
@@ -465,6 +594,7 @@ mod tests {
             Request::Create {
                 source: native(&source),
                 bundle: native(&bundle),
+                expected_source: None,
             },
             move |p| {
                 if p.phase == core::Phase::Copy && !once {
@@ -512,6 +642,7 @@ mod tests {
             Request::Create {
                 source: native(&source),
                 bundle: native(&bundle),
+                expected_source: None,
             },
             move |p| {
                 if p.phase == core::Phase::Copy && !once {
@@ -603,6 +734,7 @@ mod tests {
         c.start(Request::Create {
             source: native(&source),
             bundle: native(&target),
+            expected_source: None,
         })?;
         assert_eq!(c.join()?.unwrap().state, State::Failed);
         assert_eq!(std::fs::read(target.join("keep"))?, b"unchanged");

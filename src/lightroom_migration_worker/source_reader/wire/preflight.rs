@@ -23,6 +23,7 @@ use source::{ByteRef, Collection, Cursor, EvidenceRecord, Page, record_json::siz
 pub(in crate::lightroom_migration_worker::source_reader) enum Budget {
     Sql(ReadLimits),
     Raw(usize),
+    Capture(super::super::capture_wire::Limits),
 }
 impl Budget {
     pub(in crate::lightroom_migration_worker::source_reader) fn from_authority(
@@ -39,6 +40,10 @@ impl Budget {
                     (*limits).try_into()?;
                 limits.validate()?;
                 Self::Raw(limits.chunk_bytes)
+            }
+            Authority::CaptureSql { value } => {
+                value.limits.validate()?;
+                Self::Capture(value.limits)
             }
         })
     }
@@ -103,6 +108,41 @@ pub(super) fn project(
                 anyhow::bail!("source authority/method mismatch")
             };
             Value::Chunk(chunk(raw, cap, stop)?)
+        }
+        Read::CaptureSql(query) => {
+            let Budget::Capture(limits) = expected.budget else {
+                anyhow::bail!("source authority/method mismatch")
+            };
+            ensure!(
+                raw.get().len() <= usize::try_from(limits.result_bytes.0)?,
+                "CaptureSql result bound"
+            );
+            match query {
+                super::super::capture_wire::Query::SchemaObjects => {
+                    Value::CaptureSchemaObjects(serde_json::from_str(raw.get())?)
+                }
+                super::super::capture_wire::Query::Variables => {
+                    #[derive(Deserialize)]
+                    #[serde(deny_unknown_fields)]
+                    struct Variables {
+                        authority_binding: String,
+                        schema_roster_blake3: String,
+                        values: std::collections::BTreeMap<String, String>,
+                    }
+                    let v: Variables = serde_json::from_str(raw.get())?;
+                    Value::CaptureVariables {
+                        authority_binding: v.authority_binding,
+                        schema_roster_blake3: v.schema_roster_blake3,
+                        values: v.values,
+                    }
+                }
+                super::super::capture_wire::Query::TableRows { .. } => {
+                    Value::CaptureTable(serde_json::from_str(raw.get())?)
+                }
+                super::super::capture_wire::Query::Current => {
+                    Value::CaptureCurrent(serde_json::from_str(raw.get())?)
+                }
+            }
         }
         Read::Sql(query) => {
             let Budget::Sql(limits) = expected.budget else {

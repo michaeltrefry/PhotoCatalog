@@ -9,10 +9,17 @@ pub mod exports;
 mod hydration;
 pub mod lightroom;
 pub mod lightroom_bridge;
+#[allow(dead_code)] // Factory wiring lands with final managed-route selection.
+pub(crate) mod lightroom_capacity;
+#[allow(dead_code)]
+pub(crate) mod lightroom_managed;
 pub mod lightroom_migration;
+pub mod lightroom_process;
 pub mod metadata;
+pub mod metadata_write;
 pub mod organization;
 mod preview_delivery;
+pub mod preview_settings;
 pub mod relink;
 use crate::{
     Catalog,
@@ -171,10 +178,17 @@ impl Cancellation {
     pub fn is_canceled(&self) -> bool {
         self.0.load(Ordering::Acquire)
     }
+    pub(crate) fn flag(&self) -> Arc<AtomicBool> {
+        self.0.clone()
+    }
 }
 pub struct Pending {
     receiver: mpsc::Receiver<Reply>,
     cancel: Cancellation,
+    // Dispatcher admission survives completed-but-unreceived replies. Dropped
+    // after the receiver so buffered data disappears before its grant releases.
+    #[allow(dead_code)]
+    completion: Option<Box<dyn Send>>,
 }
 impl Pending {
     pub fn cancellation(&self) -> Cancellation {
@@ -252,6 +266,10 @@ fn reply(r: std::result::Result<Response, BridgeError>) -> Reply {
 }
 
 enum Work {
+    BackupAdmission(
+        desktop::backup::AdmissionRequest,
+        mpsc::SyncSender<desktop::backup::AdmissionReply>,
+    ),
     MigrationAdmission(
         desktop::lightroom_migration::Request,
         mpsc::SyncSender<desktop::lightroom_migration::Reply>,
@@ -273,7 +291,7 @@ struct Envelope {
 impl Envelope {
     fn priority(&self) -> u8 {
         match &self.work {
-            Work::Shutdown(_) | Work::MigrationAdmission(..) => 0,
+            Work::Shutdown(_) | Work::MigrationAdmission(..) | Work::BackupAdmission(..) => 0,
             Work::Command(Request::Lightroom { .. }, _) => 4,
             Work::Command(Request::Export { request, .. }, _) => {
                 if matches!(
@@ -300,6 +318,15 @@ impl Envelope {
                 metadata::Request::Resolve { .. } => 1,
                 _ => 2,
             },
+            Work::Command(Request::MetadataWrite { request, .. }, _) => {
+                if request.control() {
+                    0
+                } else if request.read_only() {
+                    2
+                } else {
+                    1
+                }
+            }
             Work::Command(Request::Relink { request, .. }, _) => {
                 if request.read_only() {
                     2
@@ -345,6 +372,9 @@ impl Envelope {
     }
     fn reject(self, code: ErrorCode, message: &str) {
         match self.work {
+            Work::BackupAdmission(_, tx) => {
+                let _ = tx.send(desktop::backup::AdmissionReply::error(error(code, message)));
+            }
             Work::MigrationAdmission(_, tx) => {
                 let _ = tx.send(desktop::lightroom_migration::Reply::Refused(error(
                     code, message,
@@ -474,6 +504,22 @@ impl Bridge {
     pub fn spawn(config: Config) -> Result<Self> {
         Self::spawn_engine(config, None)
     }
+    pub(crate) fn lightroom_approval_documents(
+        &self,
+        guard: &lightroom_bridge::Guard,
+        input: &str,
+        review_token: &str,
+        cancel: &AtomicBool,
+        resolve: impl FnMut(&str) -> anyhow::Result<crate::lightroom::selection::ExactDocument>,
+    ) -> std::result::Result<lightroom_bridge::Response, BridgeError> {
+        self.0
+            .shared
+            .lightroom
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .approval_documents(guard, input, review_token, cancel, resolve)
+            .map_err(native)
+    }
     /// Unselected C-only constructor; caller must keep F independently owned and
     /// forbid any live catalog/backup/native descendant at bootstrap admission.
     #[allow(dead_code)]
@@ -482,13 +528,16 @@ impl Bridge {
     }
     fn spawn_engine(config: Config, managed: Option<ManagedCatalogConfig>) -> Result<Self> {
         config.validate()?;
+        // Managed backup B/F descendants belong to the outer desktop owner G.
+        // This in-process coordinator remains the public legacy implementation.
+        let backups = backup::Coordinator::new(Default::default())?;
         let shared = Arc::new(Shared {
             managed_catalog: managed.is_some(),
             lightroom: Arc::new(Mutex::new(lightroom_bridge::Control::default())),
             exports: Arc::new(Mutex::new(exports::Control::default())),
             relink: Arc::new(Mutex::new(relink::Control::default())),
             copy: Arc::new(Mutex::new(copy::Control::default())),
-            backups: Mutex::new(backup::Coordinator::new(Default::default())?),
+            backups: Mutex::new(backups),
             queue: Mutex::new(Queue {
                 pending: VecDeque::new(),
                 stopping: false,
@@ -571,7 +620,7 @@ impl Bridge {
                 .lightroom
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .direct((**request).clone(), budget)
+                .direct((**request).clone(), budget, None)
                 .map_err(native)?;
             let out = Reply::Ok {
                 value: Response::Lightroom(Box::new(response)),
@@ -587,7 +636,11 @@ impl Bridge {
             };
             let _ = tx.send(out);
             self.0.shared.wake.notify_one();
-            return Ok(Pending { receiver, cancel });
+            return Ok(Pending {
+                completion: None,
+                receiver,
+                cancel,
+            });
         }
         if let Request::Export { catalog, request } = &request
             && matches!(
@@ -642,7 +695,11 @@ impl Bridge {
                 };
                 let _ = tx.send(out);
                 self.0.shared.wake.notify_one();
-                return Ok(Pending { receiver, cancel });
+                return Ok(Pending {
+                    completion: None,
+                    receiver,
+                    cancel,
+                });
             }
         }
         if let Request::EditCopy { catalog, request } = &request
@@ -688,7 +745,11 @@ impl Bridge {
                 };
                 let _ = tx.send(out);
                 self.0.shared.wake.notify_one();
-                return Ok(Pending { receiver, cancel });
+                return Ok(Pending {
+                    completion: None,
+                    receiver,
+                    cancel,
+                });
             }
         }
         if let Request::Relink { catalog, request } = &request {
@@ -722,7 +783,11 @@ impl Bridge {
                 };
                 let _ = tx.send(out);
                 self.0.shared.wake.notify_one();
-                return Ok(Pending { receiver, cancel });
+                return Ok(Pending {
+                    completion: None,
+                    receiver,
+                    cancel,
+                });
             }
         }
         if let Request::ImportStatus { catalog } | Request::ImportCancel { catalog, .. } = &request
@@ -745,7 +810,11 @@ impl Bridge {
                 value: Response::Import(q.import_status.clone()),
             });
             self.0.shared.wake.notify_one();
-            return Ok(Pending { receiver, cancel });
+            return Ok(Pending {
+                completion: None,
+                receiver,
+                cancel,
+            });
         }
         if matches!(
             &request,
@@ -771,7 +840,11 @@ impl Bridge {
                 _ => failure(ErrorCode::ResourceLimit, "response byte limit"),
             };
             let _ = tx.send(response);
-            return Ok(Pending { receiver, cancel });
+            return Ok(Pending {
+                completion: None,
+                receiver,
+                cancel,
+            });
         }
         if let Request::ReleaseViewport {
             catalog,
@@ -956,7 +1029,11 @@ impl Bridge {
             });
             self.0.shared.wake.notify_one();
         }
-        Ok(Pending { receiver, cancel })
+        Ok(Pending {
+            completion: None,
+            receiver,
+            cancel,
+        })
     }
     pub fn preview_bytes(
         &self,
@@ -1009,6 +1086,8 @@ struct Ticket {
     interactive: bool,
     foreground: bool,
     hydration: bool,
+    diagnostic_started: Option<Instant>,
+    original_started: Option<Instant>,
     touched: Instant,
     cancel: Cancellation,
 }
@@ -1016,6 +1095,7 @@ struct Open {
     managed: Option<crate::catalog_session::ManagedSession>,
     closing: bool,
     exports: exports::Coordinator,
+    metadata_write: metadata_write::Coordinator,
     token: String,
     catalog: Catalog,
     service: PreviewService,
@@ -1026,6 +1106,7 @@ struct Open {
     import: Option<ImportTask>,
     hydration: hydration::State,
     relink: relink::Coordinator,
+    preview_settings: preview_settings::State,
 }
 struct ImportTask {
     import_lock: Option<crate::ImportLock>,
@@ -1034,6 +1115,7 @@ struct ImportTask {
     status: ImportStatus,
     consumers: Vec<(preview::Consumer, NativePath)>,
     cancel: Cancellation,
+    source_registered: bool,
     discovery_finished: bool,
     failure: bool,
 }
@@ -1064,9 +1146,13 @@ impl ImportTask {
         self.status.pending_previews = 0;
         self.status.phase = ImportPhase::CancelRequested;
     }
-    fn cancel_owned(&mut self, service: &mut PreviewService) {
+    fn cancel_owned(&mut self, service: &mut PreviewService) -> Result<()> {
         self.request_cancel_owned(service);
+        if let Some(preparation) = &mut self.preparation {
+            preparation.cancel_and_finish()?;
+        }
         self.preparation = None; // Join after signaling every owned consumer.
+        Ok(())
     }
 }
 #[derive(Clone)]
@@ -1102,6 +1188,20 @@ fn identity_equal(
     b: &crate::catalog_edits::EditRenderIdentity,
 ) -> bool {
     serde_json::to_value(a).ok() == serde_json::to_value(b).ok()
+}
+
+fn read_diagnostic(done: &preview::ReadCompletion, outcome: &str) -> PreviewReadDiagnostic {
+    PreviewReadDiagnostic {
+        outcome: outcome.into(),
+        queue_ms: done.queue_ms,
+        owner_read_ms: done.owner_read_ms,
+        catalog_identity_ms: done.metrics.catalog_identity_ms,
+        store_read_checksum_ms: done.metrics.store_read_checksum_ms,
+        header_decode_ms: done.metrics.header_decode_ms,
+        total_ms: done.metrics.total_ms,
+        decoded_hits: done.metrics.decoded_hits,
+        decoded_misses: done.metrics.decoded_misses,
+    }
 }
 fn cancel_relink_consumers(open: &mut Open) {
     open.hydration.request_cancel();
@@ -1146,9 +1246,13 @@ fn during_relink_hold(request: &Request) -> bool {
                 )
         }
         Request::EditCopy { request, .. } => request.read_only(),
+        Request::PreviewSettings { request, .. } => {
+            matches!(request.as_ref(), preview_settings::Request::Status)
+        }
         Request::Metadata { request, .. } => {
             !matches!(request.as_ref(), metadata::Request::Resolve { .. })
         }
+        Request::MetadataWrite { request, .. } => request.read_only() || request.control(),
         Request::Relink { request, .. } => request.read_only(),
         Request::Organization { request, .. } => matches!(
             request.as_ref(),
@@ -1247,6 +1351,13 @@ impl Actor {
                     e.reject(ErrorCode::Canceled, "queued operation expired");
                 } else {
                     match e.work {
+                        Work::BackupAdmission(request, tx) => {
+                            let reply = match self.backup_admission(request) {
+                                Ok(admission) => desktop::backup::AdmissionReply::Ok(admission),
+                                Err(error) => desktop::backup::AdmissionReply::error(error),
+                            };
+                            let _ = tx.send(reply);
+                        }
                         Work::MigrationAdmission(request, tx) => {
                             let _ = tx.send(self.migration_request(request, &e.cancel));
                         }
@@ -1256,9 +1367,10 @@ impl Actor {
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
                                 .signal_shutdown();
-                            let result = self.close();
+                            let result = self
+                                .close()
+                                .and_then(|()| self.lightroom.shutdown().map_err(native));
                             if result.is_ok() {
-                                self.lightroom.shutdown();
                                 self.shared.queue.lock().unwrap().stopping = true;
                             }
                             let _ = tx.send(result);
@@ -1289,7 +1401,8 @@ impl Actor {
                                     | Request::Images { .. }
                                     | Request::Search { .. }
                                     | Request::Organization { .. }
-                            ) || matches!(&r, Request::Metadata { request, .. } if matches!(request.as_ref(), metadata::Request::Resolve { .. }));
+                            ) || matches!(&r, Request::Metadata { request, .. } if matches!(request.as_ref(), metadata::Request::Resolve { .. }))
+                                || matches!(&r, Request::MetadataWrite { request, .. } if !request.read_only());
                             let reply_limit = if matches!(&r, Request::Lightroom { .. }) {
                                 self.config
                                     .limits
@@ -1346,7 +1459,9 @@ impl Actor {
             // in the loop instead, permitting an explicit Close/shutdown retry.
             self.retain_open();
         }
-        self.lightroom.shutdown();
+        if self.lightroom.shutdown().is_err() {
+            self.lightroom.retain_failed_shutdown();
+        }
     }
     fn close(&mut self) -> std::result::Result<(), BridgeError> {
         if self.migration.held() {
@@ -1411,6 +1526,7 @@ impl Actor {
             if !open.managed.as_ref().is_some_and(|m| m.sql_returned) {
                 open.deliveries.signal_shutdown(&mut open.service);
                 open.exports.signal_shutdown(&self.shared.exports);
+                open.metadata_write.close(&open.catalog).map_err(native)?;
                 open.service.signal_shutdown();
                 self.shared.relink.lock().unwrap().request_cancel();
                 open.hydration.request_cancel();
@@ -1436,6 +1552,9 @@ impl Actor {
                 open.exports.shutdown(&self.shared.exports);
                 copy::close(&mut open.catalog, &self.shared.copy);
                 if let Some(import) = &mut open.import {
+                    if let Some(preparation) = &mut import.preparation {
+                        preparation.cancel_and_finish().map_err(native)?;
+                    }
                     import.preparation = None;
                 }
                 // The complete Open, including import lock/catalog, remains owned on
@@ -1524,6 +1643,7 @@ impl Actor {
         let o = self.current(catalog)?;
         let held = o.jobs_held
             || o.relink.busy()
+            || o.metadata_write.write_hold()
             || copy_active
             || backup_active
             || o.import.as_ref().is_some_and(|i| !i.terminal())
@@ -1661,6 +1781,7 @@ impl Actor {
                 managed: None,
                 closing: false,
                 exports: exports::Coordinator::default(),
+                metadata_write: metadata_write::Coordinator::default(),
                 token: uuid::Uuid::new_v4().to_string(),
                 catalog,
                 service,
@@ -1671,6 +1792,7 @@ impl Actor {
                 import: None,
                 hydration: hydration::State::default(),
                 relink: relink::Coordinator::default(),
+                preview_settings: preview_settings::State::default(),
             })
         })();
         match opened {
@@ -1795,6 +1917,10 @@ impl Actor {
                 self.config.preview_policy.clone(),
                 self.config.preview_limits.clone(),
             )?;
+            // C reads only bounded manifest facts. F revalidates each offline-
+            // capable path against this exact admitted catalog/cache session
+            // before the catalog can become externally available.
+            managed.restore_original_roots(&service.original_root_review()?.roots, &cancel.0)?;
             Ok((service, jobs_held))
         })();
         match built {
@@ -1804,6 +1930,7 @@ impl Actor {
                     managed: Some(managed),
                     closing: false,
                     exports: exports::Coordinator::default(),
+                    metadata_write: metadata_write::Coordinator::default(),
                     token: uuid::Uuid::new_v4().to_string(),
                     catalog,
                     service,
@@ -1814,6 +1941,7 @@ impl Actor {
                     import: None,
                     hydration: hydration::State::default(),
                     relink: relink::Coordinator::default(),
+                    preview_settings: preview_settings::State::default(),
                 });
                 if cancel.is_canceled() {
                     self.close()?;
@@ -1861,6 +1989,21 @@ impl Actor {
                 )
                 .map(|r| Response::Lightroom(Box::new(r)))
                 .map_err(native);
+        }
+        if self.managed.is_some()
+            && matches!(
+                r,
+                Request::BackupCreate { .. }
+                    | Request::BackupInspect { .. }
+                    | Request::BackupRestore { .. }
+                    | Request::BackupStatus
+                    | Request::BackupCancel { .. }
+            )
+        {
+            return Err(error(
+                ErrorCode::InvalidRequest,
+                "managed backup requests belong to the desktop owner",
+            ));
         }
         if (self.open.as_ref().is_some_and(|o| o.closing)
             || self.failed_admission.is_some()
@@ -1921,6 +2064,17 @@ impl Actor {
                 "export write hold: cached reads and cancellation remain available",
             ));
         }
+        if self
+            .open
+            .as_ref()
+            .is_some_and(|o| o.metadata_write.write_hold())
+            && !during_relink_hold(&r)
+        {
+            return Err(error(
+                ErrorCode::Busy,
+                "metadata write hold: cached reads and cancellation remain available",
+            ));
+        }
         if self.shared.exports.lock().unwrap().busy()
             && (matches!(
                 &r,
@@ -1937,6 +2091,26 @@ impl Actor {
             ));
         }
         match r {
+            Request::PreviewSettings { catalog, request } => {
+                let open = self.current(&catalog)?;
+                if !matches!(request.as_ref(), preview_settings::Request::Status)
+                    && (open.jobs_held || open.import.as_ref().is_some_and(|i| !i.terminal()))
+                {
+                    return Err(error(
+                        ErrorCode::Busy,
+                        "finish folder import and release restored jobs before changing preview storage",
+                    ));
+                }
+                let Open {
+                    catalog,
+                    service,
+                    preview_settings,
+                    ..
+                } = open;
+                Ok(Response::PreviewSettings(Box::new(
+                    preview_settings::execute(catalog, service, preview_settings, *request)?,
+                )))
+            }
             Request::LightroomMigration { .. } => Err(error(
                 ErrorCode::InvalidRequest,
                 "migration requests require the managed desktop owner",
@@ -1951,7 +2125,7 @@ impl Actor {
                     *request,
                     &limits,
                     &control,
-                    o.jobs_held || o.relink.write_hold(),
+                    o.jobs_held || o.relink.write_hold() || o.metadata_write.write_hold(),
                 )?)))
             }
             Request::Relink { catalog, request } => {
@@ -2022,6 +2196,19 @@ impl Actor {
                     cancel,
                 )?)))
             }
+            Request::MetadataWrite { catalog, request } => {
+                let limits = limits.clone();
+                let open = self.current(&catalog)?;
+                Ok(Response::MetadataWrite(Box::new(
+                    open.metadata_write.execute(
+                        &catalog,
+                        &mut open.catalog,
+                        *request,
+                        &limits,
+                        cancel,
+                    )?,
+                )))
+            }
             Request::Organization { catalog, request } => Ok(Response::Organization(Box::new(
                 organization::execute(&mut self.current(&catalog)?.catalog, *request, &limits)?,
             ))),
@@ -2031,7 +2218,10 @@ impl Actor {
                 #[cfg(test)]
                 let checkpoint = self.config.import_checkpoint.clone();
                 let o = self.current(&catalog)?;
-                if o.import.as_ref().is_some_and(|i| !i.terminal()) {
+                if o.import
+                    .as_ref()
+                    .is_some_and(|i| !i.terminal() || i.preparation.is_some())
+                {
                     return Err(error(
                         ErrorCode::Busy,
                         "an import is still running or canceling",
@@ -2044,12 +2234,24 @@ impl Actor {
                         "import source must be absolute",
                     ));
                 }
-                let path = std::fs::canonicalize(path).map_err(|e| native(e.into()))?;
-                // Both controls remain authoritative: restored-job hold and cache/source separation.
-                core!(o.service.ensure_original_separate(&path));
-                let import_lock = core!(crate::ImportLock::acquire(
-                    &o.catalog.root.join("import.lock")
-                ));
+                let managed_import = o.catalog.session.managed_import_root().is_some();
+                let path = if managed_import {
+                    // F alone resolves and observes a managed source path. The
+                    // canonical Begin reply becomes C's SQL identity.
+                    path
+                } else {
+                    let path = std::fs::canonicalize(path).map_err(|e| native(e.into()))?;
+                    core!(o.service.ensure_original_separate(&path));
+                    core!(o.service.register_original_root(&path));
+                    path
+                };
+                let import_lock = if managed_import {
+                    None
+                } else {
+                    Some(core!(crate::ImportLock::acquire(
+                        &o.catalog.root.join("import.lock")
+                    )))
+                };
                 let preparation = core!(crate::import_preparation::Preparation::spawn(
                     &o.catalog,
                     &path,
@@ -2073,12 +2275,13 @@ impl Actor {
                     error_source: None,
                 };
                 o.import = Some(ImportTask {
-                    import_lock: Some(import_lock),
+                    import_lock,
                     preparation: Some(preparation),
                     reference: None,
                     status: status.clone(),
                     consumers: Vec::new(),
                     cancel: cancel.clone(),
+                    source_registered: !managed_import,
                     discovery_finished: false,
                     failure: false,
                 });
@@ -2091,14 +2294,16 @@ impl Actor {
                 self.shared.queue.lock().unwrap().import_status.clone(),
             )),
             Request::BackupCreate { catalog, bundle } => {
-                let source = NativePath::from_path(&self.current(&catalog)?.catalog.root);
-                let snapshot = core!(
-                    self.shared
-                        .backups
-                        .lock()
-                        .unwrap()
-                        .start(backup::Request::Create { source, bundle })
-                );
+                let current = self.current(&catalog)?;
+                let source = NativePath::from_path(&current.catalog.root);
+                let expected_source = current.catalog.managed_physical_identity();
+                let snapshot = core!(self.shared.backups.lock().unwrap().start(
+                    backup::Request::Create {
+                        source,
+                        bundle,
+                        expected_source
+                    }
+                ));
                 Ok(Response::Backup(Some(snapshot)))
             }
             Request::BackupInspect { bundle } => {
@@ -2328,6 +2533,7 @@ impl Actor {
                 viewport,
                 generation,
                 foreground,
+                diagnostics,
             } => {
                 let shared = Arc::clone(&self.shared);
                 let o = self.current(&catalog)?;
@@ -2339,6 +2545,17 @@ impl Actor {
                     PreviewTier::Thumbnail => preview::Tier::Thumbnail,
                     PreviewTier::Large => preview::Tier::Large,
                 };
+                let diagnostic_started = diagnostics.then(Instant::now);
+                let expected_key_digest = diagnostics
+                    .then(|| {
+                        let key = if interactive {
+                            o.service.interactive_key(&identity, tier)
+                        } else {
+                            o.service.variant_key(&identity, tier)
+                        }?;
+                        key.digest()
+                    })
+                    .and_then(Result::ok);
                 let read = if o.managed.is_some() {
                     Some(core!(o.service.queue_read_variant(
                         &o.catalog,
@@ -2362,7 +2579,17 @@ impl Actor {
                 } else {
                     core!(o.service.cached_variant(&o.catalog, &key, tier, false))
                 };
-                if (o.relink.write_hold() || o.exports.write_hold(&shared.exports))
+                let selected_key_digest = diagnostics
+                    .then(|| {
+                        cached
+                            .as_ref()
+                            .and_then(|view| view.key.as_ref())
+                            .and_then(|key| key.digest().ok())
+                    })
+                    .flatten();
+                if (o.relink.write_hold()
+                    || o.exports.write_hold(&shared.exports)
+                    || o.metadata_write.write_hold())
                     && cached.is_none()
                     && read.is_none()
                 {
@@ -2412,6 +2639,14 @@ impl Actor {
                         Err(e) => (PreviewState::Failed, None, Some(format!("{e:#}"))),
                     }
                 };
+                let route = if read.is_some() {
+                    PreviewRoute::Pending
+                } else if cached.is_some() {
+                    PreviewRoute::MemoryCache
+                } else {
+                    PreviewRoute::OriginalRender
+                };
+                let original_started = (diagnostics && consumer.is_some()).then(Instant::now);
                 let mut queue = shared.queue.lock().unwrap();
                 if queue.viewport.get(&(catalog.clone(), viewport.clone())) != Some(&generation.0) {
                     if let Some(c) = consumer {
@@ -2435,6 +2670,23 @@ impl Actor {
                     generation,
                     state,
                     message,
+                    diagnostic: diagnostics.then(|| {
+                        Box::new(PreviewDiagnostic {
+                            route,
+                            expected_key_digest: expected_key_digest.clone(),
+                            selected_key_digest: selected_key_digest.clone(),
+                            current_key_matches_selected: selected_key_digest
+                                .as_ref()
+                                .zip(expected_key_digest.as_ref())
+                                .map(|(selected, expected)| selected == expected),
+                            retained_read: None,
+                            original_render_ms: None,
+                            ready_ms: cached.is_some().then(|| {
+                                diagnostic_started.unwrap().elapsed().as_secs_f64() * 1000.0
+                            }),
+                            delivery: None,
+                        })
+                    }),
                 };
                 o.tickets.insert(
                     id.clone(),
@@ -2447,6 +2699,8 @@ impl Actor {
                         interactive,
                         foreground,
                         hydration: needs_hydration && cached.is_none() && read.is_none(),
+                        diagnostic_started,
+                        original_started,
                         touched: Instant::now(),
                         cancel: cancel.clone(),
                     },
@@ -2563,7 +2817,17 @@ impl Actor {
         })
     }
     fn maintain(&mut self) {
-        self.lightroom.maintain();
+        if let Err(error) = self.lightroom.maintain() {
+            if let Some(open) = self.open.as_mut() {
+                open.closing = true;
+            }
+            let mut queue = self.shared.queue.lock().unwrap();
+            queue.status.phase = Phase::Closing;
+            queue.status.message = Some(format!(
+                "Workbench owner requires checked shutdown: {error:#}"
+            ));
+            return;
+        }
         let Some(o) = self.open.as_mut() else { return };
         if o.catalog
             .session
@@ -2602,7 +2866,7 @@ impl Actor {
             &self.shared.exports,
             prior_foreground,
             native_demand,
-            o.jobs_held || o.relink.write_hold(),
+            o.jobs_held || o.relink.write_hold() || o.metadata_write.write_hold(),
         ) {
             self.shared.queue.lock().unwrap().status.message = Some(e.message);
             self.shared.exports.lock().unwrap().request_cancel();
@@ -2610,6 +2874,30 @@ impl Actor {
         if o.exports.write_hold(&self.shared.exports) {
             self.shared.queue.lock().unwrap().status.active_previews =
                 o.service.scheduler_usage().active as u32;
+            return;
+        }
+        if let Err(error) = o.metadata_write.release_completed() {
+            self.shared.queue.lock().unwrap().status.message = Some(error.message);
+            return;
+        }
+        if o.metadata_write.write_hold() {
+            cancel_relink_consumers(o);
+            let readers_drained = o.hydration.drain_canceled();
+            if let Err(error) = o.service.tick(&mut o.catalog) {
+                self.shared.queue.lock().unwrap().status.message =
+                    Some(format!("draining previews for metadata write: {error:#}"));
+                o.metadata_write.request_cancel();
+                return;
+            }
+            o.service.tick_read(&o.catalog);
+            if readers_drained
+                && o.service.native_work_drained()
+                && o.metadata_write.needs_write()
+                && let Err(error) = o.metadata_write.start_write(&mut o.service)
+            {
+                self.shared.queue.lock().unwrap().status.message = Some(error.message);
+                o.metadata_write.request_cancel();
+            }
             return;
         }
         let relink_foreground = self
@@ -2661,7 +2949,7 @@ impl Actor {
             &mut o.catalog,
             &self.shared.copy,
             copy_foreground,
-            o.jobs_held || o.relink.write_hold(),
+            o.jobs_held || o.relink.write_hold() || o.metadata_write.write_hold(),
             #[cfg(test)]
             self.config.import_checkpoint.clone(),
         ) {
@@ -2744,6 +3032,24 @@ impl Actor {
                 && let Some(done) = o.service.take_read(read)
             {
                 t.read = None;
+                if let Some(diagnostic) = &mut t.dto.diagnostic {
+                    let (outcome, selected) = match &done.outcome {
+                        preview::ReadOutcome::Ready(view) => {
+                            ("ready", view.key.as_ref().and_then(|key| key.digest().ok()))
+                        }
+                        preview::ReadOutcome::Missing => ("missing", None),
+                        preview::ReadOutcome::Stale => ("stale", None),
+                        preview::ReadOutcome::Failed { .. } => ("failed", None),
+                    };
+                    diagnostic.retained_read = Some(read_diagnostic(&done, outcome));
+                    if let Some(selected) = selected {
+                        diagnostic.current_key_matches_selected = diagnostic
+                            .expected_key_digest
+                            .as_ref()
+                            .map(|expected| expected == &selected);
+                        diagnostic.selected_key_digest = Some(selected);
+                    }
+                }
                 let current = o.catalog.edit_render_identity(&t.dto.key);
                 if !current
                     .as_ref()
@@ -2756,6 +3062,12 @@ impl Actor {
                     preview::ReadOutcome::Ready(_) => {
                         t.dto.state = PreviewState::Ready;
                         t.dto.message = None;
+                        if let Some(diagnostic) = &mut t.dto.diagnostic {
+                            diagnostic.route = PreviewRoute::Retained;
+                            diagnostic.ready_ms = t
+                                .diagnostic_started
+                                .map(|started| started.elapsed().as_secs_f64() * 1000.0);
+                        }
                     }
                     preview::ReadOutcome::Stale => t.dto.state = PreviewState::Stale,
                     preview::ReadOutcome::Failed {
@@ -2770,7 +3082,10 @@ impl Actor {
                         t.dto.message = Some(message);
                     }
                     preview::ReadOutcome::Missing => {
-                        if o.relink.write_hold() || o.exports.write_hold(&self.shared.exports) {
+                        if o.relink.write_hold()
+                            || o.exports.write_hold(&self.shared.exports)
+                            || o.metadata_write.write_hold()
+                        {
                             t.dto.state = PreviewState::Unavailable;
                             t.dto.message = Some(
                                 "catalog write hold; request original rendering after completion"
@@ -2824,6 +3139,11 @@ impl Actor {
                                 Ok(c) => {
                                     t.consumer = Some(c);
                                     t.dto.state = PreviewState::Queued;
+                                    t.original_started =
+                                        t.dto.diagnostic.as_ref().map(|_| Instant::now());
+                                    if let Some(diagnostic) = &mut t.dto.diagnostic {
+                                        diagnostic.route = PreviewRoute::OriginalRender;
+                                    }
                                 }
                                 Err(e) => {
                                     t.dto.state = PreviewState::Failed;
@@ -2856,6 +3176,17 @@ impl Actor {
                     };
                     t.dto.state = state;
                     t.dto.message = message;
+                    if matches!(t.dto.state, PreviewState::Ready)
+                        && let Some(diagnostic) = &mut t.dto.diagnostic
+                    {
+                        diagnostic.route = PreviewRoute::OriginalRender;
+                        diagnostic.original_render_ms = t
+                            .original_started
+                            .map(|started| started.elapsed().as_secs_f64() * 1000.0);
+                        diagnostic.ready_ms = t
+                            .diagnostic_started
+                            .map(|started| started.elapsed().as_secs_f64() * 1000.0);
+                    }
                 }
             } else if matches!(t.dto.state, PreviewState::CancelRequested)
                 && o.service.native_work_drained()
@@ -2910,11 +3241,23 @@ impl Actor {
             import.consumers = remaining;
             if import.cancel.is_canceled()
                 && !matches!(import.status.phase, ImportPhase::CancelRequested)
+                && let Err(error) = import.cancel_owned(&mut o.service)
             {
-                import.cancel_owned(&mut o.service);
+                import.failure = true;
+                import.status.error = Some(
+                    format!("import filesystem cleanup retained: {error:#}")
+                        .chars()
+                        .take(2048)
+                        .collect(),
+                );
             }
             if matches!(import.status.phase, ImportPhase::CancelRequested) {
-                if o.service.native_work_drained() {
+                if let Some(preparation) = &mut import.preparation
+                    && preparation.cancel_and_finish().is_ok()
+                {
+                    import.preparation = None;
+                }
+                if import.preparation.is_none() && o.service.native_work_drained() {
                     import.status.phase = if import.failure {
                         ImportPhase::Failed
                     } else {
@@ -2927,6 +3270,14 @@ impl Actor {
                 && o.service.available_request_slots() > 1
             {
                 let applied = (|| -> Result<()> {
+                    if let Some(reference) = import.reference.as_mut()
+                        && let Err(error) = reference.bind_storage(&mut o.catalog)
+                    {
+                        if error.is::<crate::preview::stage_io::Busy>() {
+                            return Ok(());
+                        }
+                        return Err(error);
+                    }
                     let Some(event) = import
                         .preparation
                         .as_ref()
@@ -2937,7 +3288,26 @@ impl Actor {
                     };
                     use crate::import_preparation::Event;
                     match event {
+                        Event::Begun { source } => {
+                            ensure!(
+                                !import.source_registered && import.reference.is_none(),
+                                "managed import source was already registered"
+                            );
+                            let path = source.to_path()?;
+                            o.service.register_observed_original_root(&path)?;
+                            import
+                                .preparation
+                                .as_ref()
+                                .context("missing source preparation")?
+                                .accept_root(&source)?;
+                            import.status.source = source;
+                            import.source_registered = true;
+                        }
                         Event::Header(header) => {
+                            ensure!(
+                                import.source_registered,
+                                "managed import source root was not registered"
+                            );
                             ensure!(import.reference.is_none(), "unfinished import reference");
                             import.status.error_source = Some(NativePath::from_path(&header.path));
                             import.reference = Some(crate::import_preparation::Reference::begin(
@@ -2946,20 +3316,34 @@ impl Actor {
                             )?);
                         }
                         Event::Source(source) => {
-                            import
+                            let preparation = import
+                                .preparation
+                                .as_ref()
+                                .context("missing source preparation")?;
+                            let grant = import
                                 .reference
                                 .as_mut()
                                 .context("metadata without import reference")?
-                                .source(&mut o.catalog, &source)?;
+                                .source(&mut o.catalog, &source, preparation)?;
+                            if let Err(error) = preparation.release_inspection(grant) {
+                                // The transaction contains the exact receipt. Do
+                                // not relabel that committed snapshot as rejected.
+                                import.reference = None;
+                                return Err(error);
+                            }
                         }
                         Event::End => {
+                            let preparation = import
+                                .preparation
+                                .as_ref()
+                                .context("missing source preparation")?;
                             let reference = import
                                 .reference
                                 .take()
                                 .context("missing import reference")?;
                             let path = reference.source_path();
-                            let (consumer, changed, warnings) =
-                                reference.finish(&mut o.catalog, &mut o.service)?;
+                            let (consumer, changed, warnings, grant) =
+                                reference.finish(&mut o.catalog, &mut o.service, preparation)?;
                             import.status.metadata_updated.0 += u64::from(changed);
                             import.status.metadata_warnings.0 += warnings;
                             if let Some(consumer) = consumer {
@@ -2967,6 +3351,7 @@ impl Actor {
                             } else {
                                 import.status.unchanged.0 += 1;
                             }
+                            preparation.release_file(grant)?;
                             if import.status.error.is_none() {
                                 import.status.error_source = None;
                             }
@@ -2974,13 +3359,10 @@ impl Actor {
                         Event::Skipped => import.status.skipped.0 += 1,
                         Event::Finished => {
                             ensure!(
-                                import.reference.is_none(),
-                                "source ended inside a prepared file"
+                                import.source_registered && import.reference.is_none(),
+                                "source ended before root registration or inside a prepared file"
                             );
                             import.discovery_finished = true;
-                            if let Some(preparation) = import.preparation.take() {
-                                preparation.finish();
-                            }
                         }
                         Event::Failed { source, message } => {
                             import.status.error_source = Some(source);
@@ -2998,7 +3380,14 @@ impl Actor {
                         let _ = reference.fail(&mut o.catalog, &message);
                     }
                     import.status.error = Some(message.chars().take(2048).collect());
-                    import.cancel_owned(&mut o.service);
+                    if let Err(cleanup) = import.cancel_owned(&mut o.service) {
+                        import.status.error = Some(
+                            format!("{message}; filesystem cleanup retained: {cleanup:#}")
+                                .chars()
+                                .take(2048)
+                                .collect(),
+                        );
+                    }
                 }
             }
             import.update_counts();
@@ -3010,7 +3399,26 @@ impl Actor {
             {
                 import.status.phase = ImportPhase::Draining;
                 if import.consumers.is_empty() && !o.index_pending {
-                    import.status.phase = ImportPhase::Complete;
+                    let retired = import
+                        .preparation
+                        .as_mut()
+                        .map_or(Ok(()), crate::import_preparation::Preparation::finish);
+                    match retired {
+                        Ok(()) => {
+                            import.preparation = None;
+                            import.status.phase = ImportPhase::Complete;
+                        }
+                        Err(error) => {
+                            import.failure = true;
+                            import.status.error = Some(
+                                format!("import filesystem retirement failed: {error:#}")
+                                    .chars()
+                                    .take(2048)
+                                    .collect(),
+                            );
+                            import.status.phase = ImportPhase::Failed;
+                        }
+                    }
                 }
             }
             let mut queue = self.shared.queue.lock().unwrap();

@@ -26,6 +26,7 @@ pub(crate) enum Role {
     LightroomMigration,
     SourceSql,
     SourceRaw,
+    SourceCaptureSql,
 }
 impl Role {
     pub(crate) fn argument(self) -> &'static str {
@@ -33,10 +34,14 @@ impl Role {
             Self::LightroomMigration => "--lightroom-migration-worker",
             Self::SourceSql => "--lightroom-source-reader-sql",
             Self::SourceRaw => "--lightroom-source-reader-raw",
+            Self::SourceCaptureSql => "--lightroom-source-reader-capture-sql",
         }
     }
     fn source(self) -> bool {
-        matches!(self, Self::SourceSql | Self::SourceRaw)
+        matches!(
+            self,
+            Self::SourceSql | Self::SourceRaw | Self::SourceCaptureSql
+        )
     }
 }
 

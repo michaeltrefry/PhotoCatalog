@@ -9,8 +9,8 @@ use crate::{
         ExportOriginalReply, ExportOriginalRequest, ExportProfileReply, ExportProfileRequest,
         ExportPublicationReply, ExportPublicationRequest, InspectExportOriginal,
         InspectedExportOriginal, LeaseId, MigrationIdentityReply, MigrationIdentityRequest,
-        PrepareCatalog, PrepareExportDirectory, PreparedExportDirectory, RootCapability,
-        SqlAdmissionConfirmed,
+        PrepareCatalog, PrepareExportDirectory, PreparedExportDirectory, RestoreOriginalRootReply,
+        RestoreOriginalRootRequest, RootCapability, SqlAdmissionConfirmed,
     },
     storage_volume::NativePath,
 };
@@ -102,6 +102,60 @@ struct Owner {
     #[cfg(test)]
     faults: Faults,
 }
+
+/// One client owns exactly three pipe threads: stdin, stdout results, and
+/// stderr controls. Thread stacks/runtime storage remain outside the metadata
+/// ledger, while the retained JoinHandle vector backing is charged.
+pub(crate) const IO_THREAD_OWNERS: usize = 3;
+
+/// Exact inline roots for one G-owned filesystem client. Heap backings held by
+/// these roots are assembled separately by the managed metadata ledger.
+pub(crate) fn metadata_layouts() -> [(usize, usize); 12] {
+    [
+        (
+            std::mem::size_of::<Client>(),
+            std::mem::align_of::<Client>(),
+        ),
+        (
+            std::mem::size_of::<Shared>(),
+            std::mem::align_of::<Shared>(),
+        ),
+        (std::mem::size_of::<State>(), std::mem::align_of::<State>()),
+        (std::mem::size_of::<Owner>(), std::mem::align_of::<Owner>()),
+        (
+            std::mem::size_of::<super::wire::Operation>(),
+            std::mem::align_of::<super::wire::Operation>(),
+        ),
+        (
+            std::mem::size_of::<super::wire::Response>(),
+            std::mem::align_of::<super::wire::Response>(),
+        ),
+        (
+            std::mem::size_of::<super::wire::Message>(),
+            std::mem::align_of::<super::wire::Message>(),
+        ),
+        (
+            std::mem::size_of::<super::wire::Assembly>(),
+            std::mem::align_of::<super::wire::Assembly>(),
+        ),
+        (
+            std::mem::size_of::<super::wire::Startup>(),
+            std::mem::align_of::<super::wire::Startup>(),
+        ),
+        (
+            std::mem::size_of::<std::process::ChildStdin>(),
+            std::mem::align_of::<std::process::ChildStdin>(),
+        ),
+        (
+            std::mem::size_of::<std::process::ChildStdout>(),
+            std::mem::align_of::<std::process::ChildStdout>(),
+        ),
+        (
+            std::mem::size_of::<std::process::ChildStderr>(),
+            std::mem::align_of::<std::process::ChildStderr>(),
+        ),
+    ]
+}
 impl Owner {
     fn start_io(
         &mut self,
@@ -176,6 +230,21 @@ pub struct Client {
     pid: u32,
 }
 impl Client {
+    #[allow(dead_code)]
+    pub(crate) fn lightroom_workbench_io(
+        &self,
+        request: &crate::filesystem_worker::wire::LightroomWorkbenchIo,
+        cancel: &AtomicBool,
+    ) -> Result<crate::filesystem_worker::wire::LightroomWorkbenchIoReply> {
+        match self.execute(Operation::LightroomWorkbenchIo(request.clone()), cancel)? {
+            Response::LightroomWorkbenchIo(value) => {
+                value.validate_for(request)?;
+                Ok(value)
+            }
+            _ => anyhow::bail!("filesystem Workbench response kind"),
+        }
+    }
+
     /// Configured binary only. This API creates no user-selected executable route.
     /// The parent must own this F independently of, and longer than, dependent C.
     pub fn spawn(executable: &Path, original_roots: Vec<NativePath>) -> Result<Self> {
@@ -350,6 +419,27 @@ impl Client {
             value.phase = Phase::Stopping;
         }
         value
+    }
+    /// Wait for the identity-checked startup acknowledgement before admitting
+    /// another managed owner. A timeout leaves this exact client available for
+    /// checked cleanup; it never substitutes a new filesystem generation.
+    #[allow(dead_code)] // Also used by the managed public factory after activation.
+    pub(crate) fn wait_ready(&self, timeout: Duration) -> Result<()> {
+        let state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let (state, _) = self
+            .shared
+            .wake
+            .wait_timeout_while(state, timeout, |state| {
+                state.status.phase == Phase::Starting && state.failure.is_none() && !state.closing
+            })
+            .unwrap_or_else(|e| e.into_inner());
+        ensure!(
+            state.status.phase == Phase::Ready && state.failure.is_none() && !state.closing,
+            "filesystem startup did not become ready: {:?}, {:?}",
+            state.status.phase,
+            state.failure
+        );
+        Ok(())
     }
     pub fn refresh_status(&self) {
         self.shared.state.lock().unwrap().outgoing.status = Some(0);
@@ -917,7 +1007,107 @@ fn read_loop(mut input: impl Read, control: bool, shared: &Shared) -> Result<()>
     Ok(())
 }
 
+impl Client {
+    pub(crate) fn lightroom_artifact_preparation(
+        &self,
+        request: &crate::filesystem_worker::wire::LightroomArtifactPreparation,
+        cancel: &AtomicBool,
+    ) -> Result<Option<crate::filesystem_worker::wire::LightroomArtifactPreparationReply>> {
+        match self.execute(
+            Operation::LightroomArtifactPreparation(request.clone()),
+            cancel,
+        )? {
+            Response::LightroomArtifactPreparation(value) => match (request, value) {
+                (
+                    crate::filesystem_worker::wire::LightroomArtifactPreparation::Discard {
+                        ..
+                    }
+                    | crate::filesystem_worker::wire::LightroomArtifactPreparation::DiscardReceipt {
+                        ..
+                    },
+                    None,
+                ) => Ok(None),
+                (_, Some(value)) => {
+                    value.validate_for(request)?;
+                    Ok(Some(value))
+                }
+                _ => anyhow::bail!("artifact preparation response is absent"),
+            },
+            _ => anyhow::bail!("unexpected artifact preparation response"),
+        }
+    }
+
+    pub(crate) fn lightroom_sealed_read(
+        &self,
+        request: &crate::filesystem_worker::wire::LightroomSealedRead,
+        cancel: &AtomicBool,
+    ) -> Result<Option<crate::filesystem_worker::wire::LightroomSealedDocumentPage>> {
+        match self.execute(Operation::LightroomSealedRead(request.clone()), cancel)? {
+            Response::LightroomSealedDocument(value) => match (request, value) {
+                (crate::filesystem_worker::wire::LightroomSealedRead::Discard { .. }, None) => {
+                    Ok(None)
+                }
+                (_, Some(value)) => {
+                    value.validate_for(request)?;
+                    Ok(Some(value))
+                }
+                _ => anyhow::bail!("sealed document response is absent"),
+            },
+            _ => anyhow::bail!("unexpected sealed document response"),
+        }
+    }
+}
+
 impl CatalogFilesystem for Client {
+    fn metadata_files_call(
+        &self,
+        request: &crate::catalog_session::metadata_files::Request,
+        cancel: &AtomicBool,
+    ) -> Result<crate::catalog_session::metadata_files::Reply> {
+        match self.execute(Operation::MetadataFiles(Box::new(request.clone())), cancel)? {
+            Response::MetadataFiles(reply) => {
+                reply.validate(request)?;
+                Ok(reply)
+            }
+            _ => anyhow::bail!("unexpected metadata file reply"),
+        }
+    }
+    fn import_call(
+        &self,
+        request: &crate::catalog_session::import::Request,
+        cancel: &AtomicBool,
+    ) -> Result<crate::catalog_session::import::Reply> {
+        match self.execute(Operation::Import(request.clone()), cancel)? {
+            Response::Import(reply) => {
+                reply.validate(request)?;
+                Ok(reply)
+            }
+            _ => anyhow::bail!("unexpected managed import reply"),
+        }
+    }
+    fn backup_call(
+        &self,
+        request: &crate::catalog_backup::managed_filesystem::Request,
+        cancel: &AtomicBool,
+    ) -> Result<crate::catalog_backup::managed_filesystem::Reply> {
+        match self.execute(Operation::Backup(Box::new(request.clone())), cancel)? {
+            Response::Backup(reply) => Ok(reply),
+            _ => anyhow::bail!("unexpected backup custody response"),
+        }
+    }
+    fn restore_original_root(
+        &self,
+        request: &RestoreOriginalRootRequest,
+        cancel: &AtomicBool,
+    ) -> Result<RestoreOriginalRootReply> {
+        match self.execute(Operation::RestoreOriginalRoot(request.clone()), cancel)? {
+            Response::RestoredOriginalRoot(reply) => {
+                reply.validate_for(request)?;
+                Ok(reply)
+            }
+            _ => anyhow::bail!("unexpected restored original-root reply"),
+        }
+    }
     fn export_executor_call(
         &self,
         request: &crate::catalog_session::export_executor::Request,
@@ -1053,6 +1243,19 @@ impl CatalogFilesystem for Client {
                 Ok(value)
             }
             _ => anyhow::bail!("unexpected migration identity response"),
+        }
+    }
+    fn storage_call(
+        &self,
+        request: &crate::catalog_session::storage::Request,
+        cancel: &AtomicBool,
+    ) -> Result<crate::catalog_session::storage::Reply> {
+        match self.execute(Operation::Storage(Box::new(request.clone())), cancel)? {
+            Response::Storage(value) => {
+                value.validate(request)?;
+                Ok(value)
+            }
+            _ => anyhow::bail!("unexpected storage observation response"),
         }
     }
     fn export_alias_fact(

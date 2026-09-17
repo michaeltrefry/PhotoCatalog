@@ -132,6 +132,7 @@ const SCHEMA12_TABLES: &[&str] = &[
     "storage_source_fences",
     "storage_hydration_transitions",
 ];
+const SCHEMA13_TABLES: &[&str] = &["metadata_write_receipts"];
 const SCHEMA10_TABLES: &[&str] = &[
     "migration_keyword_repairs",
     "migration_keyword_repair_items",
@@ -439,6 +440,12 @@ fn migrate_fixture(args: &Args) -> Result<serde_json::Value> {
             .all(|t| tables_before.iter().any(|n| n == t) == (before_schema >= 12)),
         "schema12 relink review table roster disagrees with version"
     );
+    ensure!(
+        SCHEMA13_TABLES
+            .iter()
+            .all(|t| tables_before.iter().any(|n| n == t) == (before_schema >= 13)),
+        "schema13 metadata receipt table roster disagrees with version"
+    );
     if before_schema < 7 {
         ensure!(!db.query_row::<bool,_,_>("SELECT EXISTS(SELECT 1 FROM sqlite_sequence WHERE name IN ('catalog_images','organization_image_relations'))",[],|r|r.get(0))?, "legacy fixture has unexpected image sequence rows");
     }
@@ -474,6 +481,9 @@ fn migrate_fixture(args: &Args) -> Result<serde_json::Value> {
     }
     if before_schema < 12 {
         expected_added.extend(SCHEMA12_TABLES.iter().map(|s| s.to_string()));
+    }
+    if before_schema < 13 {
+        expected_added.extend(SCHEMA13_TABLES.iter().map(|s| s.to_string()));
     }
     expected_added.sort();
     ensure!(
@@ -546,13 +556,14 @@ fn migrate_fixture(args: &Args) -> Result<serde_json::Value> {
             .iter()
             .chain(SCHEMA10_TABLES.iter())
             .chain(SCHEMA12_TABLES.iter())
+            .chain(SCHEMA13_TABLES.iter())
             .map(|s| s.to_string())
             .collect::<Vec<_>>(),
         CURRENT_SCHEMA_VERSION,
     )?;
     ensure!(
         repair_initial.1.iter().all(|(_, n)| *n == 0),
-        "fixture has unexpected repair or relink review state"
+        "fixture has unexpected repair, relink review or metadata receipt state"
     );
     ensure!(
         db.query_row::<bool, _, _>(

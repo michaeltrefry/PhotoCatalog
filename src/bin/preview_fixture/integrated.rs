@@ -66,7 +66,7 @@ fn count_schema(db: &Connection, total: u64) -> Result<()> {
             [],
             |r| r.get(0)
         )? == INDEX_SQL,
-        "schema5 lens/capture index differs"
+        "current lens/capture index differs"
     );
     ensure!(
         db.query_row::<u32, _, _>("PRAGMA application_id", [], |r| r.get(0))? == 1346913089,
@@ -201,7 +201,7 @@ pub(super) fn run(bundle: &Path, dataset_path: &Path) -> Result<()> {
         serde_json::from_slice(&read_bounded(&bundle.join("copy-receipt.json"), 65536)?)?;
     ensure!(
         proof["complete"] == true
-            && proof["version"] == 3
+            && proof["version"] == 4
             && proof["schema_version"] == photocatalog::CURRENT_SCHEMA_VERSION
             && proof["ancestry"]["complete"] == true
             && proof["copied_catalog"] == copied.to_string_lossy().as_ref(),

@@ -197,7 +197,7 @@ pub(crate) fn complete_managed_rendering(
 pub struct ExportWorkerProcess {
     child: Child,
     lease: Option<ChildStdin>,
-    parent_lease: RefCell<Option<File>>,
+    parent_lease: RefCell<Option<AcquiredLease>>,
     staging: PathBuf,
     request: Request,
     exited: bool,
@@ -269,7 +269,8 @@ impl ExportWorkerProcess {
         parent_lease
             .try_lock_exclusive()
             .context("acquire export parent lease")?;
-        check_parent_lease(&staging, &parent_lease)?;
+        let parent_lease = AcquiredLease::new(parent_lease);
+        check_parent_lease(&staging, &parent_lease.0)?;
         // The owner creates the lease before a child can be canceled or delayed
         // before startup. Children open it; they never recreate a retired lease.
         write(&staging.join("active.lock"), b"")?;
@@ -317,7 +318,7 @@ impl ExportWorkerProcess {
     pub fn poll(&mut self, canceled: &AtomicBool) -> Result<Option<CompletedExport>> {
         ensure!(!self.consumed, "export worker already consumed");
         if let Some(parent_lease) = self.parent_lease.borrow().as_ref() {
-            check_parent_lease(&self.staging, parent_lease)?;
+            check_parent_lease(&self.staging, &parent_lease.0)?;
         }
         if !self.exited {
             if canceled.load(Ordering::Acquire) {
@@ -395,10 +396,13 @@ impl ExportWorkerProcess {
     /// publication/restore evidence resides in its separately sealed directory.
     pub fn retire_transport(&self) -> Result<()> {
         ensure!(self.exited, "cannot retire a live export worker");
-        if let Some(parent_lease) = self.parent_lease.borrow_mut().take() {
-            check_parent_lease(&self.staging, &parent_lease)?;
-            FileExt::unlock(&parent_lease)?;
-            drop(parent_lease);
+        {
+            let mut parent_lease = self.parent_lease.borrow_mut();
+            if let Some(parent_lease) = parent_lease.as_mut() {
+                check_parent_lease(&self.staging, &parent_lease.0)?;
+                parent_lease.unlock()?;
+            }
+            parent_lease.take();
         }
         match fence_transport(&self.staging)? {
             Inspection::Retired(retired) => {
@@ -576,7 +580,12 @@ fn complete_rendering(
 }
 impl Drop for ExportWorkerProcess {
     fn drop(&mut self) {
-        let _ = self.stop();
+        if self.stop().is_err() {
+            // Without confirmed reap, retain the parent authority permanently;
+            // a duplicated description must not be explicitly unlocked while
+            // the child may still enter or own native work.
+            std::mem::forget(self.parent_lease.borrow_mut().take());
+        }
     }
 }
 
@@ -727,16 +736,30 @@ fn acquire_parent_lease(path: &Path) -> Result<ParentLeaseInspection> {
         }
         return Err(error.into());
     }
-    check_parent_lease(path, &file)?;
-    Ok(ParentLeaseInspection::Acquired(AcquiredLease(file)))
+    let file = AcquiredLease::new(file);
+    check_parent_lease(path, &file.0)?;
+    Ok(ParentLeaseInspection::Acquired(file))
 }
 // Construct only after successful acquisition. Closing one descriptor does not
 // release flock while a concurrent fork/dup retains its open-file description.
 // Explicit unlock ends this authority on every return/error before file close.
-struct AcquiredLease(File);
+struct AcquiredLease(File, bool);
+impl AcquiredLease {
+    fn new(file: File) -> Self {
+        Self(file, true)
+    }
+
+    fn unlock(&mut self) -> std::io::Result<()> {
+        FileExt::unlock(&self.0)?;
+        self.1 = false;
+        Ok(())
+    }
+}
 impl Drop for AcquiredLease {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.0);
+        if self.1 {
+            let _ = FileExt::unlock(&self.0);
+        }
     }
 }
 fn lease_retired(lock: &mut File) -> Result<bool> {
@@ -858,7 +881,7 @@ fn fence_transport(path: &Path) -> Result<Inspection> {
         }
         return Err(error.into());
     }
-    let mut lock = AcquiredLease(lock);
+    let mut lock = AcquiredLease::new(lock);
     let marked = lease_retired(&mut lock.0)?;
     ensure!(
         lease_identity(&lock.0)? == lease_identity(&File::open(path.join("active.lock"))?)?,
@@ -1565,7 +1588,7 @@ pub fn discard_retired_export_transport(retired: &RetiredExportTransport) -> Res
     let lock = open_lease(&retired.staging)?;
     lock.try_lock_exclusive()
         .context("retired export lease busy")?;
-    let mut lock = AcquiredLease(lock);
+    let mut lock = AcquiredLease::new(lock);
     ensure!(
         lease_retired(&mut lock.0)?,
         "transport retirement marker missing"
@@ -1595,7 +1618,7 @@ pub fn export_worker_main() -> Result<()> {
         .write(true)
         .open(current.join("active.lock"))?;
     lock.try_lock_exclusive()?;
-    let lock = AcquiredLease(lock);
+    let lock = AcquiredLease::new(lock);
     check_live_lease(&current, &lock.0)?;
     let result = (|| -> Result<()> {
         let mut input = std::io::stdin();

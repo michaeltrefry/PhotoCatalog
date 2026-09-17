@@ -72,7 +72,7 @@ pub(crate) enum DocumentSet {
     PrepareSupplements,
 }
 impl DocumentSet {
-    fn roles(self) -> &'static [InputRole] {
+    pub(super) fn roles(self) -> &'static [InputRole] {
         use InputRole::*;
         match self {
             Self::None => &[],

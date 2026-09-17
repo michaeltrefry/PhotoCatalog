@@ -7,7 +7,7 @@ use anyhow::{Result, ensure};
 use flate2::{Compression, write::ZlibEncoder};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
-use std::{io::Write, path::Path};
+use std::{io::Write, path::Path, sync::atomic::AtomicBool};
 
 pub(crate) fn install(db: &Connection) -> Result<()> {
     db.execute_batch(
@@ -32,18 +32,21 @@ pub(crate) fn current(
     asset: &str,
     revision: i64,
 ) -> Result<bool> {
-    let encoded: Option<String> = db
+    let encoded: Option<Option<String>> = db
         .query_row(
-            "SELECT image_identity FROM metadata_image_export_authorities WHERE operation=?1",
+            "SELECT CASE WHEN length(CAST(image_identity AS BLOB))<=32768 THEN image_identity END FROM metadata_image_export_authorities WHERE operation=?1",
             [operation],
             |r| r.get(0),
         )
         .optional()?;
-    let Some(encoded) = encoded else {
-        let current:i64=db.query_row("SELECT COALESCE(m.revision,0) FROM assets a LEFT JOIN metadata_assets m ON m.asset_id=a.id WHERE a.id=?1",[asset],|r|r.get(0))?;
-        return Ok(current == revision);
+    let encoded = match encoded {
+        Some(Some(encoded)) => encoded,
+        Some(None) => anyhow::bail!("image export identity size limit"),
+        None => {
+            let current:i64=db.query_row("SELECT COALESCE(m.revision,0) FROM assets a LEFT JOIN metadata_assets m ON m.asset_id=a.id WHERE a.id=?1",[asset],|r|r.get(0))?;
+            return Ok(current == revision);
+        }
     };
-    ensure!(encoded.len() <= 32768, "image export identity size limit");
     let expected: ImageMetadataIdentity = serde_json::from_str(&encoded)?;
     expected.key.validate()?;
     ensure!(
@@ -57,6 +60,31 @@ pub(crate) fn current(
     Ok(actual.is_some_and(|(identity, ready)| ready && identity == expected))
 }
 
+pub(crate) fn owner(
+    db: &Connection,
+    operation: &str,
+    asset: &str,
+    revision: i64,
+) -> Result<crate::catalog_metadata_write::Owner> {
+    let encoded: Option<Option<String>> = db
+        .query_row(
+            "SELECT CASE WHEN length(CAST(image_identity AS BLOB))<=32768 THEN image_identity END FROM metadata_image_export_authorities WHERE operation=?1",
+            [operation],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match encoded {
+        Some(Some(encoded)) => Ok(crate::catalog_metadata_write::Owner::Image {
+            identity: serde_json::from_str(&encoded)?,
+        }),
+        Some(None) => anyhow::bail!("image export identity size limit"),
+        None => Ok(crate::catalog_metadata_write::Owner::LegacyAsset {
+            asset_id: asset.to_owned(),
+            revision,
+        }),
+    }
+}
+
 impl Catalog {
     /// Freeze this image's selected XMP model and resolved fields. Older master
     /// plans remain readable and are never reserialized or assigned new authority.
@@ -67,6 +95,79 @@ impl Catalog {
         base_model: i64,
         destination: &Path,
     ) -> Result<ImageMetadataExportPlan> {
+        self.plan_image_metadata_export_with_cancel(
+            key,
+            expected_revision,
+            base_model,
+            destination,
+            &AtomicBool::new(false),
+        )
+    }
+    pub(crate) fn plan_image_metadata_export_with_cancel(
+        &mut self,
+        key: &VariantKey,
+        expected_revision: i64,
+        base_model: i64,
+        destination: &Path,
+        cancel: &AtomicBool,
+    ) -> Result<ImageMetadataExportPlan> {
+        self.plan_image_metadata_export_controlled(
+            key,
+            expected_revision,
+            base_model,
+            destination,
+            cancel,
+            crate::catalog_session::metadata_files::EVIDENCE_BYTES,
+            Default::default(),
+            None,
+        )
+    }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Preserve the explicit reviewed authority, limits and cancellation contract at this boundary."
+    )]
+    pub(crate) fn plan_image_metadata_export_with_receipt(
+        &mut self,
+        key: &VariantKey,
+        expected_revision: i64,
+        base_model: i64,
+        destination: &Path,
+        cancel: &AtomicBool,
+        max_existing_bytes: u64,
+        alias_limits: crate::catalog_export_alias::AliasLimits,
+        attempt: &str,
+        request_digest: &str,
+    ) -> Result<ImageMetadataExportPlan> {
+        self.plan_image_metadata_export_controlled(
+            key,
+            expected_revision,
+            base_model,
+            destination,
+            cancel,
+            max_existing_bytes,
+            alias_limits,
+            Some((attempt, request_digest)),
+        )
+    }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Preserve the explicit reviewed authority, limits and cancellation contract at this boundary."
+    )]
+    fn plan_image_metadata_export_controlled(
+        &mut self,
+        key: &VariantKey,
+        expected_revision: i64,
+        base_model: i64,
+        destination: &Path,
+        cancel: &AtomicBool,
+        max_existing_bytes: u64,
+        alias_limits: crate::catalog_export_alias::AliasLimits,
+        receipt: Option<(&str, &str)>,
+    ) -> Result<ImageMetadataExportPlan> {
+        self.require_jobs_released()?;
+        self.reconcile_export_paths(512)?;
+        ensure!(max_existing_bytes > 0, "existing file byte limit");
+        alias_limits.validate()?;
         let identity = self.image_metadata_identity(key)?;
         ensure!(
             identity.metadata_revision == expected_revision,
@@ -74,18 +175,60 @@ impl Catalog {
         );
         let (payload, projected) =
             self.resolved_export_xmp(&identity.image_id, expected_revision, base_model)?;
-        let plan = crate::metadata_export::plan_export(destination, &payload)?;
+        let native = crate::storage_volume::NativePath::from_path(destination);
+        let _permit = self.writers.enter(Priority::Foreground)?;
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some((attempt, digest)) = receipt {
+            ensure!(
+                crate::catalog_metadata_write::existing(&tx, attempt, digest)?.is_none(),
+                "metadata attempt already committed"
+            );
+        }
+        crate::catalog_images::require_image_metadata_identity(&tx, &identity)?;
+        let mut control = crate::catalog_exports::ExportControl::new(cancel);
+        crate::catalog_exports::protect_catalog_original_destination_controlled(
+            &tx,
+            &self.session,
+            destination,
+            alias_limits,
+            &mut control,
+        )?;
+        let plan = match self.session.plan_metadata_file(
+            &native,
+            &payload,
+            max_existing_bytes,
+            alias_limits,
+            cancel,
+        )? {
+            Some(plan) => plan,
+            None => {
+                let mut checkpoint = |_| {
+                    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "metadata planning canceled",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                };
+                crate::metadata_export::plan_export_controlled(
+                    destination,
+                    &payload,
+                    max_existing_bytes,
+                    alias_limits,
+                    &mut checkpoint,
+                )?
+            }
+        };
         let hash = blake3::hash(&payload).to_hex().to_string();
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
         encoder.write_all(&payload)?;
         let compressed = encoder.finish()?;
         let encoded = serde_json::to_string(&identity)?;
         ensure!(encoded.len() <= 32768, "image export identity size limit");
-        let _permit = self.writers.enter(Priority::Foreground)?;
-        let tx = self
-            .db
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        crate::catalog_images::require_image_metadata_identity(&tx, &identity)?;
         tx.execute(
             "INSERT OR IGNORE INTO metadata_blobs VALUES(?1,?2,?3)",
             params![hash, i64::try_from(payload.len())?, compressed],
@@ -105,6 +248,18 @@ impl Catalog {
             "INSERT INTO metadata_image_export_authorities VALUES(?1,?2)",
             params![plan.operation, encoded],
         )?;
+        if let Some((attempt, digest)) = receipt {
+            crate::catalog_metadata_write::insert(
+                &tx,
+                attempt,
+                digest,
+                "sidecar_plan",
+                &crate::catalog_metadata_write::Owner::Image {
+                    identity: identity.clone(),
+                },
+                &serde_json::json!({"operation": plan.operation}),
+            )?;
+        }
         tx.commit()?;
         Ok(ImageMetadataExportPlan {
             image_identity: identity,
@@ -131,9 +286,14 @@ mod tests {
         let root = temp.path().join("catalog");
         let mut catalog = Catalog::open(&root)?;
         let original = temp.path().join("missing.dng");
+        std::fs::write(&original, b"original")?;
         catalog.db.execute(
             "INSERT INTO assets(id,location,path_display,state) VALUES('a',?1,'missing','pending')",
             [crate::location_bytes(&original)],
+        )?;
+        catalog.record_storage_path(
+            "a",
+            &crate::storage_volume::NativePath::from_path(&original),
         )?;
         let master = VariantKey::master("a");
         let copy = catalog.create_edit_variant(&master, 0, "copy")?.key;
@@ -194,7 +354,18 @@ mod tests {
             let temp = tempfile::tempdir()?;
             let root = temp.path().join("catalog");
             let mut catalog = Catalog::open(&root)?;
-            catalog.db.execute("INSERT INTO assets(id,location,path_display,state) VALUES('a',?1,'synthetic','pending')",[b"synthetic-original".as_slice()])?;
+            let original = temp.path().join("original.dng");
+            std::fs::write(&original, b"original")?;
+            catalog.db.execute("INSERT INTO assets(id,location,path_display,state) VALUES('a',?1,'synthetic','pending')",[crate::location_bytes(&original)])?;
+            catalog.record_storage_path(
+                "a",
+                &crate::storage_volume::NativePath::from_path(&original),
+            )?;
+            let key = crate::storage_volume::object_key(&original, &std::fs::metadata(&original)?)?;
+            catalog.db.execute(
+                "UPDATE storage_bindings SET file_key=?1 WHERE asset_id='a'",
+                [format!("{}:{}", key.0, key.1)],
+            )?;
             let copy = catalog
                 .create_edit_variant(&VariantKey::master("a"), 0, "copy")?
                 .key;
@@ -310,6 +481,128 @@ mod tests {
                     .is_empty()
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn controlled_sidecar_plan_rejects_original_and_enforces_selected_existing_limit() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("catalog");
+        let original = temp.path().canonicalize()?.join("original.xmp");
+        std::fs::write(&original, b"catalog original")?;
+        let mut catalog = Catalog::open(&root)?;
+        catalog.db.execute(
+            "INSERT INTO assets(id,location,path_display,state) VALUES('a',?1,'original','pending')",
+            [crate::location_bytes(&original)],
+        )?;
+        catalog.record_storage_path(
+            "a",
+            &crate::storage_volume::NativePath::from_path(&original),
+        )?;
+        let object = crate::storage_volume::object_key(&original, &std::fs::metadata(&original)?)?;
+        catalog.db.execute(
+            "UPDATE storage_bindings SET file_key=?1 WHERE asset_id='a'",
+            [format!("{}:{}", object.0, object.1)],
+        )?;
+        let key = VariantKey::master("a");
+        let change = catalog.edit_metadata_for_image(
+            &key,
+            0,
+            None,
+            &[Edit::Set {
+                namespace: crate::xmp::XMP.into(),
+                path: "Rating".into(),
+                value: "5".into(),
+            }],
+        )?;
+        let identity = catalog.image_metadata_identity(&key)?;
+        let digest = "0".repeat(64);
+        assert!(
+            catalog
+                .plan_image_metadata_export_with_receipt(
+                    &key,
+                    identity.metadata_revision,
+                    change.model_ids[0],
+                    &original,
+                    &AtomicBool::new(false),
+                    1024,
+                    Default::default(),
+                    &uuid::Uuid::new_v4().to_string(),
+                    &digest,
+                )
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&original)?, b"catalog original");
+
+        let alias = temp.path().canonicalize()?.join("hardlink-alias.xmp");
+        std::fs::hard_link(&original, &alias)?;
+        assert!(
+            catalog
+                .plan_image_metadata_export_with_receipt(
+                    &key,
+                    identity.metadata_revision,
+                    change.model_ids[0],
+                    &alias,
+                    &AtomicBool::new(false),
+                    1024,
+                    Default::default(),
+                    &uuid::Uuid::new_v4().to_string(),
+                    &digest,
+                )
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&original)?, b"catalog original");
+
+        let oversized = temp.path().canonicalize()?.join("oversized.xmp");
+        std::fs::write(&oversized, b"12345678901")?;
+        assert!(
+            catalog
+                .plan_image_metadata_export_with_receipt(
+                    &key,
+                    identity.metadata_revision,
+                    change.model_ids[0],
+                    &oversized,
+                    &AtomicBool::new(false),
+                    10,
+                    Default::default(),
+                    &uuid::Uuid::new_v4().to_string(),
+                    &digest,
+                )
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&oversized)?, b"12345678901");
+
+        catalog.db.execute(
+            "INSERT INTO assets(id,location,path_display,state) VALUES('unbound',?1,'unbound','pending')",
+            [b"unbound".as_slice()],
+        )?;
+        let new_destination = temp.path().canonicalize()?.join("new.xmp");
+        assert!(
+            catalog
+                .plan_image_metadata_export_with_receipt(
+                    &key,
+                    identity.metadata_revision,
+                    change.model_ids[0],
+                    &new_destination,
+                    &AtomicBool::new(false),
+                    1024,
+                    Default::default(),
+                    &uuid::Uuid::new_v4().to_string(),
+                    &digest,
+                )
+                .is_err()
+        );
+        assert!(!new_destination.exists());
+        assert_eq!(
+            catalog
+                .db
+                .query_row("SELECT count(*) FROM metadata_export_plans", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))?,
+            0
+        );
         Ok(())
     }
 }

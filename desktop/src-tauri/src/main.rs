@@ -1,15 +1,24 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+mod measurement;
+mod measurement_clock;
 
 use photocatalog::{application, preview};
-use tauri::{Emitter, Manager};
 use std::sync::atomic::Ordering;
+use tauri::{Emitter, Manager};
 
 fn main() {
     // The installed executable is also the isolated worker. Never initialize a
     // webview, dialogs or catalog owner in a worker process.
     match std::env::args_os().nth(1).as_deref() {
+        Some(arg) if arg == "--s12-clock-diagnostic" => {
+            if let Err(error) = measurement_clock::diagnostic() {
+                eprintln!("{error}");
+                std::process::exit(2);
+            }
+            return;
+        }
         Some(arg) if arg == "--lightroom-migration-worker" => {
             if let Err(error) = photocatalog::lightroom_migration_worker::worker_main() {
                 eprintln!("{error:#}");
@@ -17,16 +26,49 @@ fn main() {
             }
             return;
         }
-        Some(arg) if arg == "--lightroom-source-reader-sql" || arg == "--lightroom-source-reader-raw" => {
+        Some(arg)
+            if arg == "--lightroom-source-reader-sql" || arg == "--lightroom-source-reader-raw" =>
+        {
             let raw = arg == "--lightroom-source-reader-raw";
-            if let Err(error) = photocatalog::lightroom_migration_worker::managed_source_reader_main(raw) {
+            if let Err(error) =
+                photocatalog::lightroom_migration_worker::managed_source_reader_main(raw)
+            {
                 eprintln!("{error:#}");
                 std::process::exit(1);
             }
             return;
         }
         Some(arg) if arg == "--catalog-filesystem-worker" => {
-            std::process::exit(if photocatalog::filesystem_worker::worker_main().is_ok() { 0 } else { 1 });
+            std::process::exit(if photocatalog::filesystem_worker::worker_main().is_ok() {
+                0
+            } else {
+                1
+            });
+        }
+        Some(arg) if arg == "--catalog-backup-worker" => {
+            std::process::exit(
+                if photocatalog::catalog_backup::managed::worker_main().is_ok() {
+                    0
+                } else {
+                    1
+                },
+            );
+        }
+        Some(arg) if arg == "--lightroom-source-reader-capture-sql" => {
+            if let Err(error) =
+                photocatalog::lightroom_migration_worker::managed_capture_sql_reader_main()
+            {
+                eprintln!("{error:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        Some(arg) if arg == "--lightroom-workbench-worker" => {
+            std::process::exit(if application::lightroom_process::worker_main().is_ok() {
+                0
+            } else {
+                1
+            });
         }
         Some(arg) if arg == "--catalog-desktop-worker" => {
             if let Err(error) = application::desktop::worker_main() {
@@ -58,34 +100,59 @@ fn main() {
         }
         _ => {}
     }
+    let measurement_run_id = match measurement::run_id() {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    };
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .setup(|app| {
-            let bridge = application::Bridge::spawn(application::Config {
+        .setup(move |app| {
+            let cache_root = app.path().app_cache_dir()?;
+            let bridge = application::desktop::DesktopBridge::spawn(application::Config {
                 worker_executable: std::env::current_exe()?,
-                cache_root: Some(app.path().app_cache_dir()?),
+                cache_root: Some(cache_root.clone()),
                 original_roots: Vec::new(),
                 preview_policy: preview::PreviewPolicy::default(),
                 preview_limits: preview::ServiceLimits::default(),
                 limits: application::Limits::default(),
             })?;
             app.manage(commands::State::new(bridge));
+            app.manage(measurement::State::new(
+                measurement_run_id.clone(),
+                cache_root,
+            ));
+            #[cfg(feature = "measurement-devtools")]
+            if measurement_run_id.is_some()
+                && let Some(window) = app.get_webview_window("main")
+            {
+                window.open_devtools();
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::catalog_command,
             commands::catalog_cancel_operation,
+            commands::catalog_settle_cancellation,
             commands::catalog_choose_folder,
             commands::catalog_choose_location,
             commands::catalog_preview_bytes,
             commands::catalog_preview_release,
+            measurement::catalog_measurement_config,
+            measurement::catalog_measurement_clock_anchor,
+            measurement::catalog_measurement_finish,
+            measurement::catalog_measurement_preview_diagnostic,
             commands::catalog_frontend_ready,
             commands::catalog_quit,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let state = window.state::<commands::State>();
-                if state.frontend_ready.load(Ordering::Acquire) && !state.quitting.load(Ordering::Acquire) {
+                if state.frontend_ready.load(Ordering::Acquire)
+                    && !state.quitting.load(Ordering::Acquire)
+                {
                     api.prevent_close();
                     let _ = window.emit("catalog-close-requested", ());
                 }
@@ -96,7 +163,9 @@ fn main() {
     app.run(|app, event| {
         if let tauri::RunEvent::ExitRequested { api, .. } = &event {
             let state = app.state::<commands::State>();
-            if state.frontend_ready.load(Ordering::Acquire) && !state.quitting.load(Ordering::Acquire) {
+            if state.frontend_ready.load(Ordering::Acquire)
+                && !state.quitting.load(Ordering::Acquire)
+            {
                 api.prevent_exit();
                 let _ = app.emit("catalog-close-requested", ());
             }

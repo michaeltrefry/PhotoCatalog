@@ -483,6 +483,21 @@ fn main() -> Result<()> {
         Some(arg) if arg == "--lightroom-source-reader-raw" => {
             return photocatalog::lightroom_migration_worker::managed_source_reader_main(true);
         }
+        Some(arg) if arg == "--lightroom-source-reader-capture-sql" => {
+            return photocatalog::lightroom_migration_worker::managed_capture_sql_reader_main();
+        }
+        Some(arg) if arg == "--lightroom-capture-worker" => {
+            return photocatalog::lightroom::capture::capture_worker_main();
+        }
+        Some(arg) if arg == "--lightroom-workbench-worker" => {
+            std::process::exit(
+                if photocatalog::application::lightroom_process::worker_main().is_ok() {
+                    0
+                } else {
+                    1
+                },
+            );
+        }
         _ => {}
     }
     if std::env::args_os()
@@ -496,6 +511,18 @@ fn main() -> Result<()> {
         } else {
             1
         });
+    }
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--catalog-backup-worker")
+    {
+        std::process::exit(
+            if photocatalog::catalog_backup::managed::worker_main().is_ok() {
+                0
+            } else {
+                1
+            },
+        );
     }
     if std::env::args_os()
         .nth(1)

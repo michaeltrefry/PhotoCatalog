@@ -251,6 +251,7 @@ impl State {
                     } else if self.preparing.is_none() {
                         let worker = SinglePreparation::spawn(
                             path.to_path()?,
+                            catalog.session.clone(),
                             #[cfg(test)]
                             checkpoint.clone(),
                         )?;

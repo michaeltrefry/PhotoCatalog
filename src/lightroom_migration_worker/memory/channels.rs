@@ -123,6 +123,11 @@ fn context() -> Result<Layout> {
         1,
     )
 }
+/// One blocking channel operation retains a four-entry selector vector and
+/// one shared wait context while the thread is parked.
+pub(crate) fn blocking_waiter() -> Result<usize> {
+    add(mul(4, selector()?.size())?, arc(context()?)?)
+}
 /// Two registering sides per Process: ordinary input recv_timeout and output
 /// blocking send. Each has one waiter and retains the first four-entry Vec.
 pub(crate) fn process<T>() -> Result<usize> {
@@ -130,10 +135,8 @@ pub(crate) fn process<T>() -> Result<usize> {
         mul(2, bounded(1, layout::<Vec<u8>>())?)?,
         bounded(1, layout::<anyhow::Result<Option<T>>>())?,
     )?;
-    let selectors = mul(8, selector()?.size())?;
-    let contexts = mul(2, arc(context()?)?)?;
     add(
-        add(add(channels, selectors)?, contexts)?,
+        add(channels, mul(2, blocking_waiter()?)?)?,
         pthread_mutexes(12)?,
     )
 }
@@ -177,8 +180,10 @@ mod tests {
     fn current_target_channel_backing_checks_all_arithmetic() -> Result<()> {
         let one = bounded(1, Layout::new::<Vec<u8>>())?;
         let two = bounded(2, Layout::new::<Vec<u8>>())?;
+        let waiter = blocking_waiter()?;
         assert!(two > one);
         assert!(one >= std::mem::size_of::<Vec<u8>>());
+        assert!(waiter >= 4 * std::mem::size_of::<Arc<()>>());
         assert!(process::<crate::lightroom_migration_worker::protocol::ChildFrame>()? > 2 * one);
         assert!(bounded(usize::MAX, Layout::new::<Vec<u8>>()).is_err());
         assert!(

@@ -20,6 +20,70 @@ use std::{
 };
 mod worker;
 
+pub(crate) trait ManagedIo: Send + Sync + 'static {
+    /// Fail closed before a new public Workbench request is admitted. This is
+    /// separate from callback validation so F loss can stop W even while no F
+    /// callback is currently in flight.
+    fn admit(&self) -> Result<()>;
+    /// Final generation-scoped authority check performed while a managed SQL
+    /// transaction is still rollback-capable, immediately before COMMIT.
+    fn commit(&self) -> Result<()>;
+    /// Permanently revoke this generation before fatal W cleanup. In
+    /// particular, W may no longer release F root custody ahead of its reap.
+    fn revoke_generation(&self);
+    /// Record that the sole W child is gone. G may reconcile F only after this
+    /// notification on every successfully started generation.
+    fn workbench_reaped(&self);
+    fn filesystem(
+        &self,
+        request: crate::filesystem_worker::wire::LightroomWorkbenchIo,
+        cancel: &AtomicBool,
+    ) -> Result<crate::filesystem_worker::wire::LightroomWorkbenchIoReply>;
+    fn sealed_document(
+        &self,
+        request: crate::filesystem_worker::wire::LightroomSealedRead,
+        cancel: &AtomicBool,
+    ) -> Result<Option<crate::filesystem_worker::wire::LightroomSealedDocumentPage>>;
+    fn artifact_preparation(
+        &self,
+        request: crate::filesystem_worker::wire::LightroomArtifactPreparation,
+        cancel: &AtomicBool,
+    ) -> Result<Option<crate::filesystem_worker::wire::LightroomArtifactPreparationReply>>;
+    fn source_open(
+        &self,
+        authority: crate::lightroom_migration_worker::source_reader::CaptureSqlAuthority,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<String>;
+    fn source_sql_open(
+        &self,
+        seal: crate::lightroom::migration_source::InputSeal,
+        limits: crate::lightroom::migration_source::ReadLimits,
+        protected: Vec<crate::lightroom_migration_worker::identity::FileKey>,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<String>;
+    fn source_schema(
+        &self,
+        source: &str,
+    ) -> Result<crate::lightroom_migration_worker::source_reader::capture_wire::SchemaObjects>;
+    fn source_rows(
+        &self,
+        source: &str,
+        handle: String,
+        cursor: Option<Vec<crate::lightroom::plan::Cell>>,
+        limit: usize,
+    ) -> Result<crate::lightroom_migration_worker::source_reader::capture_wire::TableValue>;
+    fn source_current(
+        &self,
+        source: &str,
+    ) -> Result<crate::lightroom_migration_worker::source_reader::capture_wire::Current>;
+    fn source_retire(&self, source: &str) -> Result<()>;
+    /// Stop admission and checked-reap every independently owned Source.
+    fn drain_sources(&self) -> Result<()>;
+    /// Reconcile retained F resources after W has been checked-reaped. This
+    /// phase must never run while a W child can still hold SQLite authority.
+    fn drain_filesystem(&self) -> Result<()>;
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Limits {
@@ -45,14 +109,26 @@ impl Default for Limits {
     }
 }
 impl Limits {
+    pub(super) fn metadata_maximum() -> Self {
+        Self {
+            request_bytes: core::MANIFEST_BYTES,
+            result_bytes: 256 * 1024 * 1024,
+            page_bytes: core::PAGE_BYTES,
+            row_bytes: 128 * 1024 * 1024,
+            native_path_units: 1024 * 1024,
+            vm_steps: 100_000_000_000,
+            deadline_ms: 3_600_000,
+        }
+    }
     fn validate(&self) -> Result<()> {
+        let maximum = Self::metadata_maximum();
         ensure!(
-            (1024..=core::MANIFEST_BYTES).contains(&self.request_bytes)
-                && (1024..=core::PAGE_BYTES).contains(&self.page_bytes),
+            (1024..=maximum.request_bytes).contains(&self.request_bytes)
+                && (1024..=maximum.page_bytes).contains(&self.page_bytes),
             "workbench request/page byte limit"
         );
         ensure!(
-            (1..=1024 * 1024).contains(&self.native_path_units),
+            (1..=maximum.native_path_units).contains(&self.native_path_units),
             "workbench native path limit"
         );
         self.control(Arc::new(AtomicBool::new(false)))?;
@@ -134,6 +210,9 @@ pub enum Action {
         approval_json: String,
         output: NativePath,
     },
+    ApprovalDocuments {
+        draft_json: String,
+    },
     ReleaseReview,
 }
 impl Action {
@@ -150,7 +229,10 @@ impl Action {
         )
     }
     fn allowed_during_review(&self) -> bool {
-        matches!(self, Self::Seal { .. } | Self::ReleaseReview)
+        matches!(
+            self,
+            Self::Seal { .. } | Self::ApprovalDocuments { .. } | Self::ReleaseReview
+        )
     }
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -312,6 +394,45 @@ struct Shared {
     status: Status,
     control: Control,
     result: Option<Arc<Cached>>,
+    fatal: bool,
+}
+
+pub(super) struct MetadataLayouts {
+    pub status: usize,
+    pub cached: usize,
+    pub shared: usize,
+    pub message: usize,
+    pub control: usize,
+    pub workbench: usize,
+    pub worker_owner: usize,
+}
+
+pub(super) fn metadata_layouts() -> MetadataLayouts {
+    MetadataLayouts {
+        status: std::mem::size_of::<Status>(),
+        cached: std::mem::size_of::<Cached>(),
+        shared: std::mem::size_of::<Shared>(),
+        message: std::mem::size_of::<Message>(),
+        control: std::mem::size_of::<WorkbenchControl>(),
+        workbench: std::mem::size_of::<Workbench>(),
+        worker_owner: worker::owner_layout(),
+    }
+}
+
+pub(super) fn channel_metadata_layouts() -> Result<(usize, usize)> {
+    use crate::lightroom_migration_worker::memory::{channels, layout::add};
+    use std::alloc::Layout;
+    // The worker is the sole blocking receiver; submissions use try_send.
+    Ok((
+        add(
+            add(
+                channels::bounded(1, Layout::new::<Message>())?,
+                channels::pthread_mutexes(2)?,
+            )?,
+            channels::blocking_waiter()?,
+        )?,
+        std::mem::size_of::<mpsc::Receiver<Message>>(),
+    ))
 }
 enum Message {
     Action {
@@ -337,7 +458,7 @@ pub struct WorkbenchControl {
 }
 pub struct Workbench {
     control: WorkbenchControl,
-    join: Option<JoinHandle<()>>,
+    join: Option<JoinHandle<Result<()>>>,
 }
 impl std::ops::Deref for Workbench {
     type Target = WorkbenchControl;
@@ -378,6 +499,9 @@ pub(crate) enum DeferredAction {
         approval_blake3: String,
         output: NativePath,
     },
+    ApprovalDocuments {
+        json: Payload,
+    },
 }
 enum PendingAction {
     Typed(Action),
@@ -394,7 +518,9 @@ impl PendingAction {
     fn allowed_during_review(&self) -> bool {
         match self {
             Self::Typed(a) => a.allowed_during_review(),
-            Self::Deferred(DeferredAction::Seal { .. }) => true,
+            Self::Deferred(
+                DeferredAction::Seal { .. } | DeferredAction::ApprovalDocuments { .. },
+            ) => true,
             _ => false,
         }
     }
@@ -422,6 +548,11 @@ impl PendingAction {
                 approval_blake3,
                 output,
             },
+            Self::Deferred(DeferredAction::ApprovalDocuments { json }) => {
+                Action::ApprovalDocuments {
+                    draft_json: json.json(control)?,
+                }
+            }
         };
         control.check()?;
         Ok(action)
@@ -450,16 +581,23 @@ fn native(path: &NativePath, maximum: usize) -> Result<std::path::PathBuf> {
 }
 impl Workbench {
     pub fn spawn(config: Config) -> Result<Self> {
-        Self::spawn_inner(config, || {})
+        Self::spawn_inner(config, || {}, None)
+    }
+    pub(crate) fn spawn_managed(config: Config, io: &Arc<dyn ManagedIo>) -> Result<Self> {
+        Self::spawn_inner(config, || {}, Some(io.clone()))
     }
     #[cfg(test)]
     pub(crate) fn spawn_held(
         config: Config,
         before: impl FnOnce() + Send + 'static,
     ) -> Result<Self> {
-        Self::spawn_inner(config, before)
+        Self::spawn_inner(config, before, None)
     }
-    fn spawn_inner(config: Config, before: impl FnOnce() + Send + 'static) -> Result<Self> {
+    fn spawn_inner(
+        config: Config,
+        before: impl FnOnce() + Send + 'static,
+        managed: Option<Arc<dyn ManagedIo>>,
+    ) -> Result<Self> {
         config.limits.validate()?;
         core::bounded_json(&config, config.limits.request_bytes)?;
         for path in [
@@ -491,31 +629,45 @@ impl Workbench {
             },
             control,
             result: None,
+            fatal: false,
         }));
         let closing = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = mpsc::sync_channel(1);
         let state = shared.clone();
         let stop = closing.clone();
+        let managed_generation = managed.is_some();
         let join = thread::Builder::new()
             .name("lightroom-workbench".into())
-            .spawn(move || {
+            .spawn(move || -> Result<()> {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     before();
-                    worker::run(config, receiver, state.clone(), stop)
+                    worker::run(config, receiver, state.clone(), stop, managed)
                 }));
                 let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
                 s.status.closed = true;
                 s.status.capture_pid = None;
                 s.status.review_token = None;
-                if outcome.is_err() {
-                    s.status.error = Some(
-                        "inspection worker panicked; retained artifacts require explicit review"
-                            .into(),
-                    );
+                let (result, panicked) = match outcome {
+                    Ok(Ok(())) => (Ok(()), false),
+                    Ok(Err(error)) => (Err(error), false),
+                    Err(_) => (
+                        Err(anyhow::anyhow!(
+                            "inspection worker panicked; retained artifacts require explicit review"
+                        )),
+                        true,
+                    ),
+                };
+                if let Err(error) = &result {
+                    // Unmanaged inspection failures are terminal status values
+                    // with no external custody to retain. Managed generations
+                    // and panics must still poison checked shutdown.
+                    s.fatal |= managed_generation || panicked;
+                    s.status.error = Some(format!("{error:#}").chars().take(4096).collect());
                     s.status.phase = Phase::Failed;
                 } else {
                     s.status.phase = Phase::Closed;
                 }
+                if s.fatal { result } else { Ok(()) }
             })?;
         Ok(Self {
             control: WorkbenchControl {
@@ -531,6 +683,13 @@ impl Workbench {
     }
 }
 impl WorkbenchControl {
+    pub(crate) fn fatal(&self) -> bool {
+        self.shared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .fatal
+    }
+
     pub fn status(&self) -> Status {
         let s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
         let mut out = s.status.clone();
@@ -564,7 +723,8 @@ impl WorkbenchControl {
                 let json = match a {
                     DeferredAction::Inventory(j)
                     | DeferredAction::Selection { json: j, .. }
-                    | DeferredAction::Seal { json: j, .. } => j,
+                    | DeferredAction::Seal { json: j, .. }
+                    | DeferredAction::ApprovalDocuments { json: j } => j,
                 };
                 ensure!(
                     json.bytes <= limits.request_bytes,
@@ -580,6 +740,7 @@ impl WorkbenchControl {
             !self.closing.load(Ordering::Acquire) && !s.status.closed,
             "workbench is closing or closed"
         );
+        ensure!(!s.fatal, "workbench generation is poisoned");
         ensure!(
             s.status.initialized,
             "workbench is not initialized; open explicitly after failure"
@@ -777,7 +938,7 @@ impl Workbench {
         }
         if let Some(join) = self.join.take() {
             join.join()
-                .map_err(|_| anyhow::anyhow!("workbench owner failed during drain"))?;
+                .map_err(|_| anyhow::anyhow!("workbench owner failed during drain"))??;
         }
         Ok(true)
     }

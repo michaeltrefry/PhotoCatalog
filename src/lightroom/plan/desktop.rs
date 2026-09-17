@@ -117,6 +117,7 @@ impl Plan {
         revision: &str,
         expected: &str,
         reason: &str,
+        commit_authority: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
         ensure!(
             !reason.trim().is_empty() && reason.len() <= 4096,
@@ -141,6 +142,7 @@ impl Plan {
             "selected revision is outside family"
         );
         self.db.execute("INSERT INTO family_choices VALUES(?,?,?,?) ON CONFLICT(family) DO UPDATE SET revision=excluded.revision,evidence_digest=excluded.evidence_digest,reason=excluded.reason", params![family,revision,expected,reason])?;
+        commit_authority()?;
         tx.commit()?;
         Ok(())
     }

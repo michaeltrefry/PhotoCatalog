@@ -248,11 +248,13 @@ fn absent(pids: &Arc<Mutex<Vec<u32>>>) {
     }
 }
 #[test]
-fn both_actual_sources_revoke_before_broker_join() -> Result<()> {
+fn all_actual_sources_revoke_before_broker_join() -> Result<()> {
     let (mut broker, _, pids) = broker()?;
     let sql = start(&broker, 1, Kind::Sql, "sql")?;
     let raw = start(&broker, 2, Kind::Raw, "raw")?;
+    let capture = start(&broker, 3, Kind::CaptureSql, "capture")?;
     assert_ne!(sql, raw);
+    assert_ne!(raw, capture);
     assert!(broker.ensure_idle().is_err());
     // This isolated broker fixture has no LM child; the caller supplies the
     // revocation acknowledgement only after its own executor is absent.
@@ -260,7 +262,7 @@ fn both_actual_sources_revoke_before_broker_join() -> Result<()> {
     broker.wait_revoked();
     assert!(broker.shared.state.lock().unwrap().revoked);
     broker.finish()?;
-    assert_eq!(pids.lock().unwrap().len(), 2);
+    assert_eq!(pids.lock().unwrap().len(), 3);
     absent(&pids);
     Ok(())
 }
@@ -395,6 +397,16 @@ fn observed_full_event_queue_cannot_delay_revoking_both_sources() -> Result<()> 
             blake3: blake3::hash(b"").to_hex().to_string(),
         },
     )?;
+    // COUNT includes CaptureSql. Started + Started + Accepted exactly fills
+    // the queue, so a fourth valid event is required to observe backpressure.
+    send(
+        &broker,
+        Command::Reserve {
+            token: token.clone(),
+            sequence: U64(1),
+            bytes: U64(1),
+        },
+    )?;
     let until = Instant::now() + Duration::from_secs(5);
     loop {
         let state = broker.shared.state.lock().unwrap();
@@ -491,6 +503,16 @@ fn live_transport_errors_bypass_observed_full_events_before_any_dequeue() -> Res
                 build: crate::lightroom_migration_worker::worker::build_identity().into(),
                 bytes: U64(0),
                 blake3: blake3::hash(b"").to_hex().to_string(),
+            },
+        )?;
+        // COUNT includes CaptureSql. Started + Started + Accepted exactly fills
+        // the queue, so a fourth valid event is required to observe backpressure.
+        send(
+            &broker,
+            Command::Reserve {
+                token: token.clone(),
+                sequence: U64(1),
+                bytes: U64(1),
             },
         )?;
         let until = Instant::now() + Duration::from_secs(10);

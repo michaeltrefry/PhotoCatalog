@@ -38,6 +38,24 @@ pub(crate) struct SharedAllocationGrant {
     pool: crate::preview::ByteBudget,
     held: Mutex<Option<crate::preview::ByteReservation>>,
 }
+
+/// Heap roots for one managed migration's allocation adapters. G owns one
+/// monotonic grant, G and LM each own Source budget adapters, the result has a
+/// distinct shared adapter, and the complete three-role Source roster can each
+/// own one parent adapter. Payload reservations themselves are charged to their
+/// dedicated pools and are deliberately excluded here.
+pub(crate) fn managed_adapter_metadata_backing() -> Result<usize> {
+    use self::{
+        channels::arc,
+        layout::{add, mul},
+    };
+    use std::alloc::Layout;
+    add(
+        arc(Layout::new::<SharedAllocationGrant>())?,
+        mul(6, arc(Layout::new::<Backend>())?)?,
+    )
+}
+
 impl SharedAllocationGrant {
     pub(crate) fn new(pool: crate::preview::ByteBudget) -> Result<Arc<Self>> {
         usize::try_from(pool.snapshot().0)

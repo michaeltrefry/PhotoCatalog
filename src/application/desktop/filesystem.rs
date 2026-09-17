@@ -11,8 +11,8 @@ use crate::{
         ExportOriginalReply, ExportOriginalRequest, ExportProfileReply, ExportProfileRequest,
         ExportPublicationReply, ExportPublicationRequest, InspectExportOriginal,
         InspectedExportOriginal, LeaseId, MigrationIdentityReply, MigrationIdentityRequest,
-        PrepareCatalog, PrepareExportDirectory, PreparedExportDirectory, RootCapability,
-        SqlAdmissionConfirmed, store,
+        PrepareCatalog, PrepareExportDirectory, PreparedExportDirectory, RestoreOriginalRootReply,
+        RestoreOriginalRootRequest, RootCapability, SqlAdmissionConfirmed, store,
     },
     filesystem_worker::{
         client::Client,
@@ -62,7 +62,10 @@ pub(super) enum Call {
     PreviewIo(Box<crate::catalog_session::preview_io::Request>),
     PreviewStage(Box<crate::catalog_session::preview_stage::Request>),
     ExportStage(Box<crate::catalog_session::export_stage::Request>),
+    MetadataFiles(Box<crate::catalog_session::metadata_files::Request>),
     ExportExecutor(crate::catalog_session::export_executor::Request),
+    Import(crate::catalog_session::import::Request),
+    RestoreOriginalRoot(RestoreOriginalRootRequest),
     ExportNative(Box<crate::catalog_session::export_native::Request>),
     Native(Box<crate::catalog_session::native::Request>),
     ReadPreviewConfiguration(NativePath),
@@ -70,6 +73,7 @@ pub(super) enum Call {
     ExportDestinationSnapshot(Box<ExportDestinationSnapshotRequest>),
     MigrationIdentity(Box<MigrationIdentityRequest>),
     ExportAliasFact(Box<ExportAliasFactRequest>),
+    Storage(Box<crate::catalog_session::storage::Request>),
     InspectExportOriginal(Box<InspectExportOriginal>),
     ExportOriginal(Box<ExportOriginalRequest>),
     ExportPublication(Box<ExportPublicationRequest>),
@@ -82,10 +86,12 @@ impl Call {
             || matches!(self, Self::PreviewIo(request) if request.cleanup())
             || matches!(self, Self::PreviewStage(request) if request.cleanup())
             || matches!(self, Self::ExportStage(request) if request.cleanup())
+            || matches!(self, Self::MetadataFiles(request) if request.cleanup())
             || matches!(self, Self::ExportExecutor(request) if request.cleanup())
             || matches!(self, Self::ExportProfile(request) if request.cleanup())
             || matches!(self, Self::ExportOriginal(request) if request.cleanup())
             || matches!(self, Self::ExportPublication(request) if request.cleanup())
+            || matches!(self, Self::Import(request) if request.cleanup())
     }
     fn cancellable(&self) -> bool {
         matches!(
@@ -97,15 +103,19 @@ impl Call {
                 | Self::ExportDestinationSnapshot(_)
                 | Self::MigrationIdentity(_)
                 | Self::ExportAliasFact(_)
+                | Self::Storage(_)
                 | Self::InspectExportOriginal(_)
+                | Self::RestoreOriginalRoot(_)
         ) || matches!(self, Self::PreviewStore(request) if !request.is_cleanup())
             || matches!(self, Self::PreviewIo(request) if !request.cleanup())
             || matches!(self, Self::PreviewStage(request) if !request.cleanup())
             || matches!(self, Self::ExportStage(request) if !request.cleanup())
+            || matches!(self, Self::MetadataFiles(request) if !request.cleanup())
             || matches!(self, Self::ExportExecutor(request) if !request.cleanup())
             || matches!(self, Self::ExportProfile(request) if !request.cleanup())
             || matches!(self, Self::ExportOriginal(request) if !request.cleanup())
             || matches!(self, Self::ExportPublication(request) if !request.cleanup())
+            || matches!(self, Self::Import(request) if !request.cleanup())
     }
     fn validate(&self) -> Result<()> {
         match self {
@@ -153,12 +163,16 @@ impl Call {
                 );
                 request.validate()
             }
+            Self::MetadataFiles(request) => request.validate(),
             Self::ExportExecutor(request) => request.validate(),
+            Self::Import(request) => request.validate(),
+            Self::RestoreOriginalRoot(request) => request.validate(),
             Self::ReadPreviewConfiguration(path) => store::path(path),
             Self::PrepareExportDirectory(request) => request.validate(),
             Self::ExportDestinationSnapshot(request) => request.validate(),
             Self::MigrationIdentity(request) => request.validate(),
             Self::ExportAliasFact(request) => request.validate(),
+            Self::Storage(request) => request.validate(),
             Self::InspectExportOriginal(request) => request.validate(),
             Self::ExportOriginal(request) => request.validate(),
             Self::ExportPublication(request) => request.validate(),
@@ -174,12 +188,16 @@ pub(super) fn maximum_boxed_call_root_bytes() -> usize {
         std::mem::size_of::<crate::catalog_session::preview_io::Request>(),
         std::mem::size_of::<crate::catalog_session::preview_stage::Request>(),
         std::mem::size_of::<crate::catalog_session::export_stage::Request>(),
+        std::mem::size_of::<crate::catalog_session::metadata_files::Request>(),
         std::mem::size_of::<crate::catalog_session::export_executor::Request>(),
+        std::mem::size_of::<crate::catalog_session::import::Request>(),
+        std::mem::size_of::<RestoreOriginalRootRequest>(),
         std::mem::size_of::<crate::catalog_session::export_native::Request>(),
         std::mem::size_of::<PrepareExportDirectory>(),
         std::mem::size_of::<ExportDestinationSnapshotRequest>(),
         std::mem::size_of::<MigrationIdentityRequest>(),
         std::mem::size_of::<ExportAliasFactRequest>(),
+        std::mem::size_of::<crate::catalog_session::storage::Request>(),
         std::mem::size_of::<InspectExportOriginal>(),
         std::mem::size_of::<ExportOriginalRequest>(),
         std::mem::size_of::<ExportPublicationRequest>(),
@@ -201,7 +219,7 @@ pub(super) fn maximum_boxed_call_root_bytes() -> usize {
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", deny_unknown_fields)]
-#[expect(
+#[allow(
     clippy::large_enum_variant,
     reason = "inline replies preserve the explicitly bounded relay root without an unaccounted heap owner"
 )]
@@ -213,7 +231,10 @@ pub(super) enum Value {
     PreviewIo(crate::catalog_session::preview_io::Reply),
     PreviewStage(crate::catalog_session::preview_stage::Reply),
     ExportStage(crate::catalog_session::export_stage::Reply),
+    MetadataFiles(crate::catalog_session::metadata_files::Reply),
     ExportExecutor(crate::catalog_session::export_executor::Reply),
+    Import(crate::catalog_session::import::Reply),
+    RestoredOriginalRoot(RestoreOriginalRootReply),
     ExportNative(crate::catalog_session::export_native::Status),
     Native(crate::catalog_session::native::Status),
     Configuration(Vec<u8>),
@@ -221,6 +242,7 @@ pub(super) enum Value {
     ExportDestinationSnapshot(ExportDestinationSnapshotReply),
     MigrationIdentity(MigrationIdentityReply),
     ExportAliasFact(ExportAliasFactReply),
+    Storage(crate::catalog_session::storage::Reply),
     InspectedExportOriginal(InspectedExportOriginal),
     ExportOriginal(ExportOriginalReply),
     ExportPublication(ExportPublicationReply),
@@ -576,6 +598,10 @@ fn encode_packet(packet: &Packet, cap: usize) -> Result<Vec<u8>> {
             ..
         } => (!r.binary().is_empty()).then(|| r.binary()),
         Body::Call {
+            call: Call::MetadataFiles(r),
+            ..
+        } => (!r.binary().is_empty()).then(|| r.binary()),
+        Body::Call {
             call: Call::PreviewIo(r),
             ..
         } => r.binary(),
@@ -591,6 +617,10 @@ fn encode_packet(packet: &Packet, cap: usize) -> Result<Vec<u8>> {
             outcome: Ok(Value::ExportProfile(r)),
             ..
         } => r.binary(),
+        Body::Reply {
+            outcome: Ok(Value::Import(r)),
+            ..
+        } => r.value.binary(),
         _ => return encode(packet, cap),
     };
     crate::catalog_session::preview_io::pack(packet, binary, cap)
@@ -618,6 +648,10 @@ fn decode(binding: &Binding, bytes: &[u8], lane: Lane) -> Result<Body> {
             ..
         } => r.set_binary(binary.to_vec())?,
         Body::Call {
+            call: Call::MetadataFiles(r),
+            ..
+        } => r.set_binary(binary.to_vec())?,
+        Body::Call {
             call: Call::PreviewIo(r),
             ..
         } => r.set_binary(binary)?,
@@ -633,6 +667,10 @@ fn decode(binding: &Binding, bytes: &[u8], lane: Lane) -> Result<Body> {
             outcome: Ok(Value::ExportProfile(r)),
             ..
         } => r.set_binary(binary)?,
+        Body::Reply {
+            outcome: Ok(Value::Import(r)),
+            ..
+        } => r.value.set_binary(binary)?,
         _ => ensure!(binary.is_empty(), "unexpected relay binary trailer"),
     }
     ensure!(&packet.binding == binding, "relay nonce/epoch mismatch");
@@ -719,6 +757,20 @@ pub(super) struct Parent {
     metadata: Mutex<Option<super::preview_metadata_admission::ProcessReservation>>,
 }
 impl Parent {
+    pub(super) fn lightroom_sealed_read(
+        &self,
+        request: &crate::filesystem_worker::wire::LightroomSealedRead,
+        cancel: &AtomicBool,
+    ) -> Result<Option<crate::filesystem_worker::wire::LightroomSealedDocumentPage>> {
+        self.client.lightroom_sealed_read(request, cancel)
+    }
+    pub(super) fn lightroom_artifact_preparation(
+        &self,
+        request: &crate::filesystem_worker::wire::LightroomArtifactPreparation,
+        cancel: &AtomicBool,
+    ) -> Result<Option<crate::filesystem_worker::wire::LightroomArtifactPreparationReply>> {
+        self.client.lightroom_artifact_preparation(request, cancel)
+    }
     pub fn retain_metadata(
         &self,
         reservation: super::preview_metadata_admission::ProcessReservation,
@@ -1202,9 +1254,16 @@ impl Parent {
                 Call::ExportStage(request) => {
                     Value::ExportStage(self.export_native_owner()?.stage_call(request, cancel)?)
                 }
+                Call::MetadataFiles(request) => {
+                    Value::MetadataFiles(self.client.metadata_files_call(request, cancel)?)
+                }
                 Call::ExportExecutor(request) => Value::ExportExecutor(
                     self.export_native_owner()?.executor_call(request, cancel)?,
                 ),
+                Call::Import(request) => Value::Import(self.client.import_call(request, cancel)?),
+                Call::RestoreOriginalRoot(request) => {
+                    Value::RestoredOriginalRoot(self.client.restore_original_root(request, cancel)?)
+                }
                 Call::PreviewIo(request) => {
                     Value::PreviewIo(self.client.preview_io_call(request, cancel)?)
                 }
@@ -1222,6 +1281,9 @@ impl Parent {
                 ),
                 Call::MigrationIdentity(request) => {
                     Value::MigrationIdentity(self.client.migration_identity(request, cancel)?)
+                }
+                Call::Storage(request) => {
+                    Value::Storage(self.client.storage_call(request, cancel)?)
                 }
                 Call::ExportAliasFact(request) => {
                     Value::ExportAliasFact(self.client.export_alias_fact(request, cancel)?)
@@ -1448,6 +1510,16 @@ impl Proxy {
     pub fn next(&self, lane: Lane) -> Option<Out> {
         self.state.lock().unwrap().output.next(lane)
     }
+    pub fn next_relay(&self, allow_data: bool) -> Option<Out> {
+        let mut state = self.state.lock().unwrap();
+        // A completed caller can admit its replacement only after receive()
+        // queued the retirement ACK. Choose between those lanes under the same
+        // lock so the replacement Call cannot overtake that ACK on the wire.
+        state
+            .output
+            .next(Lane::Control)
+            .or_else(|| allow_data.then(|| state.output.next(Lane::Data)).flatten())
+    }
     pub fn fail(&self, message: impl std::fmt::Display) {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         s.fault.get_or_insert_with(|| Fault::new(message, true));
@@ -1553,14 +1625,29 @@ impl Proxy {
             crate::catalog_session::overlap_tests::before_release()?;
         }
         let mut s = self.state.lock().unwrap();
-        if let Some(fault) = &s.fault {
-            return Err(fault.clone().into_error());
+        loop {
+            if let Some(fault) = &s.fault {
+                return Err(fault.clone().into_error());
+            }
+            ensure!(!s.closing || call.cleanup(), "filesystem relay closing");
+            if s.calls.len() < 2 {
+                break;
+            }
+            // One managed import preparation exists per open catalog. Keep its
+            // exact request with that owner until one of the two relay slots
+            // drains; ordinary callers still receive Busy rather than creating
+            // an unbounded queue here. The wait releases the relay mutex, while
+            // fail/closing and completed-call retirement wake it.
+            ensure!(
+                matches!(call, Call::Import(_)),
+                crate::preview::stage_io::Busy("filesystem relay busy")
+            );
+            s = self
+                .wake
+                .wait_timeout(s, Duration::from_millis(20))
+                .unwrap()
+                .0;
         }
-        ensure!(!s.closing || call.cleanup(), "filesystem relay closing");
-        ensure!(
-            s.calls.len() < 2,
-            crate::preview::stage_io::Busy("filesystem relay busy")
-        );
         let id = s.next;
         let next = id.checked_add(1).context("relay ID exhausted")?;
         s.output.push(
@@ -1583,6 +1670,7 @@ impl Proxy {
             let index = s.calls.iter().position(|c| c.id == id).unwrap();
             if let Some(outcome) = s.calls[index].outcome.take() {
                 s.calls.remove(index);
+                self.wake.notify_all();
                 return outcome.map_err(Fault::into_error);
             }
             if let Some(fault) = &s.fault {
@@ -1646,6 +1734,57 @@ impl Proxy {
     }
 }
 impl CatalogFilesystem for Proxy {
+    fn metadata_files_call(
+        &self,
+        request: &crate::catalog_session::metadata_files::Request,
+        cancel: &AtomicBool,
+    ) -> Result<crate::catalog_session::metadata_files::Reply> {
+        ensure!(
+            request.root.epoch == self.binding.epoch,
+            "metadata file relay authority"
+        );
+        match self.call(Call::MetadataFiles(Box::new(request.clone())), cancel)? {
+            Value::MetadataFiles(reply) => {
+                reply.validate(request)?;
+                Ok(reply)
+            }
+            _ => anyhow::bail!("unexpected metadata file relay reply"),
+        }
+    }
+    fn import_call(
+        &self,
+        request: &crate::catalog_session::import::Request,
+        cancel: &AtomicBool,
+    ) -> Result<crate::catalog_session::import::Reply> {
+        ensure!(
+            request.root.epoch == self.binding.epoch,
+            "managed import relay authority"
+        );
+        match self.call(Call::Import(request.clone()), cancel)? {
+            Value::Import(reply) => {
+                reply.validate(request)?;
+                Ok(reply)
+            }
+            _ => anyhow::bail!("unexpected managed import relay reply"),
+        }
+    }
+    fn restore_original_root(
+        &self,
+        request: &RestoreOriginalRootRequest,
+        cancel: &AtomicBool,
+    ) -> Result<RestoreOriginalRootReply> {
+        ensure!(
+            request.root.epoch == self.binding.epoch,
+            "restored original-root relay authority"
+        );
+        match self.call(Call::RestoreOriginalRoot(request.clone()), cancel)? {
+            Value::RestoredOriginalRoot(reply) => {
+                reply.validate_for(request)?;
+                Ok(reply)
+            }
+            _ => anyhow::bail!("unexpected restored original-root relay reply"),
+        }
+    }
     fn export_executor_call(
         &self,
         request: &crate::catalog_session::export_executor::Request,
@@ -1909,6 +2048,19 @@ impl CatalogFilesystem for Proxy {
             _ => anyhow::bail!("unexpected migration identity relay response"),
         }
     }
+    fn storage_call(
+        &self,
+        request: &crate::catalog_session::storage::Request,
+        cancel: &AtomicBool,
+    ) -> Result<crate::catalog_session::storage::Reply> {
+        match self.call(Call::Storage(Box::new(request.clone())), cancel)? {
+            Value::Storage(value) => {
+                value.validate(request)?;
+                Ok(value)
+            }
+            _ => anyhow::bail!("unexpected storage observation relay response"),
+        }
+    }
     fn export_alias_fact(
         &self,
         request: &ExportAliasFactRequest,
@@ -2002,7 +2154,12 @@ fn validate_reply(call: &Call, value: &Value, binding: &Binding) -> Result<()> {
         (Call::PreviewIo(request), Value::PreviewIo(reply)) => reply.validate(request)?,
         (Call::PreviewStage(request), Value::PreviewStage(reply)) => reply.validate(request)?,
         (Call::ExportStage(request), Value::ExportStage(reply)) => reply.validate(request)?,
+        (Call::MetadataFiles(request), Value::MetadataFiles(reply)) => reply.validate(request)?,
         (Call::ExportExecutor(request), Value::ExportExecutor(reply)) => reply.validate(request)?,
+        (Call::Import(request), Value::Import(reply)) => reply.validate(request)?,
+        (Call::RestoreOriginalRoot(request), Value::RestoredOriginalRoot(reply)) => {
+            reply.validate_for(request)?
+        }
         (Call::PreviewStore(request), Value::PreviewStore(reply)) => {
             store::validate_reply(request, reply)?
         }
@@ -2019,6 +2176,7 @@ fn validate_reply(call: &Call, value: &Value, binding: &Binding) -> Result<()> {
         (Call::MigrationIdentity(request), Value::MigrationIdentity(value)) => {
             value.validate_for(request)?
         }
+        (Call::Storage(request), Value::Storage(value)) => value.validate(request)?,
         (Call::ExportAliasFact(request), Value::ExportAliasFact(value)) => {
             value.validate_for(request)?
         }
@@ -2184,4 +2342,37 @@ pub(crate) fn admit_export_executor_reply(
         anyhow::bail!("export executor C reply round trip");
     };
     decoded.validate(request)
+}
+
+#[cfg(test)]
+pub(crate) fn admit_import_reply(
+    request: &crate::catalog_session::import::Request,
+    reply: &crate::catalog_session::import::Reply,
+) -> Result<()> {
+    reply.validate(request)?;
+    let binding = Binding {
+        nonce: LeaseId::new(),
+        epoch: request.root.epoch.clone(),
+    };
+    let packet = Packet {
+        binding: binding.clone(),
+        body: Body::Reply {
+            id: U64(u64::MAX),
+            outcome: Ok(Value::Import(reply.clone())),
+        },
+    };
+    let encoded = encode_packet(&packet, BYTES)?;
+    let Body::Reply {
+        outcome: Ok(Value::Import(decoded)),
+        ..
+    } = decode(&binding, &encoded, Lane::Data)?
+    else {
+        anyhow::bail!("import C reply round trip");
+    };
+    decoded.validate(request)?;
+    ensure!(
+        decoded.value.binary() == reply.value.binary(),
+        "import C binary trailer changed"
+    );
+    Ok(())
 }

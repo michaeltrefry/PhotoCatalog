@@ -1,0 +1,63 @@
+{
+  "format_version": 1,
+  "pack_id": "lensworks-cross-platform-disposable-v1",
+  "builder_source_commit": "<generated exact git commit>",
+  "builder": "scripts/build_validation_fixture_pack.py",
+  "scope": "disposable generated/public workflow inputs; not camera or color-quality acceptance",
+  "public_fixture_provenance": {
+    "name": "canon-6d.cr2",
+    "format": "CR2",
+    "license": "CC0-1.0",
+    "source": "<generated from scripts/validate_public_raw.py>",
+    "sha256": "360842779d08fe4805b4a2fe4979f06fdc6da982c85c3acb181f25bcf4c9f536"
+  },
+  "generation": {
+    "ffmpeg": "<generated>",
+    "cwebp": "<generated>",
+    "python": "<generated>",
+    "absolute_paths_are_generated_for_this_pack": false
+  },
+  "counts": {
+    "original_assets": 8,
+    "xmp_sidecars": 2,
+    "lightroom_candidates": 4,
+    "selected_lightroom_catalogs": 2,
+    "source_files_hashed": 22
+  },
+  "source_reconciliation": {
+    "source_inventory": "<generated exact format and path counts>",
+    "selected_source_totals": "<generated exact Lightroom table counts>",
+    "selected_source_reconciliation": "<generated source rows and shared-path facts>",
+    "target_qualification": {
+      "status": "pending_root_native_import_and_migration_qualification",
+      "destination_assets": null,
+      "destination_variants": null,
+      "destination_xmp_sources": null,
+      "excluded_catalog_rows_imported": null,
+      "evidence": null
+    }
+  },
+  "files": [
+    {
+      "path": "<generated portable relative path>",
+      "bytes": 0,
+      "sha256": "<generated>",
+      "role": "<generated>",
+      "license": "<generated>"
+    }
+  ],
+  "readiness": {
+    "fixture_pack_built": true,
+    "all_source_sha256_recorded": true,
+    "public_cr2_checksum_verified": true,
+    "portable_catalog_roots_unbound": true,
+    "destination_working_copy_prepared": false,
+    "target_destination_counts_qualified": false,
+    "final_installer_supplied": false,
+    "installer_sha256_verified": false,
+    "installed_native_workflows_completed": false,
+    "windows_sc_23641_complete": false,
+    "linux_sc_23642_complete": false,
+    "ready_for_release_handoff": false
+  }
+}
