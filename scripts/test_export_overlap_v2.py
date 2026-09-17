@@ -150,6 +150,55 @@ class EvaluationTests(unittest.TestCase):
 
 
 class LifecycleTests(unittest.TestCase):
+    def test_denial_rechecks_live_then_gone_preserve_all_observations(self):
+        evidence = self.rechecks([{'state': 'live', 'detail': 'same_birth', 'observed_status': 'running', 'observed_birth_unix_s': 12},
+                                  {'state': 'gone', 'detail': 'zombie', 'observed_status': psutil.STATUS_ZOMBIE, 'observed_birth_unix_s': None}])
+        self.assertEqual(evidence['lifecycle'], 'gone')
+        self.assertEqual([row['state'] for row in evidence['lifecycle_probes']], ['live', 'gone'])
+        self.assertTrue(all(row['within_budget'] for row in evidence['lifecycle_probes']))
+
+    def rechecks(self, observations, read_ns=0, window_ns=250_000_000):
+        now = 1_000_000_000
+        index = 0
+        def inspect(*_):
+            nonlocal index, now
+            result = observations[min(index, len(observations) - 1)]
+            index += 1; now += read_ns
+            return result
+        def sleep(seconds):
+            nonlocal now
+            now += round(seconds * 1e9)
+        with patch.object(observer_module, 'lifecycle_observation', side_effect=inspect), \
+             patch.object(observer_module.time, 'monotonic_ns', side_effect=lambda: now), \
+             patch.object(observer_module.time, 'time_ns', side_effect=lambda: 10_000_000_000 + now), \
+             patch.object(observer_module.time, 'sleep', side_effect=sleep):
+            evidence = observer_module.recheck_denied_lifecycle(42, 12, 1_000_000_000, 1_000_000_000 + window_ns)
+        self.assertLessEqual(len(evidence['lifecycle_probes']), 11)
+        return evidence
+
+    def test_denial_persistent_live_unknown_reuse_and_deadline_fail_closed(self):
+        for state in ('live', 'unknown'):
+            evidence = self.rechecks([{'state': state, 'detail': 'same_birth' if state == 'live' else 'AccessDenied'}])
+            self.assertEqual(evidence['lifecycle'], state)
+            self.assertGreater(len(evidence['lifecycle_probes']), 1)
+        evidence = self.rechecks([{'state': 'gone', 'detail': 'pid_reused', 'observed_birth_unix_s': 13}])
+        self.assertEqual((evidence['lifecycle'], evidence['lifecycle_detail']), ('gone', 'pid_reused'))
+        late = self.rechecks([{'state': 'gone', 'detail': 'zombie'}], read_ns=250_000_001)
+        self.assertEqual(late['lifecycle'], 'unknown')
+        self.assertFalse(late['lifecycle_probes'][0]['within_budget'])
+        self.assertEqual(len(late['lifecycle_probes']), 1)
+        expired = self.rechecks([{'state': 'gone', 'detail': 'zombie'}], window_ns=0)
+        self.assertEqual(expired['lifecycle'], 'unknown'); self.assertEqual(expired['lifecycle_probes'], [])
+
+    def test_denial_exception_chain_retains_kernel_errno(self):
+        try:
+            try: raise PermissionError(1, 'kernel denied argv')
+            except PermissionError as cause: raise psutil.AccessDenied(42) from cause
+        except psutil.AccessDenied as error:
+            evidence = observer_module.exception_evidence(error)
+        self.assertEqual([row['type'] for row in evidence], ['AccessDenied', 'PermissionError'])
+        self.assertEqual(evidence[1]['errno'], 1)
+
     @patch('observe_export_native_v2.psutil.Process')
     def test_live_gone_zombie_reuse_and_unknown(self, process):
         child = Mock(); process.return_value = child
@@ -183,7 +232,13 @@ class LifecycleTests(unittest.TestCase):
                 return [str(exe), observer_module.ROLE] if operation == 'cmdline' else str(stage)
             child.cmdline.return_value = [str(exe), observer_module.ROLE]
             getattr(child, operation).side_effect = operation_call
-            child.status.side_effect = lambda: psutil.STATUS_ZOMBIE if ended and gone else 'running'
+            post_denial_reads = 0
+            def status():
+                nonlocal post_denial_reads
+                if ended:
+                    post_denial_reads += 1
+                return psutil.STATUS_ZOMBIE if ended and (gone is True or gone == 'later' and post_denial_reads >= 2) else 'running'
+            child.status.side_effect = status
             child.is_running.return_value = True
             root.children.side_effect = [list([child]), list([child]), failure] if root_error else None
             root.children.return_value = [child]
@@ -193,6 +248,7 @@ class LifecycleTests(unittest.TestCase):
                 'sys.argv': args, 'sys.platform': 'darwin',
                 'psutil.Process': lambda pid: root if pid == 41 else child,
                 'time.monotonic': Mock(side_effect=[0, 0, .01, .02, .03, .06]),
+                'time.monotonic_ns': Mock(side_effect=iter(range(1_000_000_000, 2_000_000_000, 1000))),
                 'time.sleep': Mock(), 'time.get_clock_info': Mock(return_value=Mock(implementation='mach_absolute_time()')),
                 'read_stage': Mock(return_value={'job': 'job', 'sequence': 1, 'attempt': 'attempt', 'authority': 'authority',
                     'active_lock': str(stage / 'active.lock'), 'active_lock_device_inode': [1, 2]}),
@@ -200,7 +256,15 @@ class LifecycleTests(unittest.TestCase):
                 'child_holds_lock': Mock(return_value={'exact_path_open': True, 'elapsed_ns': 1}),
             }
             for name, value in bindings.items(): stack.enter_context(patch('observe_export_native_v2.' + name, value))
-            code = observer_module.main()
+            real_recheck = observer_module.recheck_denied_lifecycle
+            def recheck(*args):
+                current = [json.loads(line) for line in output.read_text().splitlines()]
+                self.assertEqual(current[-1]['kind'], 'segment_closed')
+                self.assertEqual(current[-1]['closed_reason'], 'denied_access')
+                self.assertEqual(current[-1]['monotonic_ns'], args[2])
+                return real_recheck(*args)
+            with patch.object(observer_module, 'recheck_denied_lifecycle', side_effect=recheck):
+                code = observer_module.main()
             rows = [json.loads(line) for line in output.read_text().splitlines()]
             return code, rows
 
@@ -212,6 +276,16 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(rows[-1]['segments'][0]['positive_observations'], 2)
         gap = next(row for row in rows if row['kind'] == 'observation_gap')
         self.assertEqual((gap['operation'], gap['lifecycle']), ('cmdline', 'gone'))
+
+    def test_main_initially_live_then_gone_is_gap_without_late_positive(self):
+        code, rows = self.run_observer(psutil.AccessDenied(42), gone='later')
+        self.assertEqual(code, 0)
+        gap = next(row for row in rows if row['kind'] == 'observation_gap')
+        self.assertEqual([probe['state'] for probe in gap['lifecycle_probes']], ['live', 'gone'])
+        closed = next(row for row in rows if row['kind'] == 'segment_closed')
+        self.assertEqual(gap['denial_monotonic_ns'], closed['monotonic_ns'])
+        self.assertLessEqual(closed['monotonic_ns'], gap['lifecycle_probes'][0]['before_monotonic_ns'])
+        self.assertEqual(rows[-1]['segments'][0]['positive_observations'], 2)
 
     def test_main_live_denial_and_root_enumeration_remain_fatal(self):
         for options in ({}, {'operation': 'cwd'}, {'root_error': True}):

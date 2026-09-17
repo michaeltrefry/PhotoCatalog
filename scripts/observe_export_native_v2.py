@@ -28,20 +28,84 @@ REQUEST_LIMIT = 256 * 1024
 ROLE = "--photo-export-worker"
 CLOCK = "macos_mach_absolute_ns"
 
-def lifecycle(pid: int, birth: float | None) -> tuple[str, str]:
-    """Unknown permissions are never evidence of exit."""
+DENIAL_RECHECK_NS = 250_000_000
+DENIAL_RECHECK_INTERVAL_NS = 25_000_000
+DENIAL_RECHECK_MAX_PROBES = 11
+
+
+def exception_evidence(error: BaseException) -> list[dict[str, Any]]:
+    """Keep bounded original errno/cause evidence, not only psutil's wrapper text."""
+    chain = []
+    seen = set()
+    while error is not None and id(error) not in seen and len(chain) < 4:
+        seen.add(id(error))
+        chain.append({"type": type(error).__name__, "message": str(error)[:1024],
+                      "errno": getattr(error, "errno", None)})
+        error = error.__cause__ or error.__context__
+    return chain
+
+
+def lifecycle_observation(pid: int, birth: float | None) -> dict[str, Any]:
+    observed: dict[str, Any] = {"observed_status": None, "observed_birth_unix_s": None, "exception_chain": []}
+    operation = "process"
     try:
         process = psutil.Process(pid)
-        if process.status() == psutil.STATUS_ZOMBIE:
-            return "gone", "zombie"
-        current_birth = process.create_time()
-        if birth is not None and current_birth != birth:
-            return "gone", "pid_reused"
-        return "live", "same_birth" if birth is not None else "unbound_live"
-    except (psutil.NoSuchProcess, psutil.ZombieProcess):
-        return "gone", "absent_or_zombie"
+        operation = "status"
+        observed["observed_status"] = process.status()
+        if observed["observed_status"] == psutil.STATUS_ZOMBIE:
+            return {**observed, "state": "gone", "detail": "zombie"}
+        operation = "create_time"
+        observed["observed_birth_unix_s"] = process.create_time()
+        if birth is not None and observed["observed_birth_unix_s"] != birth:
+            return {**observed, "state": "gone", "detail": "pid_reused"}
+        return {**observed, "state": "live", "detail": "same_birth" if birth is not None else "unbound_live"}
+    except (psutil.NoSuchProcess, psutil.ZombieProcess) as error:
+        return {**observed, "state": "gone", "detail": "absent_or_zombie", "operation": operation,
+                "exception_chain": exception_evidence(error)}
     except (psutil.AccessDenied, OSError) as error:
-        return "unknown", f"{type(error).__name__}: {error}"
+        return {**observed, "state": "unknown", "detail": f"{type(error).__name__}: {error}",
+                "operation": operation, "exception_chain": exception_evidence(error)}
+
+
+def lifecycle(pid: int, birth: float | None) -> tuple[str, str]:
+    """Unknown permissions are never evidence of exit."""
+    observation = lifecycle_observation(pid, birth)
+    return observation["state"], observation["detail"]
+
+
+def recheck_denied_lifecycle(pid: int, birth: float | None, denial_ns: int,
+                             observer_deadline_ns: int) -> dict[str, Any]:
+    """Read-only evidence after segment retirement; late results never excuse denial.
+
+    The deadline caps scheduling and evidence admission. A synchronous kernel read
+    may itself overrun; record that overrun and fail closed, without more probes.
+    """
+    deadline = min(denial_ns + DENIAL_RECHECK_NS, observer_deadline_ns)
+    probes: list[dict[str, Any]] = []
+    state, detail = "unknown", "recheck_budget_expired"
+    for _ in range(DENIAL_RECHECK_MAX_PROBES):
+        before_mono, before_wall = time.monotonic_ns(), time.time_ns()
+        if before_mono >= deadline:
+            break
+        value = lifecycle_observation(pid, birth)
+        after_mono, after_wall = time.monotonic_ns(), time.time_ns()
+        within = after_mono <= deadline
+        probes.append({"before_monotonic_ns": before_mono, "after_monotonic_ns": after_mono,
+                       "before_wall_ns": before_wall, "after_wall_ns": after_wall,
+                       "within_budget": within, **value})
+        state, detail = value["state"], value["detail"]
+        if not within:
+            state, detail = "unknown", "lifecycle_read_exceeded_recheck_deadline"
+            break
+        if state == "gone":
+            break
+        remaining = deadline - time.monotonic_ns()
+        if remaining <= 0:
+            break
+        time.sleep(min(DENIAL_RECHECK_INTERVAL_NS, remaining) / 1e9)
+    return {"lifecycle": state, "lifecycle_detail": detail, "recheck_deadline_monotonic_ns": deadline,
+            "recheck_budget_ns": DENIAL_RECHECK_NS, "recheck_max_probes": DENIAL_RECHECK_MAX_PROBES,
+            "lifecycle_probes": probes}
 
 
 
@@ -261,6 +325,7 @@ def main() -> int:
     fatal_errors = 0
     observation_gaps = 0
     positive_observations = 0
+    deadline_ns = time.monotonic_ns() + round(args.seconds * 1e9)
     deadline = time.monotonic() + args.seconds
     initial_wall = time.time_ns()
     initial_mono = time.monotonic_ns()
@@ -520,17 +585,21 @@ def main() -> int:
                           "wall_ns": now_wall, "monotonic_ns": now_mono,
                           "operation": operation, "reason": f"{type(error).__name__}: {error}"})
                 except psutil.AccessDenied as error:
-                    state, detail = lifecycle(listed_child.pid, key[1] if key else None)
+                    # Retire at the first denial, before inspection or any wait.
+                    denial_mono, denial_wall = time.monotonic_ns(), time.time_ns()
                     if key is not None:
-                        close_segment(key, "denied_access", time.time_ns(), time.monotonic_ns())
-                    if state == "gone":
+                        close_segment(key, "denied_access", denial_wall, denial_mono)
+                    evidence = recheck_denied_lifecycle(listed_child.pid, key[1] if key else None,
+                                                        denial_mono, deadline_ns)
+                    if evidence["lifecycle"] == "gone":
                         observation_gaps += 1
                     else:
                         fatal_errors += 1
-                    emit({"kind": "observation_gap" if state == "gone" else "error",
+                    emit({"kind": "observation_gap" if evidence["lifecycle"] == "gone" else "error",
                           "pid": listed_child.pid, "birth_unix_s": key[1] if key else None,
                           "operation": operation, "error": f"{type(error).__name__}: {error}",
-                          "lifecycle": state, "lifecycle_detail": detail,
+                          "denial_monotonic_ns": denial_mono, "denial_wall_ns": denial_wall,
+                          "exception_chain": exception_evidence(error), **evidence,
                           "wall_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns()})
                 except (OSError, ValueError, RuntimeError, json.JSONDecodeError,
                         subprocess.TimeoutExpired) as error:
