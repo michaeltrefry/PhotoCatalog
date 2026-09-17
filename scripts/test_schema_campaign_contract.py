@@ -63,6 +63,39 @@ class SchemaCampaignContractTests(unittest.TestCase):
                 self.assertEqual(validate_migration_receipt(value,1000,source,13),
                                  value["table_counts_before"])
 
+    def test_native_declared_image_order_is_validated_as_an_exact_mapping(self):
+        value=receipt(5)
+        # Actual organization_probe emission order retained from the failed
+        # one-million-row preparation receipt. It is deliberately not sorted.
+        value["image_initial_state"]=[
+            ["catalog_images",1000],["image_import_map",0],["image_import_reservations",0],
+            ["image_shared_events",0],["image_shared_state",1000],["image_storage_events",0],
+            ["metadata_image_export_authorities",0],["metadata_image_observations",0],
+            ["metadata_image_sources",0],["migration_artifacts",0],["migration_images",0],
+            ["migration_record_lookup",0],["migration_lookup_backfill",0],
+            ["migration_file_metadata",0],["migration_runs",0],["migration_run_supplements",0],
+            ["migration_run_items",0],["migration_reconciliation",0],["migration_mapping_epoch",1],
+            ["migration_metadata",0],["migration_organization",0],["migration_evidence",0],
+            ["migration_evidence_blobs",0],["migration_evidence_chunks",0],
+            ["migration_originals",0],["migration_retained_fields",0],
+            ["migration_retained_records",0],["migration_retention",0],
+            ["organization_collection_order",0],["organization_collection_structure",0],
+            ["organization_image_relations",0],["organization_keyword_synonyms",0],
+        ]
+        self.assertNotEqual(value["image_initial_state"],image_initial_rows(value["table_counts_before"]))
+        validate_migration_receipt(value,1000,5,13)
+        for bad_rows in (
+            value["image_initial_state"][:-1],
+            value["image_initial_state"][:-1]+[["migration_images",0]],
+            [[name,999 if name=="migration_images" else count]
+             for name,count in value["image_initial_state"]],
+            [[name,"0" if name=="migration_images" else count]
+             for name,count in value["image_initial_state"]],
+        ):
+            bad=copy.deepcopy(value);bad["image_initial_state"]=bad_rows
+            with self.assertRaisesRegex(ValueError,"image initialization"):
+                validate_migration_receipt(bad,1000,5,13)
+
     def test_current_receipts_reject_wrong_proof_surfaces(self):
         valid=receipt(6)
         changes=(
