@@ -485,7 +485,9 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let canonical = temp.path().canonicalize()?;
         let root = root(&canonical);
-        let destination = canonical.join("sidecar.xmp");
+        // Model a native chooser returning an ordinary drive/UNC spelling.
+        // The filesystem owner keeps its canonical spelling in the plan.
+        let destination = temp.path().join("sidecar.xmp");
         fs::write(&destination, b"original sidecar")?;
         let payload = b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"/>".to_vec();
         let digest = blake3::hash(&payload).to_hex().to_string();
@@ -612,6 +614,53 @@ mod tests {
         crate::metadata_export::validate_metadata_export_receipt_wire(&restored, &plan)?;
         assert_eq!(fs::read(&captured)?, b"original sidecar");
         assert_eq!(fs::read(destination)?, b"original sidecar");
+        Ok(())
+    }
+
+    #[test]
+    fn filesystem_owner_plans_new_destination_from_selected_path() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = root(&temp.path().canonicalize()?);
+        let destination = temp.path().join("new-sidecar.xmp");
+        let payload = b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"/>".to_vec();
+        let digest = blake3::hash(&payload).to_hex().to_string();
+        let transfer = crate::catalog_session::LeaseId::new();
+        let mut owner = Owner::default();
+
+        call(
+            &mut owner,
+            &root,
+            &transfer,
+            1,
+            Action::Begin {
+                mode: Mode::Plan {
+                    destination: NativePath::from_path(&destination),
+                    max_existing_bytes: U64(1024),
+                    alias_limits: Default::default(),
+                },
+                bytes: U64(payload.len() as u64),
+                blake3: digest,
+            },
+        )?;
+        call(
+            &mut owner,
+            &root,
+            &transfer,
+            2,
+            Action::Append {
+                offset: U64(0),
+                bytes: payload,
+            },
+        )?;
+        let Value::Plan(plan) = call(&mut owner, &root, &transfer, 3, Action::Finish)? else {
+            unreachable!()
+        };
+        assert_eq!(
+            plan.destination,
+            temp.path().canonicalize()?.join("new-sidecar.xmp")
+        );
+        assert!(plan.expected.is_none());
+        assert!(!destination.exists());
         Ok(())
     }
 

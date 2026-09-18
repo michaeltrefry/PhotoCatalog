@@ -2272,6 +2272,209 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn actual_f_metadata_sidecar_round_trip_accepts_ordinary_selected_paths() -> Result<()> {
+        use crate::catalog_session::{
+            SQL_ROLES, SqlRole, SqlRoleObservation,
+            metadata_files::{Action, Mode, Reply, Request, Value},
+        };
+        use anyhow::Context;
+
+        fn call(
+            client: &Client,
+            root: &RootCapability,
+            transfer: &LeaseId,
+            operation: u64,
+            action: Action,
+        ) -> Result<Reply> {
+            let request = Request {
+                root: root.clone(),
+                transfer: transfer.clone(),
+                operation: U64(operation),
+                action,
+            };
+            let reply = client.metadata_files_call(&request, &AtomicBool::new(false))?;
+            reply.validate(&request)?;
+            Ok(reply)
+        }
+
+        fn plan(
+            client: &Client,
+            root: &RootCapability,
+            destination: &Path,
+            payload: &[u8],
+        ) -> Result<(Mode, crate::metadata_export::ExportPlan)> {
+            let mode = Mode::Plan {
+                destination: NativePath::from_path(destination),
+                max_existing_bytes: U64(1024),
+                alias_limits: Default::default(),
+            };
+            let transfer = LeaseId::new();
+            call(
+                client,
+                root,
+                &transfer,
+                1,
+                Action::Begin {
+                    mode: mode.clone(),
+                    bytes: U64(payload.len() as u64),
+                    blake3: blake3::hash(payload).to_hex().to_string(),
+                },
+            )?;
+            call(
+                client,
+                root,
+                &transfer,
+                2,
+                Action::Append {
+                    offset: U64(0),
+                    bytes: payload.to_vec(),
+                },
+            )?;
+            let reply = call(client, root, &transfer, 3, Action::Finish)?;
+            crate::catalog_session::validate_metadata_file_value_for_test(
+                &mode,
+                payload,
+                &reply.value,
+            )?;
+            let Value::Plan(plan) = reply.value else {
+                unreachable!()
+            };
+            Ok((mode, plan))
+        }
+
+        fn apply(
+            client: &Client,
+            root: &RootCapability,
+            plan: &crate::metadata_export::ExportPlan,
+            payload: &[u8],
+        ) -> Result<crate::metadata_export::ExportReceipt> {
+            let mode = Mode::Apply { plan: plan.clone() };
+            let transfer = LeaseId::new();
+            call(
+                client,
+                root,
+                &transfer,
+                1,
+                Action::Begin {
+                    mode: mode.clone(),
+                    bytes: U64(payload.len() as u64),
+                    blake3: blake3::hash(payload).to_hex().to_string(),
+                },
+            )?;
+            call(
+                client,
+                root,
+                &transfer,
+                2,
+                Action::Append {
+                    offset: U64(0),
+                    bytes: payload.to_vec(),
+                },
+            )?;
+            let reply = call(client, root, &transfer, 3, Action::Finish)?;
+            crate::catalog_session::validate_metadata_file_value_for_test(
+                &mode,
+                payload,
+                &reply.value,
+            )?;
+            let Value::Receipt(receipt) = reply.value else {
+                unreachable!()
+            };
+            Ok(receipt)
+        }
+
+        let temp = tempfile::tempdir()?;
+        let child = spawn_fixture("filesystem", temp.path(), Faults::default())?;
+        let catalog = PrepareCatalog {
+            operation: U64(18),
+            session: LeaseId::new(),
+            mode: crate::catalog_session::BootstrapMode::DesktopCreate,
+            root: NativePath::from_path(&temp.path().join("catalog")),
+            manifest_root: NativePath::from_path(&temp.path().join("manifest")),
+            import_source: None,
+        };
+        let bootstrap = child.0.prepare_catalog(&catalog, &AtomicBool::new(false))?;
+        child.0.confirm_sql_admission(
+            &ConfirmSqlAdmission {
+                operation: bootstrap.operation,
+                root: bootstrap.root_capability(),
+                roles: SQL_ROLES.map(|role| SqlRoleObservation {
+                    role,
+                    physical: if role == SqlRole::Manifest {
+                        bootstrap.manifest.physical
+                    } else {
+                        bootstrap.catalog.physical
+                    },
+                }),
+            },
+            &AtomicBool::new(false),
+        )?;
+        let root = bootstrap.root_capability();
+
+        let payload = b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"/>";
+        let new_destination = temp.path().join("new-sidecar.xmp");
+        let (_, new_plan) = plan(&child.0, &root, &new_destination, payload)?;
+        assert_ne!(new_plan.destination, new_destination);
+        assert_eq!(
+            new_plan.destination,
+            temp.path().canonicalize()?.join("new-sidecar.xmp")
+        );
+        assert!(new_plan.expected.is_none());
+        let published = apply(&child.0, &root, &new_plan, payload)?;
+        assert_eq!(
+            published.state,
+            crate::metadata_export::ExportState::Published
+        );
+        assert_eq!(fs::read(&new_destination)?, payload);
+
+        let existing_destination = temp.path().join("existing-sidecar.xmp");
+        fs::write(&existing_destination, b"previous sidecar")?;
+        let (_, existing_plan) = plan(&child.0, &root, &existing_destination, payload)?;
+        assert!(existing_plan.expected.is_some());
+        let published = apply(&child.0, &root, &existing_plan, payload)?;
+        let captured = published.captured_original.context("captured sidecar")?;
+        assert_eq!(fs::read(&captured)?, b"previous sidecar");
+        assert_eq!(fs::read(&existing_destination)?, payload);
+
+        fs::remove_file(&existing_destination)?;
+        let restore_mode = Mode::Restore {
+            plan: existing_plan.clone(),
+        };
+        let restore_transfer = LeaseId::new();
+        call(
+            &child.0,
+            &root,
+            &restore_transfer,
+            1,
+            Action::Begin {
+                mode: restore_mode.clone(),
+                bytes: U64(0),
+                blake3: blake3::hash(&[]).to_hex().to_string(),
+            },
+        )?;
+        let restored = call(&child.0, &root, &restore_transfer, 2, Action::Finish)?;
+        crate::catalog_session::validate_metadata_file_value_for_test(
+            &restore_mode,
+            &[],
+            &restored.value,
+        )?;
+        let Value::Receipt(restored) = restored.value else {
+            unreachable!()
+        };
+        assert_eq!(
+            restored.state,
+            crate::metadata_export::ExportState::Restored
+        );
+        assert_eq!(fs::read(existing_destination)?, b"previous sidecar");
+
+        child.0.release_root(&root)?;
+        child.0.try_shutdown()?;
+        assert_retired(&child.0);
+        Ok(())
+    }
+
     #[test]
     fn actual_f_export_profile_round_trip_cancels_cleans_up_and_reaps() -> Result<()> {
         use crate::catalog_session::{
