@@ -355,7 +355,9 @@ impl Custody {
                 capture_generation,
                 ..
             } => {
-                self.evidence = Some(FResource {
+                // A rejected later Begin must not replace the identity needed
+                // to reconcile the evidence that F still actually owns.
+                self.evidence.get_or_insert_with(|| FResource {
                     identity: FIdentity {
                         operation: operation.clone(),
                         workbench: workbench.clone(),
@@ -1293,7 +1295,19 @@ impl ManagedIo for Owner {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .before(&request);
-        let result = self.filesystem.lightroom_workbench_io(&request, cancel);
+        let result = (|| {
+            if matches!(&request, LightroomWorkbenchIo::EvidenceRelease { .. }) {
+                self.check_source()?;
+                ensure!(
+                    self.reader
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .is_none(),
+                    "capture evidence retained until Source is checked-retired"
+                );
+            }
+            self.filesystem.lightroom_workbench_io(&request, cancel)
+        })();
         match result {
             Ok(reply) => {
                 self.custody
@@ -1783,6 +1797,71 @@ pub(crate) mod tests {
             },
         );
         assert!(custody.root.is_none());
+    }
+
+    #[test]
+    fn rejected_evidence_begin_keeps_original_identity_for_checked_drain() -> Result<()> {
+        let _serial = process_serial();
+        let temp = tempfile::tempdir()?;
+        let directory = std::fs::canonicalize(temp.path())?;
+        std::fs::create_dir(directory.join("sources"))?;
+        let source = directory.join("sources/catalog.lrcat");
+        rusqlite::Connection::open(&source)?.execute_batch("CREATE TABLE opaque(id INTEGER);")?;
+        let captured = directory.join("capture");
+        let manifest =
+            crate::lightroom::capture::run_isolated(crate::lightroom::capture::Request {
+                source: NativePath::from_path(&source),
+                output: NativePath::from_path(&captured),
+                include_auxiliary: false,
+                closed_application_evidence: Some("synthetic fixture closed".into()),
+                limits: crate::lightroom::Limits::default(),
+            })?;
+        ensure!(manifest.state == "captured", "fixture capture failed");
+        let fixture = ManagedFixture::start(&directory)?;
+        let begin = |operation: &str| LightroomWorkbenchIo::EvidenceBegin {
+            operation: operation.into(),
+            workbench: "workbench".into(),
+            generation: "generation".into(),
+            capture_generation: format!("capture-{operation}"),
+            directory: NativePath::from_path(&captured),
+            source_generation: operation.into(),
+            protected: vec![],
+            limits: crate::lightroom_migration_worker::source_reader::capture_wire::Limits {
+                open_deadline_ms: crate::application::U64(10_000),
+                total_deadline_ms: crate::application::U64(60_000),
+                vm_steps: crate::application::U64(1_000_000),
+                schema_objects: crate::application::U64(100),
+                schema_bytes: crate::application::U64(65_536),
+                page_bytes: crate::application::U64(65_536),
+                max_cell_bytes: crate::application::U64(65_536),
+                result_bytes: crate::application::U64(65_536),
+                inline_bytes: crate::application::U64(65_536),
+                chunk_bytes: crate::application::U64(4096),
+                max_rows: crate::application::U64(100),
+            },
+        };
+        let cancel = AtomicBool::new(false);
+        fixture.owner.filesystem(begin("original"), &cancel)?;
+        let rejected = fixture
+            .owner
+            .filesystem(begin("replacement"), &cancel)
+            .unwrap_err();
+        ensure!(
+            format!("{rejected:#}").contains("capture evidence already retained"),
+            "wrong rejection: {rejected:#}"
+        );
+        // A bad second admission must poison the generation without destroying
+        // the exact identity that permits the old F lease to be retired.
+        ensure!(
+            fixture.owner.admit().is_err(),
+            "failed admission was not revoked"
+        );
+        fixture.drain()?;
+        ensure!(
+            fixture.owner.custody.lock().unwrap().evidence.is_none(),
+            "F evidence remains retained"
+        );
+        Ok(())
     }
 
     #[test]

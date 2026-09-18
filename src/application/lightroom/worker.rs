@@ -513,9 +513,8 @@ impl Owner {
             );
             Ok(String::from_utf8(bytes)?)
         })();
-        // A failed or canceled page keeps F's evidence lease retained for the
-        // generation's existing checked reconciliation path. The partial Vec
-        // drops here and no inspection-plan transaction has started.
+        // The caller releases evidence at the operation boundary, including a
+        // canceled page. The partial Vec drops before any plan transaction.
         collected
     }
     fn evidence_current(
@@ -554,6 +553,28 @@ impl Owner {
             "capture evidence release reply kind"
         );
         Ok(())
+    }
+    fn finish_evidence<T>(
+        &self,
+        operation: &str,
+        capture_generation: &str,
+        result: Result<T>,
+    ) -> Result<T> {
+        // Cancellation is an operation boundary, not a generation drain. Once
+        // Source is retired, release F's evidence even if row work or the final
+        // current check failed. A poisoned Source retains F custody for the
+        // supervisor's W/S checked-reap path instead.
+        let io = self.managed.as_ref().context("managed owner absent")?;
+        let released = io
+            .admit()
+            .and_then(|()| self.release_evidence(operation, capture_generation));
+        match (result, released) {
+            (result, Ok(())) => result,
+            (Ok(_), Err(error)) => Err(error).context("capture evidence cleanup failed"),
+            (Err(primary), Err(cleanup)) => {
+                Err(primary.context(format!("capture evidence cleanup also failed: {cleanup:#}")))
+            }
+        }
     }
     fn seal_upload(
         &self,
@@ -829,56 +850,57 @@ impl Owner {
             .clone();
         let (capture_generation, directory, manifest, manifest_blake3, manifest_bytes, authority) =
             self.begin_evidence(operation, directory, control)?;
-        let manifest_json = self.evidence_manifest(
-            operation,
-            &capture_generation,
-            &manifest_blake3,
-            manifest_bytes,
-            &authority.manifest_blake3,
-            control,
-        )?;
-        let binding = authority.binding_blake3.clone();
-        let source = io.source_open(authority, control.cancel.clone())?;
-        let source_result = (|| -> Result<capture_wire::SchemaObjects> {
-            let schema = io.source_schema(&source)?;
-            ensure!(
-                schema.authority_binding == binding,
-                "CaptureSql schema authority differs"
-            );
-            let current = io.source_current(&source)?;
-            ensure!(
-                current.authority_binding == binding
-                    && current.schema_roster_blake3 == schema.schema_roster_blake3,
-                "CaptureSql current binding differs"
-            );
-            Ok(schema)
-        })();
-        let retired = io.source_retire(&source);
-        let schema = match (source_result, retired) {
-            (Ok(schema), Ok(())) => schema,
-            (Err(primary), Ok(())) => return Err(primary),
-            (Ok(_), Err(retire)) => {
-                return Err(retire).context("CaptureSql did not drain");
-            }
-            (Err(primary), Err(retire)) => {
-                return Err(
-                    primary.context(format!("CaptureSql checked drain also failed: {retire:#}"))
+        let result = (|| {
+            let manifest_json = self.evidence_manifest(
+                operation,
+                &capture_generation,
+                &manifest_blake3,
+                manifest_bytes,
+                &authority.manifest_blake3,
+                control,
+            )?;
+            let binding = authority.binding_blake3.clone();
+            let source = io.source_open(authority, control.cancel.clone())?;
+            let source_result = (|| -> Result<capture_wire::SchemaObjects> {
+                let schema = io.source_schema(&source)?;
+                ensure!(
+                    schema.authority_binding == binding,
+                    "CaptureSql schema authority differs"
                 );
-            }
-        };
-        // This is the final fallible filesystem observation before the short
-        // plan transaction. The evidence lease remains retained through commit.
-        self.evidence_current(operation, &capture_generation, control)?;
-        self.verify_root(control)?;
-        let revision = self.plan(control)?.add_capture_managed(
-            &directory,
-            &manifest,
-            &manifest_json,
-            &schema,
-            || io.commit(),
-        )?;
-        self.release_evidence(operation, &capture_generation)?;
-        Ok(revision)
+                let current = io.source_current(&source)?;
+                ensure!(
+                    current.authority_binding == binding
+                        && current.schema_roster_blake3 == schema.schema_roster_blake3,
+                    "CaptureSql current binding differs"
+                );
+                Ok(schema)
+            })();
+            let retired = io.source_retire(&source);
+            let schema = match (source_result, retired) {
+                (Ok(schema), Ok(())) => schema,
+                (Err(primary), Ok(())) => return Err(primary),
+                (Ok(_), Err(retire)) => {
+                    return Err(retire).context("CaptureSql did not drain");
+                }
+                (Err(primary), Err(retire)) => {
+                    return Err(primary
+                        .context(format!("CaptureSql checked drain also failed: {retire:#}")));
+                }
+            };
+            // This is the final fallible filesystem observation before the short
+            // plan transaction. The evidence lease remains retained through commit.
+            self.evidence_current(operation, &capture_generation, control)?;
+            self.verify_root(control)?;
+            let revision = self.plan(control)?.add_capture_managed(
+                &directory,
+                &manifest,
+                &manifest_json,
+                &schema,
+                || io.commit(),
+            )?;
+            Ok(revision)
+        })();
+        self.finish_evidence(operation, &capture_generation, result)
     }
     fn resume_managed(
         &mut self,
@@ -895,115 +917,117 @@ impl Owner {
         let directory = self.plan(control)?.managed_capture(revision)?.0;
         let (capture_generation, _, manifest, _, _, authority) =
             self.begin_evidence(operation, directory, control)?;
-        ensure!(
-            manifest.revision_id.as_deref() == Some(revision),
-            "capture revision differs"
-        );
-        let binding = authority.binding_blake3.clone();
-        let source = io.source_open(authority, control.cancel.clone())?;
-        let source_result = (|| -> Result<usize> {
-            let schema = io.source_schema(&source)?;
+        let result = (|| {
             ensure!(
-                schema.authority_binding == binding,
-                "CaptureSql schema authority differs"
+                manifest.revision_id.as_deref() == Some(revision),
+                "capture revision differs"
             );
-            let (stable_digest, pending) = self.plan(control)?.managed_resume_roster(revision)?;
-            ensure!(
-                schema.schema_roster_blake3 == stable_digest,
-                "captured schema roster changed"
-            );
-            let mut retained = 0usize;
-            for mut stable in pending {
-                if retained >= maximum {
-                    break;
-                }
-                control.check()?;
-                let fresh = schema
-                    .tables
-                    .get(usize::try_from(stable.descriptor.ordinal.0)?)
-                    .context("fresh CaptureSql table ordinal missing")?;
-                let mut comparable = fresh.clone();
-                let handle = std::mem::take(&mut comparable.table_handle);
+            let binding = authority.binding_blake3.clone();
+            let source = io.source_open(authority, control.cancel.clone())?;
+            let source_result = (|| -> Result<usize> {
+                let schema = io.source_schema(&source)?;
                 ensure!(
-                    comparable == stable.descriptor,
-                    "captured stable table descriptor changed"
+                    schema.authority_binding == binding,
+                    "CaptureSql schema authority differs"
                 );
-                let mut cursor = stable.cursor.clone();
-                loop {
-                    let request_rows = (maximum - retained).min(capture_wire::MAX_ROWS);
-                    if request_rows == 0 {
+                let (stable_digest, pending) =
+                    self.plan(control)?.managed_resume_roster(revision)?;
+                ensure!(
+                    schema.schema_roster_blake3 == stable_digest,
+                    "captured schema roster changed"
+                );
+                let mut retained = 0usize;
+                for mut stable in pending {
+                    if retained >= maximum {
                         break;
                     }
-                    let value =
-                        io.source_rows(&source, handle.clone(), cursor.clone(), request_rows)?;
-                    let next_cursor = match &value {
-                        TableValue::Batch(batch) => {
-                            ensure!(
-                                batch.authority_binding == binding
-                                    && batch.schema_roster_blake3 == stable_digest
-                                    && batch.table_handle == handle,
-                                "CaptureSql batch binding differs"
-                            );
-                            batch.next_cursor.clone()
+                    control.check()?;
+                    let fresh = schema
+                        .tables
+                        .get(usize::try_from(stable.descriptor.ordinal.0)?)
+                        .context("fresh CaptureSql table ordinal missing")?;
+                    let mut comparable = fresh.clone();
+                    let handle = std::mem::take(&mut comparable.table_handle);
+                    ensure!(
+                        comparable == stable.descriptor,
+                        "captured stable table descriptor changed"
+                    );
+                    let mut cursor = stable.cursor.clone();
+                    loop {
+                        let request_rows = (maximum - retained).min(capture_wire::MAX_ROWS);
+                        if request_rows == 0 {
+                            break;
                         }
-                        TableValue::Failure(failure) => {
-                            ensure!(
-                                failure.authority_binding == binding
-                                    && failure.schema_roster_blake3 == stable_digest
-                                    && failure.table_handle == handle,
-                                "CaptureSql failure binding differs"
-                            );
-                            failure.cursor.clone()
+                        let value =
+                            io.source_rows(&source, handle.clone(), cursor.clone(), request_rows)?;
+                        let next_cursor = match &value {
+                            TableValue::Batch(batch) => {
+                                ensure!(
+                                    batch.authority_binding == binding
+                                        && batch.schema_roster_blake3 == stable_digest
+                                        && batch.table_handle == handle,
+                                    "CaptureSql batch binding differs"
+                                );
+                                batch.next_cursor.clone()
+                            }
+                            TableValue::Failure(failure) => {
+                                ensure!(
+                                    failure.authority_binding == binding
+                                        && failure.schema_roster_blake3 == stable_digest
+                                        && failure.table_handle == handle,
+                                    "CaptureSql failure binding differs"
+                                );
+                                failure.cursor.clone()
+                            }
+                        };
+                        self.verify_root(control)?;
+                        let added = self.plan(control)?.apply_managed_table(
+                            revision,
+                            &stable,
+                            value,
+                            || io.commit(),
+                        )?;
+                        cursor = next_cursor;
+                        stable.cursor.clone_from(&cursor);
+                        retained = retained.checked_add(added).context("retained row count")?;
+                        control.progress(retained as u64);
+                        if added == 0 || retained >= maximum {
+                            break;
                         }
-                    };
-                    self.verify_root(control)?;
-                    let added = self.plan(control)?.apply_managed_table(
-                        revision,
-                        &stable,
-                        value,
-                        || io.commit(),
-                    )?;
-                    cursor = next_cursor;
-                    stable.cursor.clone_from(&cursor);
-                    retained = retained.checked_add(added).context("retained row count")?;
-                    control.progress(retained as u64);
-                    if added == 0 || retained >= maximum {
-                        break;
                     }
                 }
-            }
-            let current = io.source_current(&source)?;
-            ensure!(
-                current.authority_binding == binding
-                    && current.schema_roster_blake3 == stable_digest,
-                "CaptureSql terminal current binding differs"
-            );
-            Ok(retained)
-        })();
-        let retired = io.source_retire(&source);
-        let retained = match (source_result, retired) {
-            (Ok(retained), Ok(())) => retained,
-            (Err(primary), Ok(())) => return Err(primary),
-            (Ok(_), Err(retire)) => {
-                return Err(retire).context("CaptureSql did not drain");
-            }
-            (Err(primary), Err(retire)) => {
-                return Err(
-                    primary.context(format!("CaptureSql checked drain also failed: {retire:#}"))
+                let current = io.source_current(&source)?;
+                ensure!(
+                    current.authority_binding == binding
+                        && current.schema_roster_blake3 == stable_digest,
+                    "CaptureSql terminal current binding differs"
                 );
-            }
-        };
-        self.evidence_current(operation, &capture_generation, control)?;
-        self.verify_root(control)?;
-        let stage = self
-            .plan(control)?
-            .finish_managed_resume(revision, || io.commit())?;
-        self.release_evidence(operation, &capture_generation)?;
-        Ok(core::plan::Progress {
-            revision_id: revision.into(),
-            retained_this_call: retained,
-            stage,
-        })
+                Ok(retained)
+            })();
+            let retired = io.source_retire(&source);
+            let retained = match (source_result, retired) {
+                (Ok(retained), Ok(())) => retained,
+                (Err(primary), Ok(())) => return Err(primary),
+                (Ok(_), Err(retire)) => {
+                    return Err(retire).context("CaptureSql did not drain");
+                }
+                (Err(primary), Err(retire)) => {
+                    return Err(primary
+                        .context(format!("CaptureSql checked drain also failed: {retire:#}")));
+                }
+            };
+            self.evidence_current(operation, &capture_generation, control)?;
+            self.verify_root(control)?;
+            let stage = self
+                .plan(control)?
+                .finish_managed_resume(revision, || io.commit())?;
+            Ok(core::plan::Progress {
+                revision_id: revision.into(),
+                retained_this_call: retained,
+                stage,
+            })
+        })();
+        self.finish_evidence(operation, &capture_generation, result)
     }
     fn inspect_originals_managed(
         &mut self,

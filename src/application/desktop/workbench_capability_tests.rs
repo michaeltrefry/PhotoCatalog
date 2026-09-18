@@ -125,6 +125,178 @@ fn action(dispatcher: &Dispatcher, action: bridge::Action) -> Result<serde_json:
     result_json(dispatcher)
 }
 
+#[test]
+fn managed_resume_cancel_close_reopen_preserves_rows_and_releases_custody() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let directory = std::fs::canonicalize(temp.path())?;
+    std::fs::create_dir(directory.join("sources"))?;
+    let source = directory.join("sources/synthetic.lrcat");
+    {
+        let db = rusqlite::Connection::open(&source)?;
+        db.execute_batch(
+            "CREATE TABLE Opaque(id INTEGER PRIMARY KEY, value TEXT);
+            WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<4096)
+            INSERT INTO Opaque SELECT x,'retained opaque data' FROM n;",
+        )?;
+    }
+    let source_before = std::fs::read(&source)?;
+    let captured = directory.join("capture");
+    let manifest = capture::run_isolated(capture::Request {
+        source: NativePath::from_path(&source),
+        output: NativePath::from_path(&captured),
+        include_auxiliary: false,
+        closed_application_evidence: Some("synthetic fixture closed".into()),
+        limits: crate::lightroom::Limits::default(),
+    })?;
+    ensure!(
+        manifest.state == "captured",
+        "fixture capture: {manifest:?}"
+    );
+    let capture_before = std::fs::read(captured.join("logical.sqlite3"))?;
+    let fixture = lightroom_managed::tests::ManagedFixture::start(&directory)?;
+    let config = config();
+    let generation = Arc::new(lightroom_managed::Generation::start_fixture(
+        &fixture.owner,
+        &config.worker_executable,
+    )?);
+    let dispatcher = Dispatcher::start(&generation, config.limits)?;
+    let root = directory.join("inspection");
+    let open = |mode| -> Result<()> {
+        call(
+            &dispatcher,
+            bridge::Request::Open {
+                attempt: uuid::Uuid::new_v4().to_string(),
+                root: NativePath::from_path(&root),
+                mode,
+                capture_staging: NativePath::from_path(&directory),
+                limits: lw::Limits::default().into(),
+            },
+        )?;
+        result_json(&dispatcher)?;
+        Ok(())
+    };
+    open(lw::OpenMode::Create).context("initial open")?;
+    let added = action(
+        &dispatcher,
+        bridge::Action::AddCapture {
+            directory: NativePath::from_path(&captured),
+        },
+    )?;
+    let revision = added["revision"]
+        .as_str()
+        .context("capture revision")?
+        .to_owned();
+    call(
+        &dispatcher,
+        bridge::Request::Action {
+            guard: guard(&status(&dispatcher)?),
+            action: bridge::Action::Resume {
+                revision: revision.clone(),
+                max_rows: U64(100_000),
+            },
+        },
+    )?;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let current = status(&dispatcher)?;
+        ensure!(
+            current.phase == lw::Phase::Running && Instant::now() < deadline,
+            "resume did not reach cancellable progress: {current:?}"
+        );
+        if current.processed.0 > 0 {
+            call(
+                &dispatcher,
+                bridge::Request::Cancel {
+                    guard: guard(&current),
+                },
+            )?;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    ensure!(
+        wait(&dispatcher)?.phase == lw::Phase::Canceled,
+        "resume did not cancel"
+    );
+    let report = || -> Result<serde_json::Value> {
+        call(
+            &dispatcher,
+            bridge::Request::Read {
+                guard: guard(&status(&dispatcher)?),
+                query: bridge::Query::Report {
+                    revision: revision.clone(),
+                },
+            },
+        )?;
+        result_json(&dispatcher)
+    };
+    let partial = report()?;
+    call(
+        &dispatcher,
+        bridge::Request::Close {
+            workbench: status(&dispatcher)?.workbench,
+        },
+    )?;
+    ensure!(
+        wait(&dispatcher)?.phase == lw::Phase::Closed,
+        "close did not settle"
+    );
+    open(lw::OpenMode::OpenExisting)?;
+    ensure!(
+        report()?["tables"] == partial["tables"],
+        "reopen changed retained rows"
+    );
+    let resumed = action(
+        &dispatcher,
+        bridge::Action::Resume {
+            revision: revision.clone(),
+            max_rows: U64(100_000),
+        },
+    )?;
+    ensure!(
+        resumed["stage"] != "pending",
+        "resume did not finish: {resumed}"
+    );
+    let complete = report()?;
+    ensure!(
+        complete["tables"]
+            .as_array()
+            .context("table report")?
+            .iter()
+            .all(|table| table["state"] == "complete"),
+        "incomplete tables: {complete}"
+    );
+    call(
+        &dispatcher,
+        bridge::Request::Close {
+            workbench: status(&dispatcher)?.workbench,
+        },
+    )?;
+    ensure!(
+        wait(&dispatcher)?.phase == lw::Phase::Closed,
+        "final close did not settle"
+    );
+    dispatcher.shutdown_checked()?;
+    fixture.owner.drain_checked()?;
+    fixture.filesystem.try_shutdown()?;
+    ensure!(generation.pid().is_none(), "W remains retained");
+    let db = rusqlite::Connection::open(root.join("inspection.sqlite3"))?;
+    let (count, distinct): (i64, i64) = db.query_row(
+        "SELECT count(*),count(DISTINCT key_json) FROM rows WHERE revision=? AND table_name='Opaque'",
+        [&revision], |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    ensure!(
+        (count, distinct) == (4096, 4096),
+        "lost or duplicate rows: {count}/{distinct}"
+    );
+    ensure!(std::fs::read(source)? == source_before, "source changed");
+    ensure!(
+        std::fs::read(captured.join("logical.sqlite3"))? == capture_before,
+        "capture changed"
+    );
+    Ok(())
+}
+
 fn upload(dispatcher: &Dispatcher, purpose: bridge::InputPurpose, json: &str) -> Result<String> {
     let guard = guard(&status(dispatcher)?);
     let bridge::Response::Input(Some(input)) = call(
