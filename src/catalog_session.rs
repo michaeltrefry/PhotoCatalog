@@ -2922,7 +2922,7 @@ fn validate_metadata_file_value(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 pub(crate) fn validate_metadata_file_value_for_test(
     mode: &metadata_files::Mode,
     payload: &[u8],
