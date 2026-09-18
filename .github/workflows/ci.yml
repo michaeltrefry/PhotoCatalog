@@ -162,6 +162,8 @@ jobs:
         run: python -m unittest discover -s scripts -p test_validate_image_corpus.py -v
       - name: Lint
         run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Build CLI and full-resolution validation probe
+        run: cargo build --locked --bins --examples
       - name: Test library and CLI, including restart and recovery
         run: cargo test --locked --all-targets --no-fail-fast
       - name: Validate native same-device file bind mount cache boundary (Linux)
@@ -171,8 +173,6 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: ./scripts/validate_windows_volume.ps1
-      - name: Build CLI and full-resolution validation probe
-        run: cargo build --locked --bins --examples
       - name: Validate catalog and filesystem process custody
         run: python scripts/test_catalog_filesystem_processes.py --executable "target/debug/photocatalog${{ runner.os == 'Windows' && '.exe' || '' }}"
       - name: Validate public CC0 Canon and Panasonic RAW originals

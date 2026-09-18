@@ -2102,13 +2102,40 @@ impl Actor {
                     ));
                 }
                 let Open {
+                    managed,
                     catalog,
                     service,
                     preview_settings,
                     ..
                 } = open;
+                let mut admit_roots = |roots: &[PathBuf]| {
+                    if cancel.is_canceled() {
+                        return Err(error(
+                            ErrorCode::Canceled,
+                            "original-root review canceled before admission",
+                        ));
+                    }
+                    if let Some(managed) = managed.as_ref() {
+                        managed
+                            .restore_original_roots(roots, &cancel.0)
+                            .map_err(native)?;
+                    }
+                    if cancel.is_canceled() {
+                        return Err(error(
+                            ErrorCode::Canceled,
+                            "original-root review canceled during admission",
+                        ));
+                    }
+                    Ok(())
+                };
                 Ok(Response::PreviewSettings(Box::new(
-                    preview_settings::execute(catalog, service, preview_settings, *request)?,
+                    preview_settings::execute_with_root_admission(
+                        catalog,
+                        service,
+                        preview_settings,
+                        *request,
+                        &mut admit_roots,
+                    )?,
                 )))
             }
             Request::LightroomMigration { .. } => Err(error(

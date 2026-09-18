@@ -1079,6 +1079,117 @@ fn actor_rejects_cache_root_before_managed_walk_acknowledgement() -> Result<()> 
 }
 
 #[test]
+fn managed_cross_cache_root_review_recovers_live_export_admission() -> Result<()> {
+    use crate::filesystem_worker::client::Client;
+    let temp = tempfile::tempdir()?;
+    let originals = temp.path().join("originals");
+    std::fs::create_dir(&originals)?;
+    let original = originals.join("photo.png");
+    image::RgbImage::from_pixel(8, 6, image::Rgb([20u8, 40, 70])).save(&original)?;
+    let catalog_root = temp.path().join("catalog");
+    let mut catalog = Catalog::open(&catalog_root)?;
+    catalog.import(&originals, None, |_| Ok(()))?;
+    drop(catalog);
+
+    let worker = std::env::current_exe()?
+        .parent()
+        .and_then(std::path::Path::parent)
+        .context("test target directory")?
+        .join(format!("photocatalog{}", std::env::consts::EXE_SUFFIX));
+    ensure!(worker.is_file(), "photocatalog worker binary is absent");
+    let client = Arc::new(Client::spawn(&worker, vec![])?);
+    client.wait_ready(Duration::from_secs(30))?;
+    let bridge = disconnected();
+    let mut actor = Actor::new(
+        Config {
+            worker_executable: worker,
+            cache_root: Some(temp.path().join("fresh-cache")),
+            original_roots: vec![],
+            preview_policy: Default::default(),
+            preview_limits: Default::default(),
+            limits: Default::default(),
+            import_checkpoint: None,
+        },
+        bridge.0.shared.clone(),
+    );
+    actor.managed = Some(ManagedCatalogConfig {
+        filesystem: client.clone(),
+    });
+    let cancel = Cancellation::default();
+    let Response::Status(opened) = actor.command(
+        Request::OpenExisting {
+            path: NativePath::from_path(&catalog_root),
+        },
+        &cancel,
+    )?
+    else {
+        anyhow::bail!("open response")
+    };
+    let token = opened.catalog.context("catalog token")?;
+    let allowance = std::fs::metadata(&original)?.len();
+    let before = actor
+        .open
+        .as_ref()
+        .unwrap()
+        .catalog
+        .session
+        .inspect_export_original(&NativePath::from_path(&original), allowance, &cancel.0)
+        .unwrap_err();
+    assert!(before.to_string().contains("open Preview storage"));
+
+    let Response::PreviewSettings(started) = actor.command(
+        Request::PreviewSettings {
+            catalog: token.clone(),
+            request: Box::new(preview_settings::Request::BeginOriginalRootReview {
+                roots: vec![NativePath::from_path(&originals)],
+            }),
+        },
+        &cancel,
+    )?
+    else {
+        anyhow::bail!("root review response")
+    };
+    let mut status = *started;
+    for _ in 0..20 {
+        if status.original_roots.state == "ready" {
+            break;
+        }
+        let review = status.original_roots.review.clone().context("review id")?;
+        let Response::PreviewSettings(next) = actor.command(
+            Request::PreviewSettings {
+                catalog: token.clone(),
+                request: Box::new(preview_settings::Request::StepOriginalRootReview {
+                    review,
+                    directories: 100,
+                }),
+            },
+            &cancel,
+        )?
+        else {
+            anyhow::bail!("root review step response")
+        };
+        status = *next;
+    }
+    assert_eq!(status.original_roots.state, "ready");
+    let inspected = actor
+        .open
+        .as_ref()
+        .unwrap()
+        .catalog
+        .session
+        .inspect_export_original(&NativePath::from_path(&original), allowance, &cancel.0)?
+        .context("managed inspection")?;
+    assert_eq!(inspected.bytes, allowance);
+
+    actor.command(Request::Close { catalog: token }, &cancel)?;
+    drop(actor);
+    drop(bridge);
+    let client = Arc::try_unwrap(client).map_err(|_| anyhow::anyhow!("retained F client"))?;
+    client.terminate_after_dependents_drained()?;
+    Ok(())
+}
+
+#[test]
 fn actor_rejects_stale_sidecar_and_original_before_publication() -> Result<()> {
     for sidecar in [true, false] {
         let root = tempfile::tempdir()?;
