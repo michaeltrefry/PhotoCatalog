@@ -10,6 +10,8 @@ use std::{process::Command as OsCommand, time::Instant};
 const HELPER: &str =
     "lightroom_migration_worker::source_reader::relay::broker::tests::owned_broker_source_fixture";
 const ENV: &str = "PHOTOCATALOG_OWNED_BROKER_SOURCE_FIXTURE";
+const OPEN_FAILURE_ENV: &str = "PHOTOCATALOG_BROKER_OPEN_FAILURE";
+const OPEN_FAILURE: &str = "artifact opening refused: invalid Windows path (os error 123)";
 
 pub(super) fn start_typed(
     executable: PathBuf,
@@ -47,6 +49,28 @@ fn typed_source_entrypoint() {
 fn owned_broker_source_fixture() -> Result<()> {
     if std::env::var_os(ENV).is_none() {
         return Ok(());
+    }
+    if let Ok(mode) = std::env::var(OPEN_FAILURE_ENV) {
+        use std::io::Write;
+        let mut bytes = Vec::new();
+        let detail = crate::lightroom_migration_worker::source_reader::owner::reply_error_text(
+            &anyhow::anyhow!("{OPEN_FAILURE}: {}", "detail ".repeat(1000)),
+        );
+        write_frame(
+            &mut bytes,
+            &Reply::Failed {
+                epoch: epoch(if mode == "foreign" { "foreign" } else { "raw" }),
+                detail,
+            },
+        )?;
+        match mode.as_str() {
+            "complete" | "foreign" => std::io::stderr().write_all(&bytes)?,
+            "truncated" => std::io::stderr().write_all(&bytes[..bytes.len() - 1])?,
+            "absent" => {}
+            _ => anyhow::bail!("unknown opening failure fixture"),
+        }
+        std::io::stderr().flush()?;
+        std::process::exit(1);
     }
     if let Some(path) = std::env::var_os("PHOTOCATALOG_BROKER_READY_PATH") {
         // The supervisor waits for actual harness startup, not shell startup.
@@ -336,6 +360,94 @@ fn unexpected_source_death_has_reserved_control_and_waits_for_lm_revoke() -> Res
     broker.wait_revoked();
     assert!(broker.finish().is_err());
     absent(&pids);
+    Ok(())
+}
+
+#[test]
+fn queued_opening_failure_survives_eof_without_delaying_revoke_or_checked_drain() -> Result<()> {
+    for mode in ["complete", "absent", "truncated", "foreign"] {
+        let stop = Arc::new(Stop::default());
+        let checked = Arc::new(Mutex::new(None));
+        let observed = checked.clone();
+        let mut broker = Broker::start_with(
+            guard(),
+            stop.clone(),
+            MemoryBudget::new(1024 * 1024)?,
+            move |_, child_stop, before_wait| {
+                let mut command = OsCommand::new(std::env::current_exe()?);
+                command
+                    .args(["--exact", HELPER, "--nocapture"])
+                    .env(ENV, "1")
+                    .env(OPEN_FAILURE_ENV, mode);
+                crate::lightroom_migration_worker::process::source_environment(&mut command);
+                let process = Process::spawn_test_command_with_cleanup(
+                    command,
+                    child_stop,
+                    Some(before_wait),
+                )?;
+                *observed.lock().unwrap() = Some(process.checked_drain_probe());
+                // Hold the actual broker spawn boundary until EOF/parse failure
+                // is published. A complete Failed occupies the one-frame queue
+                // before EOF; no broker poll can consume it ahead of liveness.
+                let until = Instant::now() + Duration::from_secs(5);
+                while !process.output_ended() && !process.transport_failed() {
+                    ensure!(Instant::now() < until, "opening failure fixture deadline");
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Ok(process)
+            },
+        )?;
+        send(
+            &broker,
+            Command::Start {
+                sequence: U64(1),
+                kind: Kind::Raw,
+                reader: "raw".into(),
+            },
+        )?;
+        let until = Instant::now() + Duration::from_secs(5);
+        while !stop.requested() {
+            ensure!(
+                Instant::now() < until,
+                "opening failure did not revoke: {mode}"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        broker.wait_revoked();
+        let checked = checked
+            .lock()
+            .unwrap()
+            .clone()
+            .context("missing child probe")?;
+        assert!(!checked.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!broker.worker.as_ref().unwrap().is_finished());
+        let Some(Event::Failed { detail, .. }) = broker.try_urgent() else {
+            anyhow::bail!("opening failure has no reserved diagnostic: {mode}");
+        };
+        assert!(detail.len() <= 4096);
+        if mode == "complete" {
+            assert!(detail.contains(OPEN_FAILURE), "{detail}");
+        } else {
+            assert!(
+                !detail.contains(OPEN_FAILURE),
+                "untrusted diagnostic: {mode}"
+            );
+            let expected = match mode {
+                "absent" => "Source output ended before retirement",
+                "truncated" => "Source transport failed",
+                "foreign" => "Source relay reply epoch differs",
+                _ => unreachable!(),
+            };
+            assert!(detail.contains(expected), "{mode}: {detail}");
+        }
+        broker.revoke_after_lm();
+        let error = broker.finish().unwrap_err();
+        assert_eq!(
+            format!("{error:#}").contains(OPEN_FAILURE),
+            mode == "complete"
+        );
+        assert!(checked.load(std::sync::atomic::Ordering::Acquire));
+    }
     Ok(())
 }
 #[test]
