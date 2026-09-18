@@ -22,6 +22,9 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
+#[path = "original_path.rs"]
+mod original_path;
+
 const ADAPTER: &str = "lightroom-selected-import-v2";
 const LIMIT: usize = 8 * 1024 * 1024;
 
@@ -29,8 +32,9 @@ const LIMIT: usize = 8 * 1024 * 1024;
 #[serde(tag = "kind", deny_unknown_fields)]
 pub enum OverlapPolicy {
     RequireDecision,
-    /// Explicit permission to share a physical asset at identical native path
-    /// bytes. Each source image still gets its own logical image and edit state.
+    /// Explicit permission to share a unique asset at identical native path
+    /// bytes or a strict Windows plain/verbatim prefix equivalent. Each source
+    /// image still gets its own logical image and edit state.
     ReuseExactPath {
         reason: String,
     },
@@ -734,17 +738,10 @@ fn original(
             "inspection_path",
             131072,
         )?)?;
-        let existing: Option<String> = catalog
-            .db
-            .query_row(
-                "SELECT id FROM assets WHERE location=?",
-                [crate::catalog_storage::encoded_bytes(&path)],
-                |r| r.get(0),
-            )
-            .optional()?;
+        let existing = original_path::existing(&catalog.db, &path)?;
         match existing {
             None => OriginalDecision::Create { path },
-            Some(asset_id) => match &policy.overlap {
+            Some((asset_id, stored_path)) => match &policy.overlap {
                 OverlapPolicy::RequireDecision => {
                     return Ok(RowResult::NeedsDecision(format!(
                         "Source file {key} shares an existing path; choose an explicit physical-file reuse policy"
@@ -752,7 +749,7 @@ fn original(
                 }
                 OverlapPolicy::ReuseExactPath { .. } => OriginalDecision::Reuse {
                     asset_id,
-                    expected_path: path,
+                    expected_path: stored_path,
                 },
             },
         }
