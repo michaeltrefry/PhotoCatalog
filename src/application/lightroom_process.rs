@@ -675,9 +675,11 @@ impl CallbackProxy {
     fn call(&self, request: CallbackRequest, cancel: &AtomicBool) -> Result<CallbackValue> {
         let encoded = encode_callback_request(&request, cancel)?;
         let mut output = self.output.lock().unwrap_or_else(|e| e.into_inner());
-        // A preexisting cancellation consumes no sequence. Once a sequence is
-        // allocated, Begin is unconditional; cancellation while streaming
-        // leaves an explicit partial request for G's checked revoke path.
+        // A preexisting cancellation consumes no sequence. Once published,
+        // finish this bounded request and consume its exact acknowledgement
+        // before another callback (especially cleanup) can use the channel.
+        // Otherwise cancellation can strand an acquired F/S lease and leave
+        // its reply to collide with the cleanup callback's sequence.
         ensure!(
             !cancel.load(std::sync::atomic::Ordering::Acquire),
             "Workbench callback canceled"
@@ -692,14 +694,10 @@ impl CallbackProxy {
             state.next
         };
         let sequence = crate::application::U64(sequence);
-        write_encoded_callback_request(&mut *output, sequence, &encoded, cancel)?;
+        write_encoded_callback_request(&mut *output, sequence, &encoded, &AtomicBool::new(false))?;
         drop(output);
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            ensure!(
-                !cancel.load(std::sync::atomic::Ordering::Acquire),
-                "Workbench callback canceled"
-            );
             ensure!(!state.closed, "Workbench supervisor callback closed");
             if state
                 .waiting
