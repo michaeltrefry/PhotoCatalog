@@ -759,3 +759,7 @@ pub(crate) mod keyword_repair_tests;
 
 #[path = "../../tests/support/backup_snapshot.rs"]
 mod backup_snapshot;
+
+#[cfg(windows)]
+#[path = "importer_windows_tests.rs"]
+mod windows_original_reuse;
