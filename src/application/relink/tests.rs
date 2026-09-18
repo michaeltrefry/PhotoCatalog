@@ -169,7 +169,6 @@ fn exact_wire_and_backend_mount_authority() -> Result<()> {
             },
             &Limits::default(),
             &control,
-            false,
         )
         .unwrap_err();
     assert!(matches!(bad.code, ErrorCode::StaleSession));
@@ -233,7 +232,6 @@ fn review_pages_bind_revision_and_do_not_skip_byte_rejected_rows() -> Result<()>
             },
             &limits,
             &control,
-            false,
         )?
         else {
             panic!("items")
@@ -258,7 +256,6 @@ fn review_pages_bind_revision_and_do_not_skip_byte_rejected_rows() -> Result<()>
             },
             &limits,
             &control,
-            false,
         )
         .unwrap_err();
     assert!(matches!(stale.code, ErrorCode::StaleSession));
@@ -278,7 +275,6 @@ fn review_pages_bind_revision_and_do_not_skip_byte_rejected_rows() -> Result<()>
                 },
                 &tiny,
                 &control,
-                false
             )
             .unwrap_err()
             .code,
@@ -418,7 +414,6 @@ fn saved_rules_include_legacy_exclusions_with_bounded_empty_continuations() -> R
             },
             &limits,
             &control,
-            false,
         )?
         else {
             panic!("rules")
@@ -478,7 +473,6 @@ fn saved_rules_include_legacy_exclusions_with_bounded_empty_continuations() -> R
         },
         &Limits::default(),
         &control,
-        false,
     )?
     else {
         panic!("revised rules")
@@ -513,7 +507,6 @@ fn saved_rules_include_legacy_exclusions_with_bounded_empty_continuations() -> R
                 },
                 &Limits::default(),
                 &control,
-                false
             )
             .unwrap_err()
             .code,
@@ -938,5 +931,186 @@ fn atomic_relink_status_write_hold_cancel_commit_wins_and_close_undo() -> Result
     bridge.shutdown();
     assert_eq!(std::fs::read(f.originals.join("seed.png"))?, f.bytes);
     assert_eq!(std::fs::read(&f.destination)?, f.bytes);
+    Ok(())
+}
+
+#[test]
+fn restored_hold_allows_reviewed_nested_relink_apply_reopen_and_undo() -> Result<()> {
+    let mut f = fixture()?;
+    let nested = f.originals.join("nested").join("deeper");
+    std::fs::create_dir_all(&nested)?;
+    image::RgbImage::from_pixel(16, 12, image::Rgb([90u8, 40, 80]))
+        .save(nested.join("second.png"))?;
+    let old_root = f.originals.canonicalize()?;
+    let mut catalog = Catalog::open(&f.root)?;
+    catalog.import(&f.originals, None, |_| Ok(()))?;
+    let pending = catalog.begin_photo_export()?;
+    let locations = |catalog: &Catalog| -> Result<Vec<(String, Vec<u8>)>> {
+        Ok(catalog
+            .db
+            .prepare("SELECT id,location FROM assets ORDER BY id")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    };
+    let original_locations = locations(&catalog)?;
+    assert_eq!(original_locations.len(), 2);
+    drop(catalog);
+    let bundle = f._temp.path().join("backup");
+    let restored = f._temp.path().join("restored");
+    let limits = crate::catalog_backup::Limits::default();
+    crate::catalog_backup::backup_catalog(&f.root, &bundle, &limits, |_| Ok(()))?;
+    crate::catalog_backup::restore_catalog(&bundle, &restored, &limits, |_| Ok(()))?;
+    f.root = restored;
+    let moved = f._temp.path().join("relocated");
+    std::fs::rename(&f.originals, &moved)?;
+    f.originals = moved.canonicalize()?;
+    let nested_bytes = std::fs::read(f.originals.join("nested/deeper/second.png"))?;
+    let assert_held = |bridge: &Bridge, token: &str| -> Result<()> {
+        let app::Response::Restore(Some(status)) = call(
+            bridge,
+            app::Request::RestoreStatus {
+                catalog: token.into(),
+            },
+        )?
+        else {
+            anyhow::bail!("restore status missing")
+        };
+        assert!(status.jobs_held);
+        let error = call(
+            bridge,
+            app::Request::Export {
+                catalog: token.into(),
+                request: Box::new(app::exports::Request::Begin),
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("jobs are held"), "{error}");
+        Ok(())
+    };
+    let (bridge, token) = open(&f, None)?;
+    assert_held(&bridge, &token)?;
+    let Response::Plan(mut plan) = relink(
+        &bridge,
+        &token,
+        Request::Begin {
+            scope: Scope::Prefix {
+                from: core::PathReference::native(&old_root),
+                destinations: vec![NativePath::from_path(&f.originals)],
+            },
+        },
+    )?
+    else {
+        anyhow::bail!("plan missing")
+    };
+    for _ in 0..16 {
+        if plan.state == "ready" {
+            break;
+        }
+        let work = operation(relink(
+            &bridge,
+            &token,
+            Request::Prepare {
+                plan: plan.id.clone(),
+                revision: plan.revision,
+                batch_rows: U64(1),
+            },
+        )?);
+        let done = terminal(&bridge, &token, &work.id)?;
+        assert_eq!(done.phase, Phase::Complete, "{done:?}");
+        plan = done.plan.context("prepared plan")?;
+    }
+    assert_eq!(plan.state, "ready");
+    let Response::Items { rows, .. } = relink(
+        &bridge,
+        &token,
+        Request::Items {
+            plan: plan.id.clone(),
+            revision: plan.revision,
+            after: I64(0),
+            limit: U64(10),
+        },
+    )?
+    else {
+        anyhow::bail!("review missing")
+    };
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row.status == "matched"));
+    for relative in ["seed.png", "nested/deeper/second.png"] {
+        let expected = NativePath::from_path(&f.originals.join(relative));
+        assert!(
+            rows.iter()
+                .any(|row| row.destination.as_ref() == Some(&expected))
+        );
+    }
+    assert!(
+        relink(
+            &bridge,
+            &token,
+            Request::Apply {
+                plan: plan.id.clone(),
+                revision: I64(plan.revision.0 - 1),
+            }
+        )
+        .is_err()
+    );
+    assert_held(&bridge, &token)?;
+    let work = operation(relink(
+        &bridge,
+        &token,
+        Request::Apply {
+            plan: plan.id.clone(),
+            revision: plan.revision,
+        },
+    )?);
+    let done = terminal(&bridge, &token, &work.id)?;
+    assert_eq!(done.phase, Phase::Complete, "{done:?}");
+    plan = done.plan.context("applied plan")?;
+    assert_eq!(plan.state, "applied");
+    assert_held(&bridge, &token)?;
+    call(&bridge, app::Request::Close { catalog: token })?;
+    bridge.shutdown();
+    let catalog = Catalog::open(&f.root)?;
+    let applied_locations = locations(&catalog)?;
+    assert_eq!(applied_locations.len(), original_locations.len());
+    for row in &rows {
+        let expected = crate::catalog_storage::encoded_bytes(
+            row.destination.as_ref().context("reviewed destination")?,
+        );
+        assert!(applied_locations.contains(&(row.asset_id.clone(), expected)));
+    }
+    drop(catalog);
+    let (bridge, token) = open(&f, None)?;
+    assert_held(&bridge, &token)?;
+    let work = operation(relink(
+        &bridge,
+        &token,
+        Request::Undo {
+            plan: plan.id,
+            revision: plan.revision,
+        },
+    )?);
+    let done = terminal(&bridge, &token, &work.id)?;
+    assert_eq!(done.phase, Phase::Complete, "{done:?}");
+    assert_eq!(done.plan.context("undone plan")?.state, "undone");
+    assert_held(&bridge, &token)?;
+    call(&bridge, app::Request::Close { catalog: token })?;
+    bridge.shutdown();
+    let catalog = Catalog::open(&f.root)?;
+    assert_eq!(locations(&catalog)?, original_locations);
+    assert_eq!(
+        serde_json::to_value(catalog.photo_export_job(&pending.id)?)?,
+        serde_json::to_value(pending)?
+    );
+    assert!(
+        catalog
+            .restore_status()?
+            .context("restore marker")?
+            .jobs_held
+    );
+    assert_eq!(std::fs::read(f.originals.join("seed.png"))?, f.bytes);
+    assert_eq!(
+        std::fs::read(f.originals.join("nested/deeper/second.png"))?,
+        nested_bytes
+    );
     Ok(())
 }

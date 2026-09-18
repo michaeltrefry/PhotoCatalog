@@ -611,7 +611,6 @@ impl Coordinator {
         request: Request,
         limits: &Limits,
         control: &Arc<Mutex<Control>>,
-        jobs_held: bool,
     ) -> Result<Response> {
         self.sql_session = Some(catalog.session.clone());
         if request.read_only() {
@@ -686,12 +685,6 @@ impl Coordinator {
                 revision,
                 batch_rows,
             } => {
-                if jobs_held {
-                    return Err(error(
-                        ErrorCode::Busy,
-                        "restored jobs remain held; review and explicitly resume first",
-                    ));
-                }
                 let p = reviewed(catalog, &plan, revision)?;
                 let n = page(batch_rows, limits)?;
                 let checking = p.state == "checking";

@@ -2145,12 +2145,8 @@ impl Actor {
                         | relink::Request::Revise { .. }
                 );
                 let response = if commit {
-                    if o.jobs_held {
-                        return Err(error(
-                            ErrorCode::Busy,
-                            "restored jobs remain held; review and explicitly resume first",
-                        ));
-                    }
+                    // Explicitly reviewed relinks repair restored original paths while
+                    // unrelated external jobs remain held by the restore marker.
                     if o.import.as_ref().is_some_and(|i| !i.terminal()) {
                         return Err(error(
                             ErrorCode::Busy,
@@ -2165,7 +2161,7 @@ impl Actor {
                     response
                 } else {
                     o.relink
-                        .execute(&mut o.catalog, *request, &limits, &control, o.jobs_held)?
+                        .execute(&mut o.catalog, *request, &limits, &control)?
                 };
                 Ok(Response::Relink(Box::new(response)))
             }
