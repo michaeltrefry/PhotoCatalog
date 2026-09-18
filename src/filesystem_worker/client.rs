@@ -2414,7 +2414,8 @@ mod tests {
         let root = bootstrap.root_capability();
 
         let payload = b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"/>";
-        let new_destination = temp.path().join("new-sidecar.xmp");
+        let directory = crate::catalog_session::ordinary_metadata_test_directory(temp.path())?;
+        let new_destination = directory.join("new-sidecar.xmp");
         let (_, new_plan) = plan(&child.0, &root, &new_destination, payload)?;
         assert_ne!(new_plan.destination, new_destination);
         assert_eq!(
@@ -2429,7 +2430,7 @@ mod tests {
         );
         assert_eq!(fs::read(&new_destination)?, payload);
 
-        let existing_destination = temp.path().join("existing-sidecar.xmp");
+        let existing_destination = directory.join("existing-sidecar.xmp");
         fs::write(&existing_destination, b"previous sidecar")?;
         let (_, existing_plan) = plan(&child.0, &root, &existing_destination, payload)?;
         assert!(existing_plan.expected.is_some());
@@ -2437,6 +2438,39 @@ mod tests {
         let captured = published.captured_original.context("captured sidecar")?;
         assert_eq!(fs::read(&captured)?, b"previous sidecar");
         assert_eq!(fs::read(&existing_destination)?, payload);
+
+        // Native folder pickers return ordinary paths. Discovery must accept
+        // only this prefix difference and retain exact transfer/cursor identity.
+        let discovery_transfer = LeaseId::new();
+        let selected_directory = NativePath::from_path(&directory);
+        let mut after = None;
+        let mut found = false;
+        for operation in 1..100 {
+            let reply = call(
+                &child.0,
+                &root,
+                &discovery_transfer,
+                operation,
+                Action::Discover {
+                    directory: selected_directory.clone(),
+                    after: after.clone(),
+                    scan_rows: U64(1),
+                    page_rows: U64(1),
+                },
+            )?;
+            let Value::Discovery { rows, next, .. } = reply.value else {
+                unreachable!()
+            };
+            found |= rows
+                .iter()
+                .any(|row| row.operation.as_deref() == Some(&existing_plan.operation));
+            if next.is_none() {
+                break;
+            }
+            after = next;
+        }
+        assert!(found, "published sidecar recovery must be discoverable");
+        call(&child.0, &root, &discovery_transfer, 101, Action::Release)?;
 
         fs::remove_file(&existing_destination)?;
         let restore_mode = Mode::Restore {

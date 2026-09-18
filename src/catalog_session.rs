@@ -2868,7 +2868,7 @@ fn validate_metadata_file_value(
             crate::metadata_export::validate_plan_wire(plan)?;
             let requested_destination = destination.to_path()?;
             ensure!(
-                metadata_plan_destination_matches(&requested_destination, &plan.destination)
+                metadata_path_spelling_matches(&requested_destination, &plan.destination)
                     && plan.payload_bytes == payload_bytes
                     && plan.payload_digest == payload_digest
                     && plan.max_existing_bytes == Some(max_existing_bytes.0)
@@ -2936,8 +2936,26 @@ pub(crate) fn validate_metadata_file_value_for_test(
     )
 }
 
-fn metadata_plan_destination_matches(requested: &Path, planned: &Path) -> bool {
-    if requested == planned {
+#[cfg(all(test, windows))]
+pub(crate) fn ordinary_metadata_test_directory(path: &Path) -> Result<std::path::PathBuf> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    // TEMP may itself contain a short-name or junction alias on hosted runners.
+    // This fixture intentionally changes only the canonical verbatim prefix.
+    let canonical = path.canonicalize()?;
+    let units: Vec<_> = canonical.as_os_str().encode_wide().collect();
+    let tail = units
+        .strip_prefix(&[92, 92, 63, 92])
+        .context("verbatim test directory")?;
+    let ordinary = if let Some(tail) = tail.strip_prefix(&[85, 78, 67, 92]) {
+        [vec![92, 92], tail.to_vec()].concat()
+    } else {
+        tail.to_vec()
+    };
+    Ok(std::ffi::OsString::from_wide(&ordinary).into())
+}
+
+pub(crate) fn metadata_path_spelling_matches(requested: &Path, planned: &Path) -> bool {
+    if requested.as_os_str() == planned.as_os_str() {
         return true;
     }
     #[cfg(windows)]
@@ -3434,7 +3452,11 @@ mod metadata_reply_tests {
         // Keep the chooser-style ordinary Windows spelling. F canonicalizes the
         // existing parent before returning its plan, which adds the verbatim
         // prefix on Windows.
-        let destination = temp.path().join("reply.xmp");
+        #[cfg(windows)]
+        let directory = ordinary_metadata_test_directory(temp.path())?;
+        #[cfg(not(windows))]
+        let directory = temp.path().to_path_buf();
+        let destination = directory.join("reply.xmp");
         std::fs::write(&destination, b"old")?;
         let limits = crate::catalog_export_alias::AliasLimits::default();
         let mut checkpoint = |_| Ok(());
@@ -3562,7 +3584,7 @@ mod metadata_reply_tests {
     #[test]
     fn metadata_plan_authority_accepts_only_windows_verbatim_prefix_equivalence() {
         let matches = |requested: &str, planned: &str| {
-            metadata_plan_destination_matches(Path::new(requested), Path::new(planned))
+            metadata_path_spelling_matches(Path::new(requested), Path::new(planned))
         };
         assert!(matches(
             r"C:\Photos\sidecar.xmp",
@@ -3591,6 +3613,22 @@ mod metadata_reply_tests {
         assert!(!matches(
             r"\\server\share\Photos\sidecar.xmp",
             r"\\?\UNC\other\share\Photos\sidecar.xmp"
+        ));
+        assert!(!matches(
+            r"C:\Users\RUNNER~1\sidecar.xmp",
+            r"\\?\C:\Users\runneradmin\sidecar.xmp"
+        ));
+        assert!(!matches(
+            r"C:\Photos\sidecar.xmp",
+            r"\\?\C:\photos\sidecar.xmp"
+        ));
+        assert!(!matches(
+            r"C:\Photos\.\sidecar.xmp",
+            r"C:\Photos\sidecar.xmp"
+        ));
+        assert!(!matches(
+            r"C:\Photos\\sidecar.xmp",
+            r"C:\Photos\sidecar.xmp"
         ));
     }
 }

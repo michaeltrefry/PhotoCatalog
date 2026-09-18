@@ -264,15 +264,14 @@ impl Owner {
             let path = directory.to_path()?;
             ensure!(path.is_absolute(), "recovery directory must be absolute");
             let canonical = path.canonicalize()?;
-            let canonical = NativePath::from_path(&canonical);
             ensure!(
-                &canonical == directory,
+                crate::catalog_session::metadata_path_spelling_matches(&path, &canonical),
                 "recovery directory must be canonical"
             );
             self.discovery = Some(Discovery {
                 transfer: transfer.clone(),
                 directory: directory.clone(),
-                reader: fs::read_dir(canonical.to_path()?)?,
+                reader: fs::read_dir(canonical)?,
                 pending: None,
                 cursor: None,
                 exhausted: false,
@@ -477,6 +476,91 @@ mod tests {
         }
         assert!(saw_sparse_continuation);
         assert!(found);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ordinary_discovery_keeps_exact_directory_and_cursor_authority() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        for index in 0..3 {
+            fs::write(temp.path().join(format!("entry-{index}")), b"unchanged")?;
+        }
+        let ordinary = crate::catalog_session::ordinary_metadata_test_directory(temp.path())?;
+        let directory = NativePath::from_path(&ordinary);
+        let canonical = NativePath::from_path(&temp.path().canonicalize()?);
+        let root = root(temp.path());
+        let transfer = crate::catalog_session::LeaseId::new();
+        let mut owner = Owner::default();
+        let action = |directory: NativePath, after| Action::Discover {
+            directory,
+            after,
+            scan_rows: U64(1),
+            page_rows: U64(1),
+        };
+        let Value::Discovery {
+            next: Some(cursor), ..
+        } = call(
+            &mut owner,
+            &root,
+            &transfer,
+            1,
+            action(directory.clone(), None),
+        )?
+        else {
+            panic!("bounded page must retain cursor")
+        };
+        assert!(
+            call(
+                &mut owner,
+                &root,
+                &transfer,
+                2,
+                action(canonical, Some(cursor.clone()))
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("authority changed")
+        );
+        assert!(
+            call(
+                &mut owner,
+                &root,
+                &transfer,
+                2,
+                action(directory.clone(), None)
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("cursor changed")
+        );
+        assert!(
+            call(
+                &mut owner,
+                &root,
+                &crate::catalog_session::LeaseId::new(),
+                2,
+                action(directory.clone(), Some(cursor.clone()))
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("authority changed")
+        );
+        call(
+            &mut owner,
+            &root,
+            &transfer,
+            2,
+            action(directory, Some(cursor)),
+        )?;
+        call(&mut owner, &root, &transfer, 3, Action::Release)?;
+        assert!(owner.empty());
+        for index in 0..3 {
+            assert_eq!(
+                fs::read(temp.path().join(format!("entry-{index}")))?,
+                b"unchanged"
+            );
+        }
         Ok(())
     }
 
