@@ -2866,8 +2866,9 @@ fn validate_metadata_file_value(
             metadata_files::Value::Plan(plan),
         ) => {
             crate::metadata_export::validate_plan_wire(plan)?;
+            let requested_destination = destination.to_path()?;
             ensure!(
-                plan.destination == destination.to_path()?
+                metadata_path_spelling_matches(&requested_destination, &plan.destination)
                     && plan.payload_bytes == payload_bytes
                     && plan.payload_digest == payload_digest
                     && plan.max_existing_bytes == Some(max_existing_bytes.0)
@@ -2919,6 +2920,120 @@ fn validate_metadata_file_value(
         _ => anyhow::bail!("metadata file terminal reply authority mismatch"),
     }
     Ok(())
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn validate_metadata_file_value_for_test(
+    mode: &metadata_files::Mode,
+    payload: &[u8],
+    value: &metadata_files::Value,
+) -> Result<()> {
+    validate_metadata_file_value(
+        mode,
+        u64::try_from(payload.len())?,
+        blake3::hash(payload).to_hex().as_str(),
+        value,
+    )
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn ordinary_metadata_test_directory(path: &Path) -> Result<std::path::PathBuf> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    // TEMP may itself contain a short-name or junction alias on hosted runners.
+    // This fixture intentionally changes only the canonical verbatim prefix.
+    let canonical = path.canonicalize()?;
+    let units: Vec<_> = canonical.as_os_str().encode_wide().collect();
+    let tail = units
+        .strip_prefix(&[92, 92, 63, 92])
+        .context("verbatim test directory")?;
+    let ordinary = if let Some(tail) = tail.strip_prefix(&[85, 78, 67, 92]) {
+        [vec![92, 92], tail.to_vec()].concat()
+    } else {
+        tail.to_vec()
+    };
+    Ok(std::ffi::OsString::from_wide(&ordinary).into())
+}
+
+pub(crate) fn metadata_path_spelling_matches(requested: &Path, planned: &Path) -> bool {
+    if requested.as_os_str() == planned.as_os_str() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        windows_verbatim_prefix_equivalent(requested, planned)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+#[cfg(windows)]
+fn windows_verbatim_prefix_equivalent(first: &Path, second: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+
+    fn ordinary_verbatim_path(units: &[u16]) -> Option<Vec<u16>> {
+        const PREFIX: &[u16] = &[92, 92, 63, 92]; // \\?\
+        const UNC: &[u16] = &[85, 78, 67, 92]; // UNC\
+        let tail = units.strip_prefix(PREFIX)?;
+        let ordinary = if let Some(network) = tail.strip_prefix(UNC) {
+            let mut value = Vec::with_capacity(network.len().checked_add(2)?);
+            value.extend_from_slice(&[92, 92]);
+            value.extend_from_slice(network);
+            value
+        } else {
+            tail.to_vec()
+        };
+        ordinary_windows_path(&ordinary).then_some(ordinary)
+    }
+
+    fn ordinary_windows_path(units: &[u16]) -> bool {
+        let drive = units.len() >= 3
+            && units[0] < 128
+            && (units[0] as u8).is_ascii_alphabetic()
+            && units[1..3] == [58, 92];
+        let unc = units.starts_with(&[92, 92])
+            && !units.starts_with(&[92, 92, 46, 92])
+            && units[2..].split(|unit| *unit == 92).take(2).count() == 2;
+        if !drive && !unc {
+            return false;
+        }
+        if units.contains(&47) {
+            return false;
+        }
+        let start = if drive { 3 } else { 2 };
+        if drive && units.len() == start {
+            return true;
+        }
+        let parts: Vec<&[u16]> = units[start..].split(|unit| *unit == 92).collect();
+        // Share roots may retain their literal trailing separator. This does
+        // not add or remove a separator when comparing the two spellings.
+        let parts = if unc && parts.len() == 3 && parts[2].is_empty() {
+            &parts[..2]
+        } else {
+            &parts[..]
+        };
+        let required = if drive { 1 } else { 2 };
+        parts.len() >= required
+            && parts.iter().all(|part| {
+                !part.is_empty()
+                    && *part != [46]
+                    && *part != [46, 46]
+                    && !matches!(part.last(), Some(32 | 46))
+                    && !part.contains(&58)
+            })
+    }
+
+    let first: Vec<u16> = first.as_os_str().encode_wide().collect();
+    let second: Vec<u16> = second.as_os_str().encode_wide().collect();
+    match (
+        ordinary_verbatim_path(&first),
+        ordinary_verbatim_path(&second),
+    ) {
+        (Some(ordinary), None) => ordinary == second,
+        (None, Some(ordinary)) => first == ordinary,
+        _ => false,
+    }
 }
 
 /// No destructor in this owner invokes Connection::drop, SQL or rollback. A
@@ -3344,7 +3459,14 @@ mod metadata_reply_tests {
     #[test]
     fn terminal_metadata_replies_are_bound_to_requested_plan_and_receipt_authority() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let destination = temp.path().canonicalize()?.join("reply.xmp");
+        // Keep the chooser-style ordinary Windows spelling. F canonicalizes the
+        // existing parent before returning its plan, which adds the verbatim
+        // prefix on Windows.
+        #[cfg(windows)]
+        let directory = ordinary_metadata_test_directory(temp.path())?;
+        #[cfg(not(windows))]
+        let directory = temp.path().canonicalize()?;
+        let destination = directory.join("reply.xmp");
         std::fs::write(&destination, b"old")?;
         let limits = crate::catalog_export_alias::AliasLimits::default();
         let mut checkpoint = |_| Ok(());
@@ -3377,6 +3499,53 @@ mod metadata_reply_tests {
             )
             .is_err()
         );
+        let mut wrong_bytes = plan.clone();
+        wrong_bytes.payload_bytes += 1;
+        assert!(
+            validate_metadata_file_value(
+                &mode,
+                3,
+                blake3::hash(b"new").to_hex().as_ref(),
+                &metadata_files::Value::Plan(wrong_bytes),
+            )
+            .is_err()
+        );
+        let mut wrong_limit = plan.clone();
+        wrong_limit.max_existing_bytes = Some(4);
+        assert!(
+            validate_metadata_file_value(
+                &mode,
+                3,
+                blake3::hash(b"new").to_hex().as_ref(),
+                &metadata_files::Value::Plan(wrong_limit),
+            )
+            .is_err()
+        );
+        let mut wrong_alias_limits = plan.clone();
+        wrong_alias_limits.alias_limits = Some(crate::catalog_export_alias::AliasLimits {
+            directories: limits.directories - 1,
+            ..limits
+        });
+        assert!(
+            validate_metadata_file_value(
+                &mode,
+                3,
+                blake3::hash(b"new").to_hex().as_ref(),
+                &metadata_files::Value::Plan(wrong_alias_limits),
+            )
+            .is_err()
+        );
+        let mut wrong_destination = plan.clone();
+        wrong_destination.destination.set_file_name("other.xmp");
+        assert!(
+            validate_metadata_file_value(
+                &mode,
+                3,
+                blake3::hash(b"new").to_hex().as_ref(),
+                &metadata_files::Value::Plan(wrong_destination),
+            )
+            .is_err()
+        );
         let recovery = crate::metadata_export::metadata_recovery_directory(&plan)?;
         let wrong_receipt = crate::metadata_export::ExportReceipt {
             state: crate::metadata_export::ExportState::Published,
@@ -3396,7 +3565,7 @@ mod metadata_reply_tests {
         );
         let restored = crate::metadata_export::ExportReceipt {
             state: crate::metadata_export::ExportState::Restored,
-            destination,
+            destination: plan.destination.clone(),
             recovery_directory: recovery.clone(),
             captured_original: Some(recovery.join("original")),
             detail: "restored with retained recovery evidence".into(),
@@ -3419,6 +3588,76 @@ mod metadata_reply_tests {
             .is_err()
         );
         Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn metadata_plan_authority_accepts_only_windows_verbatim_prefix_equivalence() {
+        let matches = |requested: &str, planned: &str| {
+            metadata_path_spelling_matches(Path::new(requested), Path::new(planned))
+        };
+        assert!(matches(
+            r"C:\Photos\sidecar.xmp",
+            r"\\?\C:\Photos\sidecar.xmp"
+        ));
+        assert!(matches(
+            r"\\server\share\Photos\sidecar.xmp",
+            r"\\?\UNC\server\share\Photos\sidecar.xmp"
+        ));
+        assert!(matches(
+            r"\\?\C:\Photos\sidecar.xmp",
+            r"C:\Photos\sidecar.xmp"
+        ));
+        for (ordinary, verbatim) in [
+            (r"C:\", r"\\?\C:\"),
+            (r"\\server\share", r"\\?\UNC\server\share"),
+            (r"\\server\share\", r"\\?\UNC\server\share\"),
+        ] {
+            assert!(matches(ordinary, verbatim));
+            assert!(matches(verbatim, ordinary));
+        }
+        for (ordinary, verbatim) in [
+            (r"C:\", r"\\?\D:\"),
+            (r"C:\", r"\\?\C:\."),
+            (r"\\server\share", r"\\?\UNC\server\share\"),
+            (r"\\server\share", r"\\?\UNC\SERVER\share"),
+            (r"\\server", r"\\?\UNC\server"),
+            (r"\\server\share.", r"\\?\UNC\server\share."),
+        ] {
+            assert!(!matches(ordinary, verbatim));
+        }
+
+        for rejected in [
+            r"\\?\D:\Photos\sidecar.xmp",
+            r"\\?\C:\Photos\other.xmp",
+            r"\\?\C:\Photos\..\sidecar.xmp",
+            r"\\?\C:\Photos.\sidecar.xmp",
+            r"\\?\C:\Photos \sidecar.xmp",
+            r"\\.\C:\Photos\sidecar.xmp",
+            r"\\?\GLOBALROOT\Device\sidecar.xmp",
+        ] {
+            assert!(!matches(r"C:\Photos\sidecar.xmp", rejected));
+        }
+        assert!(!matches(
+            r"\\server\share\Photos\sidecar.xmp",
+            r"\\?\UNC\other\share\Photos\sidecar.xmp"
+        ));
+        assert!(!matches(
+            r"C:\Users\RUNNER~1\sidecar.xmp",
+            r"\\?\C:\Users\runneradmin\sidecar.xmp"
+        ));
+        assert!(!matches(
+            r"C:\Photos\sidecar.xmp",
+            r"\\?\C:\photos\sidecar.xmp"
+        ));
+        assert!(!matches(
+            r"C:\Photos\.\sidecar.xmp",
+            r"C:\Photos\sidecar.xmp"
+        ));
+        assert!(!matches(
+            r"C:\Photos\\sidecar.xmp",
+            r"C:\Photos\sidecar.xmp"
+        ));
     }
 }
 

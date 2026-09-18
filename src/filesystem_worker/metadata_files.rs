@@ -264,15 +264,14 @@ impl Owner {
             let path = directory.to_path()?;
             ensure!(path.is_absolute(), "recovery directory must be absolute");
             let canonical = path.canonicalize()?;
-            let canonical = NativePath::from_path(&canonical);
             ensure!(
-                &canonical == directory,
+                crate::catalog_session::metadata_path_spelling_matches(&path, &canonical),
                 "recovery directory must be canonical"
             );
             self.discovery = Some(Discovery {
                 transfer: transfer.clone(),
                 directory: directory.clone(),
-                reader: fs::read_dir(canonical.to_path()?)?,
+                reader: fs::read_dir(canonical)?,
                 pending: None,
                 cursor: None,
                 exhausted: false,
@@ -480,12 +479,99 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn ordinary_discovery_keeps_exact_directory_and_cursor_authority() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        for index in 0..3 {
+            fs::write(temp.path().join(format!("entry-{index}")), b"unchanged")?;
+        }
+        let ordinary = crate::catalog_session::ordinary_metadata_test_directory(temp.path())?;
+        let directory = NativePath::from_path(&ordinary);
+        let canonical = NativePath::from_path(&temp.path().canonicalize()?);
+        let root = root(temp.path());
+        let transfer = crate::catalog_session::LeaseId::new();
+        let mut owner = Owner::default();
+        let action = |directory: NativePath, after| Action::Discover {
+            directory,
+            after,
+            scan_rows: U64(1),
+            page_rows: U64(1),
+        };
+        let Value::Discovery {
+            next: Some(cursor), ..
+        } = call(
+            &mut owner,
+            &root,
+            &transfer,
+            1,
+            action(directory.clone(), None),
+        )?
+        else {
+            panic!("bounded page must retain cursor")
+        };
+        assert!(
+            call(
+                &mut owner,
+                &root,
+                &transfer,
+                2,
+                action(canonical, Some(cursor.clone()))
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("authority changed")
+        );
+        assert!(
+            call(
+                &mut owner,
+                &root,
+                &transfer,
+                2,
+                action(directory.clone(), None)
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("cursor changed")
+        );
+        assert!(
+            call(
+                &mut owner,
+                &root,
+                &crate::catalog_session::LeaseId::new(),
+                2,
+                action(directory.clone(), Some(cursor.clone()))
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("authority changed")
+        );
+        call(
+            &mut owner,
+            &root,
+            &transfer,
+            2,
+            action(directory, Some(cursor)),
+        )?;
+        call(&mut owner, &root, &transfer, 3, Action::Release)?;
+        assert!(owner.empty());
+        for index in 0..3 {
+            assert_eq!(
+                fs::read(temp.path().join(format!("entry-{index}")))?,
+                b"unchanged"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn filesystem_owner_plans_applies_and_restores_without_losing_original() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let canonical = temp.path().canonicalize()?;
         let root = root(&canonical);
-        let destination = canonical.join("sidecar.xmp");
+        // Model a native chooser returning an ordinary drive/UNC spelling.
+        // The filesystem owner keeps its canonical spelling in the plan.
+        let destination = temp.path().join("sidecar.xmp");
         fs::write(&destination, b"original sidecar")?;
         let payload = b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"/>".to_vec();
         let digest = blake3::hash(&payload).to_hex().to_string();
@@ -612,6 +698,53 @@ mod tests {
         crate::metadata_export::validate_metadata_export_receipt_wire(&restored, &plan)?;
         assert_eq!(fs::read(&captured)?, b"original sidecar");
         assert_eq!(fs::read(destination)?, b"original sidecar");
+        Ok(())
+    }
+
+    #[test]
+    fn filesystem_owner_plans_new_destination_from_selected_path() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = root(&temp.path().canonicalize()?);
+        let destination = temp.path().join("new-sidecar.xmp");
+        let payload = b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"/>".to_vec();
+        let digest = blake3::hash(&payload).to_hex().to_string();
+        let transfer = crate::catalog_session::LeaseId::new();
+        let mut owner = Owner::default();
+
+        call(
+            &mut owner,
+            &root,
+            &transfer,
+            1,
+            Action::Begin {
+                mode: Mode::Plan {
+                    destination: NativePath::from_path(&destination),
+                    max_existing_bytes: U64(1024),
+                    alias_limits: Default::default(),
+                },
+                bytes: U64(payload.len() as u64),
+                blake3: digest,
+            },
+        )?;
+        call(
+            &mut owner,
+            &root,
+            &transfer,
+            2,
+            Action::Append {
+                offset: U64(0),
+                bytes: payload,
+            },
+        )?;
+        let Value::Plan(plan) = call(&mut owner, &root, &transfer, 3, Action::Finish)? else {
+            unreachable!()
+        };
+        assert_eq!(
+            plan.destination,
+            temp.path().canonicalize()?.join("new-sidecar.xmp")
+        );
+        assert!(plan.expected.is_none());
+        assert!(!destination.exists());
         Ok(())
     }
 
