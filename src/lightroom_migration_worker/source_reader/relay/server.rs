@@ -355,15 +355,28 @@ impl Owner {
                 !slot.process.transport_failed(),
                 "Source transport failed with queued relay output"
             );
-            ensure!(
-                !slot.process.output_ended() || slot.closing || slot.retiring,
-                "Source output ended before retirement"
-            );
-            if slot.process.try_reap()?.is_some() {
-                ensure!(
-                    slot.closing || slot.retiring,
-                    "Source process lost with pending relay output"
-                );
+            let failure = if slot.process.output_ended() && !slot.closing && !slot.retiring {
+                Some("Source output ended before retirement")
+            } else if slot.process.try_reap()?.is_some() && !slot.closing && !slot.retiring {
+                Some("Source process lost with pending relay output")
+            } else {
+                None
+            };
+            if let Some(failure) = failure {
+                // An opening failure can queue its bounded Failed reply, then
+                // exit before this liveness check. Inspect only the already
+                // queued frame; never wait for diagnostics or defer revocation.
+                // Other output cannot make this dead Source usable again.
+                if let Ok(Output::Frame(reply)) = slot.process.try_receive() {
+                    ensure!(
+                        reply.epoch() == &slot.epoch,
+                        "Source relay reply epoch differs"
+                    );
+                    if let Reply::Failed { detail, .. } = reply {
+                        anyhow::bail!("Source owner failed: {detail}");
+                    }
+                }
+                anyhow::bail!("{failure}");
             }
         }
         Ok(())
