@@ -254,11 +254,22 @@ fn coverage_batch(
     Ok(batch)
 }
 
+#[cfg(test)]
 pub(super) fn execute(
     catalog: &mut Catalog,
     service: &mut PreviewService,
     state: &mut State,
     request: Request,
+) -> Result<Status, BridgeError> {
+    execute_with_root_admission(catalog, service, state, request, &mut |_| Ok(()))
+}
+
+pub(super) fn execute_with_root_admission(
+    catalog: &mut Catalog,
+    service: &mut PreviewService,
+    state: &mut State,
+    request: Request,
+    admit_roots: &mut dyn FnMut(&[PathBuf]) -> Result<(), BridgeError>,
 ) -> Result<Status, BridgeError> {
     match request {
         Request::Status => {}
@@ -305,6 +316,7 @@ pub(super) fn execute(
                     "original-root review belongs to another session",
                 ));
             }
+            let mut completed = None;
             if storage_epoch(catalog).map_err(native)? != active.storage_epoch {
                 state.review = None;
             } else if active.issue.is_none() {
@@ -334,11 +346,26 @@ pub(super) fn execute(
                             .into(),
                     );
                 } else if batch.complete {
-                    service
-                        .replace_original_root_review(&active.roots, active.storage_epoch)
-                        .map_err(native)?;
-                    state.review = None;
+                    completed = Some((active.roots.clone(), active.storage_epoch));
                 }
+            }
+            if let Some((roots, expected_epoch)) = completed {
+                // F independently validates and retains these user-reviewed roots
+                // before the cache manifest advertises the review as ready. A
+                // changed catalog cannot turn an earlier coverage result into new
+                // path authority while admission is in flight.
+                admit_roots(&roots)?;
+                if storage_epoch(catalog).map_err(native)? != expected_epoch {
+                    state.review = None;
+                    return Err(error(
+                        ErrorCode::StaleSession,
+                        "catalog original locations changed; restart the root review",
+                    ));
+                }
+                service
+                    .replace_original_root_review(&roots, expected_epoch)
+                    .map_err(native)?;
+                state.review = None;
             }
         }
         Request::BeginRelocation { tier, destination } => {
@@ -818,6 +845,118 @@ mod tests {
             status.original_roots.roots,
             vec![NativePath::from_path(&originals.canonicalize()?)]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn cross_cache_root_review_requires_live_admission_before_becoming_ready() -> anyhow::Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let originals = temp.path().join("originals");
+        std::fs::create_dir(&originals)?;
+        let mut catalog = Catalog::open(temp.path().join("catalog"))?;
+        add_original(&mut catalog, "photo", &originals.join("photo.jpg"))?;
+
+        let mut first_service = open_service(config(&temp.path().join("first-cache")))?;
+        let mut first_state = State::default();
+        let first = complete_root_review(
+            &mut catalog,
+            &mut first_service,
+            &mut first_state,
+            std::slice::from_ref(&originals),
+        )?;
+        assert_eq!(first.original_roots.state, "ready");
+        drop(first_service);
+
+        let mut service = open_service(config(&temp.path().join("fresh-cache")))?;
+        let mut state = State::default();
+        assert!(service.original_root_review()?.roots.is_empty());
+        let begun = execute(
+            &mut catalog,
+            &mut service,
+            &mut state,
+            Request::BeginOriginalRootReview {
+                roots: vec![NativePath::from_path(&originals)],
+            },
+        )?;
+        let review = begun.original_roots.review.context("review")?;
+
+        let error = execute_with_root_admission(
+            &mut catalog,
+            &mut service,
+            &mut state,
+            Request::StepOriginalRootReview {
+                review: review.clone(),
+                directories: 10,
+            },
+            &mut |_| Err(error(ErrorCode::Native, "injected F admission refusal")),
+        )
+        .unwrap_err();
+        assert!(error.message.contains("injected F admission refusal"));
+        assert!(service.original_root_review()?.roots.is_empty());
+
+        let mut admitted = Vec::new();
+        let ready = execute_with_root_admission(
+            &mut catalog,
+            &mut service,
+            &mut state,
+            Request::StepOriginalRootReview {
+                review,
+                directories: 10,
+            },
+            &mut |roots| {
+                admitted = roots.to_vec();
+                Ok(())
+            },
+        )?;
+        assert_eq!(ready.original_roots.state, "ready");
+        assert_eq!(admitted, vec![originals.canonicalize()?]);
+        assert_eq!(service.original_root_review()?.roots, admitted);
+        Ok(())
+    }
+
+    #[test]
+    fn root_review_does_not_persist_when_storage_changes_during_live_admission()
+    -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let originals = temp.path().join("originals");
+        std::fs::create_dir(&originals)?;
+        let mut catalog = Catalog::open(temp.path().join("catalog"))?;
+        add_original(&mut catalog, "photo", &originals.join("photo.jpg"))?;
+        let mut service = open_service(config(&temp.path().join("fresh-cache")))?;
+        let mut state = State::default();
+        let begun = execute(
+            &mut catalog,
+            &mut service,
+            &mut state,
+            Request::BeginOriginalRootReview {
+                roots: vec![NativePath::from_path(&originals)],
+            },
+        )?;
+        let review = begun.original_roots.review.context("review")?;
+        let epoch_writer = rusqlite::Connection::open(catalog.root.join("catalog.sqlite3"))?;
+        let error = execute_with_root_admission(
+            &mut catalog,
+            &mut service,
+            &mut state,
+            Request::StepOriginalRootReview {
+                review,
+                directories: 10,
+            },
+            &mut |_| {
+                // Model a catalog actor rotation between coverage and F admission.
+                epoch_writer
+                    .execute(
+                        "UPDATE storage_epoch SET revision=revision+1 WHERE id=1",
+                        [],
+                    )
+                    .map_err(|error| native(error.into()))?;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.message.contains("original locations changed"));
+        assert!(service.original_root_review()?.roots.is_empty());
         Ok(())
     }
 }

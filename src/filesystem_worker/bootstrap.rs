@@ -1205,7 +1205,7 @@ impl BootstrapOwner {
         }
         ensure!(
             admitted,
-            "export original is outside admitted original roots"
+            "export original is outside admitted original roots; open Preview storage, add and verify every original-photo root, then retry export"
         );
         Ok(normalized)
     }
