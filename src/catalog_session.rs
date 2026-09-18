@@ -2988,7 +2988,7 @@ fn windows_verbatim_prefix_equivalent(first: &Path, second: &Path) -> bool {
     }
 
     fn ordinary_windows_path(units: &[u16]) -> bool {
-        let drive = units.len() > 3
+        let drive = units.len() >= 3
             && units[0] < 128
             && (units[0] as u8).is_ascii_alphabetic()
             && units[1..3] == [58, 92];
@@ -3002,8 +3002,18 @@ fn windows_verbatim_prefix_equivalent(first: &Path, second: &Path) -> bool {
             return false;
         }
         let start = if drive { 3 } else { 2 };
+        if drive && units.len() == start {
+            return true;
+        }
         let parts: Vec<&[u16]> = units[start..].split(|unit| *unit == 92).collect();
-        let required = if drive { 1 } else { 3 };
+        // Share roots may retain their literal trailing separator. This does
+        // not add or remove a separator when comparing the two spellings.
+        let parts = if unc && parts.len() == 3 && parts[2].is_empty() {
+            &parts[..2]
+        } else {
+            &parts[..]
+        };
+        let required = if drive { 1 } else { 2 };
         parts.len() >= required
             && parts.iter().all(|part| {
                 !part.is_empty()
@@ -3455,7 +3465,7 @@ mod metadata_reply_tests {
         #[cfg(windows)]
         let directory = ordinary_metadata_test_directory(temp.path())?;
         #[cfg(not(windows))]
-        let directory = temp.path().to_path_buf();
+        let directory = temp.path().canonicalize()?;
         let destination = directory.join("reply.xmp");
         std::fs::write(&destination, b"old")?;
         let limits = crate::catalog_export_alias::AliasLimits::default();
@@ -3598,6 +3608,24 @@ mod metadata_reply_tests {
             r"\\?\C:\Photos\sidecar.xmp",
             r"C:\Photos\sidecar.xmp"
         ));
+        for (ordinary, verbatim) in [
+            (r"C:\", r"\\?\C:\"),
+            (r"\\server\share", r"\\?\UNC\server\share"),
+            (r"\\server\share\", r"\\?\UNC\server\share\"),
+        ] {
+            assert!(matches(ordinary, verbatim));
+            assert!(matches(verbatim, ordinary));
+        }
+        for (ordinary, verbatim) in [
+            (r"C:\", r"\\?\D:\"),
+            (r"C:\", r"\\?\C:\."),
+            (r"\\server\share", r"\\?\UNC\server\share\"),
+            (r"\\server\share", r"\\?\UNC\SERVER\share"),
+            (r"\\server", r"\\?\UNC\server"),
+            (r"\\server\share.", r"\\?\UNC\server\share."),
+        ] {
+            assert!(!matches(ordinary, verbatim));
+        }
 
         for rejected in [
             r"\\?\D:\Photos\sidecar.xmp",
