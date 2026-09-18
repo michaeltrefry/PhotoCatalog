@@ -1095,7 +1095,7 @@ fn managed_cross_cache_root_review_recovers_live_export_admission() -> Result<()
         .parent()
         .and_then(std::path::Path::parent)
         .context("test target directory")?
-        .join("photocatalog.exe");
+        .join(format!("photocatalog{}", std::env::consts::EXE_SUFFIX));
     ensure!(worker.is_file(), "photocatalog worker binary is absent");
     let client = Arc::new(Client::spawn(&worker, vec![])?);
     client.wait_ready(Duration::from_secs(30))?;
