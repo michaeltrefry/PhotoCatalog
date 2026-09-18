@@ -97,6 +97,10 @@ impl Broker {
         stop: Arc<Stop>,
         memory: MemoryBudget,
     ) -> Result<Self> {
+        #[cfg(test)]
+        if executable == std::env::current_exe()? {
+            return tests::start_typed(executable, guard, stop, memory);
+        }
         ensure!(
             executable.is_absolute(),
             "absolute configured Source executable required"

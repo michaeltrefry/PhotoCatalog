@@ -11,6 +11,38 @@ const HELPER: &str =
     "lightroom_migration_worker::source_reader::relay::broker::tests::owned_broker_source_fixture";
 const ENV: &str = "PHOTOCATALOG_OWNED_BROKER_SOURCE_FIXTURE";
 
+pub(super) fn start_typed(
+    executable: PathBuf,
+    guard: Guard,
+    stop: Arc<Stop>,
+    memory: MemoryBudget,
+) -> Result<Broker> {
+    Broker::start_with(guard, stop, memory, move |kind, stop, before_wait| {
+        let mut command = OsCommand::new(&executable);
+        command.args([
+            "--ignored", "--exact",
+            "lightroom_migration_worker::source_reader::relay::broker::tests::typed_source_entrypoint",
+            "--nocapture", "--test-threads=1",
+        ]).env("PHOTOCATALOG_TYPED_SOURCE_KIND", serde_json::to_string(&kind)?);
+        crate::lightroom_migration_worker::process::source_environment(&mut command);
+        Process::spawn_test_command_with_cleanup(command, stop, Some(before_wait))
+    })
+}
+
+#[test]
+#[ignore = "owned typed Source subprocess entrypoint"]
+fn typed_source_entrypoint() {
+    let result = (|| -> Result<()> {
+        let kind = serde_json::from_str(&std::env::var("PHOTOCATALOG_TYPED_SOURCE_KIND")?)?;
+        crate::lightroom_migration_worker::source_reader::owner::serve_mode(
+            std::io::stdin(),
+            std::io::stderr(),
+            Some(kind),
+        )
+    })();
+    std::process::exit(if result.is_ok() { 0 } else { 1 });
+}
+
 #[test]
 fn owned_broker_source_fixture() -> Result<()> {
     if std::env::var_os(ENV).is_none() {
