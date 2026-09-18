@@ -247,7 +247,11 @@ fn remote_sql_full_method_parity_and_cancel_retain_lock_through_consumer_drain()
     Ok(())
 }
 fn raw_descriptor(root: &Path, bytes: &[u8]) -> Result<ArtifactDescriptor> {
-    let path = root.join("capture.bin");
+    raw_descriptor_at(root, Path::new("capture.bin"), bytes)
+}
+fn raw_descriptor_at(root: &Path, relative: &Path, bytes: &[u8]) -> Result<ArtifactDescriptor> {
+    let path = root.join(relative);
+    fs::create_dir_all(path.parent().unwrap())?;
     fs::write(&path, bytes)?;
     let source = Source::open(&path, u64::MAX)?;
     let identity = source.before.clone();
@@ -259,7 +263,7 @@ fn raw_descriptor(root: &Path, bytes: &[u8]) -> Result<ArtifactDescriptor> {
             member_index: 0,
             mapping: crate::catalog_migration::artifacts::ArtifactMapping {
                 root: NativePath::from_path(root),
-                relative: NativePath::from_path(Path::new("capture.bin")),
+                relative: NativePath::from_path(relative),
                 copy_identity: identity.clone(),
             },
         },
@@ -275,6 +279,65 @@ fn raw_descriptor(root: &Path, bytes: &[u8]) -> Result<ArtifactDescriptor> {
             blake3: crate::lightroom::digest(bytes),
         },
     })
+}
+#[cfg(windows)]
+#[test]
+fn raw_reader_verbatim_root_accepts_portable_separators_and_preserves_custody() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    assert!(matches!(
+        root.components().next(),
+        Some(std::path::Component::Prefix(prefix)) if prefix.kind().is_verbatim()
+    ));
+    let bytes: Vec<u8> = (0..8193)
+        .map(|index| (index * 37 + index / 4096) as u8)
+        .collect();
+    for relative in ["raw/member.bin", "raw\\member.bin", "raw/撮影\\member.bin"] {
+        let relative = Path::new(relative);
+        let descriptor = raw_descriptor_at(&root, relative, &bytes)?;
+        let path = root.join(relative);
+        let budget = MemoryBudget::new(8 * 1024 * 1024)?;
+        let mut reader = session_with_memory(
+            Authority::Artifact {
+                descriptor,
+                limits: ArtifactLimits {
+                    maximum_bytes: 100_000,
+                    open_deadline_ms: 10_000,
+                    chunk_deadline_ms: 5000,
+                    chunk_bytes: 4096,
+                }
+                .into(),
+                protected: vec![],
+            },
+            Arc::new(AtomicBool::new(false)),
+            10_000,
+            budget.clone(),
+        )?;
+        assert!(!can_write(&path));
+        let mut restored = vec![];
+        while restored.len() < bytes.len() {
+            let Value::Chunk(chunk) = reader.query(Read::ArtifactChunk {
+                offset: U64(restored.len() as u64),
+            })?
+            else {
+                anyhow::bail!("raw chunk");
+            };
+            assert!(!chunk.is_empty());
+            restored.extend_from_slice(&chunk);
+        }
+        assert_eq!(restored, bytes);
+        assert_eq!(
+            crate::lightroom::digest(&restored),
+            crate::lightroom::digest(&bytes)
+        );
+        reader.retire()?;
+        assert!(budget.used() > 0);
+        drop(reader);
+        assert_eq!(budget.used(), 0);
+        assert!(can_write(&path));
+        assert_eq!(fs::read(path)?, bytes);
+    }
+    Ok(())
 }
 #[test]
 fn raw_reader_hash_once_chunks_and_locked_path_command_rejection_keep_custody() -> Result<()> {

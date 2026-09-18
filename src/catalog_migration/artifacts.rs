@@ -197,15 +197,19 @@ fn admitted_mapping_path(
     let mut original = std::ffi::OsString::with_capacity(capacity);
     original.push(&root);
     // Native component validation above has excluded absolute/non-normal relative
-    // paths. Raw append avoids PathBuf::push's verbatim Vec/rebuild allocations.
+    // paths. Append components with native separators: Windows verbatim roots do
+    // not interpret portable '/' separators. This avoids PathBuf::push's verbatim
+    // Vec/rebuild allocations and fits the already admitted capacity.
     #[cfg(unix)]
     let separator = "/";
     #[cfg(windows)]
     let separator = "\\";
-    if !original.as_encoded_bytes().ends_with(separator.as_bytes()) {
-        original.push(separator);
+    for component in relative.components() {
+        if !original.as_encoded_bytes().ends_with(separator.as_bytes()) {
+            original.push(separator);
+        }
+        original.push(component.as_os_str());
     }
-    original.push(&relative);
     #[cfg(unix)]
     // Source.path clone + prefix growth/realloc + std CString scratch. Retained
     // until reader reap, reused during serial revision checks.
@@ -1254,6 +1258,36 @@ mod tests {
         }
         assert!(admitted_mapping_path(&foreign, &mut |_| Ok(())).is_err());
         assert!(mapping_path(&foreign).is_err());
+        for relative in [
+            "../escape",
+            "raw/../escape",
+            "raw/./member",
+            "raw//member",
+            "/absolute",
+        ] {
+            let mut bad = mapping.clone();
+            bad.relative = NativePath::from_path(Path::new(relative));
+            assert!(
+                admitted_mapping_path(&bad, &mut |_| Ok(())).is_err(),
+                "{relative}"
+            );
+        }
+        #[cfg(windows)]
+        for relative in [
+            r"raw\..\escape",
+            r"C:\absolute",
+            r"C:relative",
+            r"\rooted",
+            r"\\server\share\member",
+            "raw/member:stream",
+        ] {
+            let mut bad = mapping.clone();
+            bad.relative = NativePath::from_path(Path::new(relative));
+            assert!(
+                admitted_mapping_path(&bad, &mut |_| Ok(())).is_err(),
+                "{relative}"
+            );
+        }
         println!("RAW_PATH admitted={total} original_native_spelling=true foreign_rejected=true");
         Ok(())
     }
